@@ -103,6 +103,7 @@ Foxguard/
 ├── frontend/
 │   ├── admin/          # Next.js dashboard; the admin token stays server-side
 │   └── portal/         # static bundle; runs in the browser, served by the API
+├── deploy/             # installer + health check, both with their own safeguards
 ├── examples/           # example ACL document for the import endpoint
 └── docs/
 ```
@@ -219,19 +220,131 @@ output is a reviewable diff. See `backend/tests/golden/README.md`.
 
 ## Deploying on a real Linux gateway
 
-Full procedure — including the "do not lock yourself out" checklist — is in
-[`docs/deployment.md`](docs/deployment.md). Short version:
+A Debian/Ubuntu LXC or VM, ideally behind your existing router. Everything below
+assumes you can still reach the box **without** the tunnel — a console or SSH
+from the LAN. Keep that open until the last step.
 
-1. LXC/VM with `nftables`, `wireguard-tools`, Python 3.11+, and an existing
-   `wg0` you can already reach.
-2. Install the backend + agent, set `/etc/foxguard/agent.env` with the API URL
-   and the agent token.
-3. **Start the agent with `FOXGUARD_AGENT_DRY_RUN=true`** and check the logs: it
-   validates every ruleset with `nft -c -f` without applying anything.
-4. Flip the dry run off and enable `foxguard-agent.service`.
+### 1. Check the box can host it — changes nothing
+
+```sh
+git clone <your-repo> /root/foxguard-src && cd /root/foxguard-src
+sudo ./deploy/foxguard-install.sh --check-only
+```
+
+It verifies `CAP_NET_ADMIN`, WireGuard kernel support, that `wg0` exists and
+carries an address, that the ports are free and that forwarding is on. It stops
+at the first thing that would have bitten you later.
+
+### 2. Install
+
+```sh
+sudo ./deploy/foxguard-install.sh --wan-interface eth0
+```
+
+Packages, service user, PostgreSQL (UTF8 — see the note below), secrets in
+`0600` config, migrations, both frontends, three systemd units, and the first
+administrator whose password is printed once.
+
+<details>
+<summary>Let it create WireGuard too</summary>
+
+Normally `wg0` is yours — it carries your remote access and the installer would
+rather not be what breaks it. If you would rather it did:
+
+```sh
+sudo ./deploy/foxguard-install.sh \
+  --bootstrap-wireguard \
+  --bootstrap-peer my-laptop \
+  --endpoint vpn.example.com:51820 \
+  --wan-interface eth0
+```
+
+`--bootstrap-wireguard` writes an `[Interface]`-only config and enables
+`wg-quick@wg0`. It is create-if-absent: an existing interface is used as it is,
+and it refuses outright rather than overwrite an existing config file.
+
+`--bootstrap-peer` handles the awkward first device. One added by hand to
+`wg0.conf` is removed on the agent's first sync — the control plane does not
+know it — so this registers it properly and prints a ready client config once.
+Its private key is generated on the gateway: fair for the laptop you are setting
+up from, a bad habit for everything after.
+
+You still have to forward `udp/51820` on your router.
+</details>
+
+### 3. Go live — deliberately manual
+
+The installer leaves the agent **stopped and in dry run**. Nothing reaches
+nftables until you have read the rules:
+
+```sh
+curl -s http://10.88.0.1:8080/api/v1/ruleset/preview \
+  -H "Authorization: Bearer $(grep ADMIN_API_TOKEN /etc/foxguard/backend.env | cut -d= -f2)" \
+  | jq -r .content
+```
+
+Confirm three things: `iifname != "wg0" accept` is the **first** rule of
+`chain input` (this is what keeps your SSH alive), both base chains say
+`policy accept`, and the only delete statement is `delete table inet foxguard`.
+
+```sh
+systemctl start foxguard-agent && journalctl -u foxguard-agent -f
+# expect: "dry run: ruleset <digest> validated, not applied"
+
+sed -i 's/^FOXGUARD_AGENT_DRY_RUN=true/FOXGUARD_AGENT_DRY_RUN=false/' /etc/foxguard/agent.env
+systemctl restart foxguard-agent
+```
+
+If it goes wrong: `systemctl stop foxguard-agent && nft delete table inet foxguard`.
+The tunnel survives — removing the filter table does not touch WireGuard.
+
+### 4. Verify, now and later
+
+```sh
+sudo ./deploy/foxguard-healthcheck.sh
+```
+
+Read-only, safe on a live gateway. It checks the services, that dev mode is off,
+that the API runs under `foxguard-serve`, config file modes, that the live table
+still guards non-tunnel traffic **first**, drift between database and dataplane,
+that WireGuard's peer list matches the control plane, and that the portal refuses
+both forwarded headers and non-peer addresses.
+
+Then sign in to the dashboard, enable TOTP on your account, and confirm your SSH
+does not depend on the tunnel.
+
+### Two things that will bite you otherwise
+
+**PostgreSQL encoding.** On a minimal LXC with no locale, `initdb` creates the
+cluster as `SQL_ASCII`; psycopg then hands SQLAlchemy bytes and the first
+connection dies on `TypeError: cannot use a string pattern on a bytes-like
+object`, which mentions no encoding at all. The installer creates the database
+`--template=template0 --encoding=UTF8` and refuses an existing one that is not.
+
+**No reverse proxy in front of the portal.** It identifies peers by source
+address; nginx or Traefik in front makes every request arrive from the proxy.
+The API refuses forwarded headers outright, so this fails closed — loudly.
 
 Foxguard only ever owns `table inet foxguard`. Your existing host firewall,
 Docker rules and fail2ban chains are never flushed and never modified.
+
+The manual procedure, and the reasoning behind each step, is in
+[`docs/deployment.md`](docs/deployment.md).
+
+### 5. Then actually use it
+
+Nothing is enforced until there are groups, devices and a rule — in that order.
+[`docs/usage.md`](docs/usage.md) walks through the first working setup, the
+tasks you will repeat (onboarding a person, onboarding a machine, cutting
+access), what your users see at the portal, and a triage table for when a peer
+reaches nothing.
+
+Back it up before you rely on it. The ACL export covers groups and rules only;
+peers, accounts and their secrets live solely in the database:
+
+```sh
+sudo ./deploy/foxguard-backup.sh --dest /mnt/nas/foxguard --keep 30
+```
 
 ## Safety properties
 

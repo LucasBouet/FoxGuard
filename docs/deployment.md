@@ -596,6 +596,73 @@ curl -s -X POST localhost:8000/api/v1/policies/import \
 `prune: true` makes the import a full sync — groups and rules absent from the
 document are deleted. Without it, the import only creates and updates.
 
+## Backup and restore
+
+**The policy export is not a backup.** `GET /api/v1/policies/export` covers
+groups and ACL rules — the things worth versioning in git. Everything else lives
+solely in PostgreSQL: every peer's public key and tunnel address, every
+account's password hash and TOTP secret, the enrollment key hashes, the audit
+log. Lose the database and every device needs re-registering, which means every
+client config changes.
+
+```sh
+sudo ./deploy/foxguard-backup.sh                    # -> /var/backups/foxguard
+sudo ./deploy/foxguard-backup.sh --dest /mnt/nas/foxguard --keep 30
+```
+
+One `0600` tarball per run: a `pg_dump`, the three `/etc/foxguard/*.env` files,
+and the WireGuard interface config. It refuses to finish if `pg_dump` produced a
+truncated file — a dump that stops halfway restores cleanly and silently drops
+rows, which is worse than no dump at all.
+
+Nightly, keeping a month:
+
+```
+15 3 * * * /opt/foxguard/src/deploy/foxguard-backup.sh --dest /mnt/nas/foxguard --keep 30 >/dev/null
+```
+
+**The archive is a credential.** It holds the admin and agent tokens, the
+database password, the WireGuard private key that *is* this gateway's identity,
+and TOTP secrets in plaintext — they have to be usable to verify a code. Protect
+a backup exactly as you protect root on this box, and encrypt it if it leaves
+your network.
+
+Check one without restoring it:
+
+```sh
+sudo ./deploy/foxguard-backup.sh --verify /mnt/nas/foxguard/foxguard-20260729-031501.tar.gz
+```
+
+### Restoring
+
+```sh
+tar -xzf foxguard-20260729-031501.tar.gz -C /tmp
+cd /tmp/foxguard-20260729-031501
+
+systemctl stop foxguard-agent foxguard-api foxguard-dashboard
+
+# The database must exist with UTF8 encoding before the dump goes in.
+sudo -u postgres dropdb --if-exists foxguard
+sudo -u postgres createdb -O foxguard --template=template0 --encoding=UTF8 \
+  --lc-collate=C.UTF-8 --lc-ctype=C.UTF-8 foxguard
+sudo -u postgres psql -q foxguard < database.sql
+
+install -m 0600 backend.env agent.env dashboard.env /etc/foxguard/
+install -m 0600 wg0.conf /etc/wireguard/          # the gateway's identity
+
+systemctl restart wg-quick@wg0
+systemctl start foxguard-api foxguard-dashboard
+./deploy/foxguard-healthcheck.sh
+```
+
+Start the agent last, and consider putting it back in dry run for one cycle if
+the restore was onto different hardware.
+
+**Restoring without `wg0.conf` gives you a gateway with a new keypair**: every
+existing client config points at a server that can no longer decrypt them, and
+you would have to redistribute all of them. That file matters as much as the
+database.
+
 ## Recovering from a mistake
 
 **Locked out through the tunnel.** Get in over the console or from the LAN and:
@@ -689,3 +756,6 @@ because there is no lockout; if you need it cleared immediately, restart the API
       and its `FOXGUARD_ADMIN_API_TOKEN` is in an `0600` environment file.
 - [ ] You have tried the kill switch **once**, on purpose, and know which mode
       you would reach for at 3am.
+- [ ] `deploy/foxguard-backup.sh` runs on a schedule, its output leaves this
+      box, and you have restored one somewhere to prove it works.
+- [ ] The ACL document is exported to a git repository you actually commit to.
