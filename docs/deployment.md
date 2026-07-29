@@ -26,6 +26,39 @@ sudo ./deploy/foxguard-install.sh --check-only
 sudo ./deploy/foxguard-install.sh --wan-interface eth0
 ```
 
+### Letting it create the interface too
+
+Normally you bring `wg0` up yourself — it carries your remote access, and the
+installer would rather not be the thing that breaks it. If you would rather it
+did, it is opt-in:
+
+```sh
+sudo ./deploy/foxguard-install.sh \
+  --bootstrap-wireguard \
+  --bootstrap-peer my-laptop \
+  --endpoint vpn.example.com:51820 \
+  --wan-interface eth0
+```
+
+`--bootstrap-wireguard` writes `/etc/wireguard/wg0.conf` with an `[Interface]`
+block and **no peers** — those belong to Foxguard — then enables
+`wg-quick@wg0`. It is create-if-absent: an interface that already exists is
+used as it is, and it **refuses outright** if a config file is already there
+rather than overwrite the thing holding your only way in.
+
+`--bootstrap-peer` solves the awkward first step. A device added by hand to
+`wg0.conf` is removed on the agent's first sync, because the control plane does
+not know about it — so instead this registers the device properly, bound to the
+administrator account, and prints a ready client config once.
+
+That client's private key is generated on the gateway. For the laptop you are
+setting up from that is a fair trade; for everything after, generate the keypair
+on the device and register only the public key. The peer form in the dashboard
+says so too.
+
+You still have to forward `udp/51820` to this box on your router — the installer
+says so but cannot do it.
+
 It detects the tunnel address and peer pool from your live WireGuard interface,
 generates the secrets, writes `0600` config, applies the migrations, builds both
 frontends, installs the systemd units, and creates the first administrator —

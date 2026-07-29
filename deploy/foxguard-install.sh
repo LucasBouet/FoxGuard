@@ -51,6 +51,14 @@ CHECK_ONLY=0
 SKIP_FRONTEND=0
 ADMIN_USER="admin"
 
+# Creating the interface that carries your only remote access is opt-in, never
+# implicit. Both of these default to off.
+BOOTSTRAP_WG=0
+LISTEN_PORT=51820
+BOOTSTRAP_PEER=""
+ENDPOINT=""
+DEFAULT_POOL=10.88.0.0/24
+
 # --------------------------------------------------------------------------- #
 # output
 # --------------------------------------------------------------------------- #
@@ -103,6 +111,16 @@ Options:
   --check-only           Run the preflight checks and exit
   -y, --yes              Do not prompt
   -h, --help             This text
+
+WireGuard bootstrap (opt-in — normally you bring the interface up yourself):
+  --bootstrap-wireguard  Create \$WG_IF and its wg-quick unit if absent.
+                         Refuses if the interface or its config already exists.
+  --listen-port PORT     UDP port for the new interface (default: $LISTEN_PORT)
+  --bootstrap-peer NAME  Also register a first device and print a ready client
+                         config. Its private key is generated here and shown
+                         once — acceptable for the laptop you set this up from,
+                         not the habit for everything else.
+  --endpoint HOST[:PORT] Public address peers dial, for the printed config.
 EOF
 }
 
@@ -119,6 +137,10 @@ while [[ $# -gt 0 ]]; do
     --dashboard-port)  DASHBOARD_PORT=$2; shift 2 ;;
     --admin-user)      ADMIN_USER=$2; shift 2 ;;
     --skip-frontend)   SKIP_FRONTEND=1; shift ;;
+    --bootstrap-wireguard) BOOTSTRAP_WG=1; shift ;;
+    --listen-port)     LISTEN_PORT=$2; shift 2 ;;
+    --bootstrap-peer)  BOOTSTRAP_PEER=$2; shift 2 ;;
+    --endpoint)        ENDPOINT=$2; shift 2 ;;
     --check-only)      CHECK_ONLY=1; shift ;;
     -y|--yes)          ASSUME_YES=1; shift ;;
     -h|--help)         usage; exit 0 ;;
@@ -127,6 +149,51 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n $SRC ]] || SRC=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+[[ -n $BOOTSTRAP_PEER && $BOOTSTRAP_WG -eq 0 ]] && \
+  die "--bootstrap-peer needs --bootstrap-wireguard (or an interface you brought up yourself, in which case register the peer from the dashboard)."
+
+# --------------------------------------------------------------------------- #
+# WireGuard bootstrap
+# --------------------------------------------------------------------------- #
+
+bootstrap_wireguard() {
+  local conf=/etc/wireguard/${WG_IF}.conf
+
+  # Never touch an existing interface or config. If either is there, the person
+  # who made it had reasons, and clobbering the file that carries their remote
+  # access is not a recoverable mistake.
+  [[ -e $conf ]] && die "$conf already exists — refusing to overwrite it. Drop --bootstrap-wireguard."
+  ip link show "$WG_IF" >/dev/null 2>&1 && \
+    die "$WG_IF already exists — refusing to reconfigure it. Drop --bootstrap-wireguard."
+
+  install -d -m 0700 /etc/wireguard
+  ( umask 077
+    wg genkey > "/etc/wireguard/${WG_IF}.private"
+    wg pubkey < "/etc/wireguard/${WG_IF}.private" > "/etc/wireguard/${WG_IF}.public"
+
+    # No [Peer] sections: those belong to Foxguard. The agent rewrites them from
+    # the control plane and reads this [Interface] block back verbatim, so the
+    # private key below never leaves this machine.
+    cat > "$conf" <<WGEOF
+# Created by foxguard-install.sh.
+# Foxguard owns the [Peer] sections of this interface -- add devices through the
+# dashboard, not here. A peer added by hand is removed on the agent's next sync.
+[Interface]
+Address = $TUNNEL_IP/${POOL##*/}
+ListenPort = $LISTEN_PORT
+PrivateKey = $(cat "/etc/wireguard/${WG_IF}.private")
+WGEOF
+  )
+  chmod 600 "$conf"
+
+  systemctl enable --now "wg-quick@${WG_IF}" >/dev/null 2>&1 \
+    || die "wg-quick@${WG_IF} failed to start. Check: journalctl -u wg-quick@${WG_IF} -n 30"
+  ip link show "$WG_IF" >/dev/null 2>&1 \
+    || die "$WG_IF still does not exist after starting wg-quick."
+
+  ok "created $WG_IF ($TUNNEL_IP/${POOL##*/}, udp/$LISTEN_PORT) and enabled wg-quick@${WG_IF}"
+  warn "open udp/$LISTEN_PORT on your router towards this box, or nothing will reach it"
+}
 
 # --------------------------------------------------------------------------- #
 # preflight
@@ -159,7 +226,28 @@ if command -v ip >/dev/null 2>&1; then
   fi
 
   # Foxguard manages peers on an interface it does not create. If it is not
-  # there, the install would produce a control plane governing nothing.
+  # there, the install would produce a control plane governing nothing -- unless
+  # the operator explicitly asked for it to be created.
+  if [[ $BOOTSTRAP_WG -eq 1 ]] && ! ip link show "$WG_IF" >/dev/null 2>&1; then
+    [[ -n $POOL ]] || POOL=$DEFAULT_POOL
+    [[ -n $TUNNEL_IP ]] || TUNNEL_IP=$(python3 - "$POOL" <<'PY'
+import ipaddress, sys
+print(next(ipaddress.ip_network(sys.argv[1]).hosts()))
+PY
+)
+    if [[ $CHECK_ONLY -eq 1 ]]; then
+      ok "would create $WG_IF as $TUNNEL_IP in $POOL on udp/$LISTEN_PORT"
+    else
+      command -v wg >/dev/null 2>&1 || {
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -qq && apt-get install -y -qq wireguard-tools
+      }
+      confirm "Create interface $WG_IF as $TUNNEL_IP in $POOL?" \
+        || die "cancelled — bring $WG_IF up yourself and re-run without --bootstrap-wireguard."
+      bootstrap_wireguard
+    fi
+  fi
+
   if ip link show "$WG_IF" >/dev/null 2>&1; then
     ok "interface $WG_IF exists"
     DETECTED_IP=$(ip -4 -o addr show dev "$WG_IF" 2>/dev/null | awk '{print $4}' | head -1)
@@ -183,8 +271,10 @@ PY
         warn "$WG_IF has no peers yet — reach the gateway through the tunnel from one device before going live"
       fi
     fi
+  elif [[ $BOOTSTRAP_WG -eq 1 && $CHECK_ONLY -eq 1 ]]; then
+    : # reported above as "would create"
   else
-    fail "interface $WG_IF does not exist — Foxguard manages peers on an interface you bring up yourself"
+    fail "interface $WG_IF does not exist — bring it up yourself, or pass --bootstrap-wireguard"
     PREFLIGHT_FAILED=1
   fi
 else
@@ -193,7 +283,7 @@ else
 fi
 
 # Binding to the WAN would expose the admin API and the portal to the internet.
-if [[ -n $TUNNEL_IP ]]; then
+if [[ -n $TUNNEL_IP ]] && ip link show "$WG_IF" >/dev/null 2>&1; then
   if ip -o addr show 2>/dev/null | grep -q " $WG_IF .*\b${TUNNEL_IP}/"; then
     ok "bind address $TUNNEL_IP belongs to $WG_IF"
   else
@@ -478,6 +568,50 @@ else
 fi
 
 # --------------------------------------------------------------------------- #
+# first device
+# --------------------------------------------------------------------------- #
+
+CLIENT_CONF=""
+if [[ -n $BOOTSTRAP_PEER ]]; then
+  step "First device"
+
+  # Registering it here rather than adding a [Peer] by hand is the point: a peer
+  # the control plane does not know about is removed on the agent's first sync.
+  CLIENT_PRIV=$(wg genkey)
+  CLIENT_PUB=$(printf '%s' "$CLIENT_PRIV" | wg pubkey)
+
+  ADMIN_ID=$(curl -sf -H "Authorization: Bearer $ADMIN_TOKEN" \
+    "http://$TUNNEL_IP:$API_PORT/api/v1/users" \
+    | jq -r --arg u "$ADMIN_USER" '.[] | select(.username==$u) | .id' 2>/dev/null || true)
+
+  if [[ -n ${ADMIN_ID:-} ]]; then
+    PEER_JSON=$(curl -sf -X POST "http://$TUNNEL_IP:$API_PORT/api/v1/peers" \
+      -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+      -d "{\"name\":\"$BOOTSTRAP_PEER\",\"peer_type\":\"user\",\"wg_public_key\":\"$CLIENT_PUB\",\"owner_user_id\":\"$ADMIN_ID\",\"tags\":[\"bootstrap\"]}" || true)
+    PEER_IP=$(printf '%s' "$PEER_JSON" | jq -r '.tunnel_ip // empty' 2>/dev/null || true)
+  fi
+
+  if [[ -n ${PEER_IP:-} ]]; then
+    ok "registered '$BOOTSTRAP_PEER' at $PEER_IP, owned by $ADMIN_USER"
+    SERVER_PUB=$(cat "/etc/wireguard/${WG_IF}.public" 2>/dev/null || wg show "$WG_IF" public-key)
+    CLIENT_CONF=$(cat <<EOF
+[Interface]
+PrivateKey = $CLIENT_PRIV
+Address = $PEER_IP/32
+
+[Peer]
+PublicKey = $SERVER_PUB
+Endpoint = ${ENDPOINT:-<your-public-address>:$LISTEN_PORT}
+AllowedIPs = $POOL
+PersistentKeepalive = 25
+EOF
+)
+  else
+    warn "could not register the device — add it from the dashboard instead"
+  fi
+fi
+
+# --------------------------------------------------------------------------- #
 # what happens next
 # --------------------------------------------------------------------------- #
 
@@ -518,19 +652,42 @@ $B4. Verify$N
 
 EOF
 
+if [[ -n $ADMIN_PASS || -n $CLIENT_CONF ]]; then
+  printf '%s────────────────────────────────────────────────────────────────%s\n' "$B" "$N"
+  printf '%s Shown once. Nothing below is stored anywhere you can read it back.%s\n' "$Y" "$N"
+fi
+
 if [[ -n $ADMIN_PASS ]]; then
   cat <<EOF
-$B────────────────────────────────────────────────────────────────$N
-$Y Shown once. Store it in your password manager now.$N
 
-   dashboard   http://$TUNNEL_IP:$DASHBOARD_PORT
+ $B Dashboard $N  http://$TUNNEL_IP:$DASHBOARD_PORT
    username    $ADMIN_USER
    password    $ADMIN_PASS
 
  Sign in, then enable TOTP on the account (Accounts → Manage). Until you
  sign in, the dashboard acts as 'admin-token' and the audit log cannot
  name you.
-$B────────────────────────────────────────────────────────────────$N
-
 EOF
+fi
+
+if [[ -n $CLIENT_CONF ]]; then
+  cat <<EOF
+
+ $B Client config for '$BOOTSTRAP_PEER' $N — save as $BOOTSTRAP_PEER.conf
+
+$CLIENT_CONF
+
+ Its private key was generated on this gateway, which is a fair trade for
+ the laptop you are setting up from and a bad habit for everything else:
+ generate the keypair on the device and register only the public key.
+$( [[ -z $ENDPOINT ]] && echo " Replace <your-public-address> with what your router forwards udp/$LISTEN_PORT to." )
+
+ This device lands in quarantine, as every user peer does. Connect the
+ tunnel, open http://$TUNNEL_IP:$API_PORT/ and sign in as $ADMIN_USER to
+ leave it.
+EOF
+fi
+
+if [[ -n $ADMIN_PASS || -n $CLIENT_CONF ]]; then
+  printf '%s────────────────────────────────────────────────────────────────%s\n\n' "$B" "$N"
 fi
