@@ -617,6 +617,22 @@ after a successful apply, the agent re-applies
 during migrations.** The database is `SQL_ASCII`, not UTF8 — see section 3. If
 it is still empty, recreate it; otherwise dump, recreate and restore.
 
+**The agent exits with `Permission denied` on its own executable, as root.**
+Not a paradox: its unit hardens root down to `CAP_NET_ADMIN`/`CAP_NET_RAW`,
+which drops `CAP_DAC_OVERRIDE` along with everything else, so root loses its
+free pass on file permissions. If `/opt/foxguard` is owned by another user and
+not world-readable, the agent cannot reach its own binary.
+
+```sh
+chown -R root:root /opt/foxguard /var/lib/foxguard
+chmod 0755 /opt/foxguard
+chown -R foxguard:foxguard /opt/foxguard/src/frontend/admin/.next   # if built
+systemctl restart foxguard-agent
+```
+
+Nothing secret lives under `/opt/foxguard` — credentials are in `/etc/foxguard`
+at `0600` — so a world-readable prefix costs nothing.
+
 **A peer that must lose access right now.** Set its state to `quarantined` (or
 delete it). Because the quarantine drop is evaluated before the
 `established,related` accept, its open connections are cut on the next

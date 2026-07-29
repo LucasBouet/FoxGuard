@@ -77,6 +77,20 @@ for f in backend.env agent.env dashboard.env; do
   [[ $mode == 600 ]] && ok "$f is mode 0600" || bad "$f is mode $mode, expected 0600"
 done
 
+# The agent's unit drops CAP_DAC_OVERRIDE, so root gets no free pass on file
+# permissions: an install prefix owned by someone else and not world-readable
+# makes it fail to start on its own executable.
+PREFIX_DIR=$(systemctl cat foxguard-agent 2>/dev/null \
+             | sed -n 's|^ExecStart=\(.*\)/venv/bin/foxguard-agent.*|\1|p' | head -1)
+if [[ -n ${PREFIX_DIR:-} && -d $PREFIX_DIR ]]; then
+  read -r pmode powner <<<"$(stat -c '%a %U' "$PREFIX_DIR")"
+  if [[ $powner == root || ${pmode: -1} =~ [45671] ]]; then
+    ok "$PREFIX_DIR is reachable by the agent ($pmode $powner)"
+  else
+    bad "$PREFIX_DIR is $pmode owned by $powner — the agent runs without CAP_DAC_OVERRIDE and cannot read it"
+  fi
+fi
+
 # The API must be started by foxguard-serve. Plain uvicorn enables proxy headers
 # by default, which lets anything on loopback forge a peer's source address.
 if systemctl cat foxguard-api 2>/dev/null | grep -q 'foxguard-serve'; then
@@ -147,12 +161,23 @@ fi
 if "$NFT" list table inet "${FOXGUARD_NFT_TABLE_NAME:-foxguard}" >/dev/null 2>&1; then
   ok "table inet ${FOXGUARD_NFT_TABLE_NAME:-foxguard} is live"
 
-  # The one rule that keeps SSH alive if it does not transit the tunnel.
-  if "$NFT" list table inet "${FOXGUARD_NFT_TABLE_NAME:-foxguard}" 2>/dev/null \
-     | grep -q "iifname != \"$WG_IF\" accept"; then
-    ok "non-tunnel traffic is accepted before anything else"
+  # The one rule that keeps SSH alive if it does not transit the tunnel. It has
+  # to be *first* in the input chain, not merely present: a guard evaluated
+  # after a drop is not a guard.
+  FIRST_RULE=$("$NFT" list chain inet "${FOXGUARD_NFT_TABLE_NAME:-foxguard}" input 2>/dev/null \
+               | grep -vE '^\s*(table|chain|type|\})' | grep -vE '^\s*(#|$)' \
+               | head -1 | sed 's/^[[:space:]]*//')
+  if [[ $FIRST_RULE == "iifname != \"$WG_IF\" accept" ]]; then
+    ok "non-tunnel traffic is accepted first (your SSH is safe)"
+  elif [[ $FIRST_RULE == iifname* ]]; then
+    # Almost certainly the interface Foxguard was configured with differs from
+    # the one this check is comparing against -- say what was found rather than
+    # claiming the guard is missing.
+    bad "the input chain guards a different interface than $WG_IF: '$FIRST_RULE'"
+  elif [[ -z $FIRST_RULE ]]; then
+    bad "could not read chain input of table inet ${FOXGUARD_NFT_TABLE_NAME:-foxguard}"
   else
-    bad "the 'iifname != \"$WG_IF\" accept' guard is missing from the live table"
+    bad "the first rule of chain input is '$FIRST_RULE', expected 'iifname != \"$WG_IF\" accept'"
   fi
 
   if "$NFT" list table inet "${FOXGUARD_NFT_TABLE_NAME:-foxguard}" 2>/dev/null \

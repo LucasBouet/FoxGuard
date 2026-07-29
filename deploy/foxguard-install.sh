@@ -362,8 +362,20 @@ id -u "$SERVICE_USER" >/dev/null 2>&1 || \
   useradd --system --home "$PREFIX" --shell /usr/sbin/nologin "$SERVICE_USER"
 ok "service user $SERVICE_USER"
 
-install -d -m 0750 "$PREFIX" "$CONFDIR"
-install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_USER" "$STATEDIR"
+# $PREFIX stays root-owned and world-readable, and $STATEDIR root-owned.
+#
+# Not laziness -- the alternative breaks the agent. Its unit hardens root down
+# to CAP_NET_ADMIN/CAP_NET_RAW, which drops CAP_DAC_OVERRIDE with everything
+# else, so root stops being able to ignore file permissions. A prefix owned by
+# `foxguard` with mode 0750 is then unreadable to it: not the owner, not in the
+# group, and "other" has no bits. The agent dies with a permission error on its
+# own executable.
+#
+# Nothing secret lives here: credentials are in $CONFDIR at 0600. The API and
+# the dashboard run as $SERVICE_USER and only need to read.
+install -d -m 0755 "$PREFIX"
+install -d -m 0750 "$CONFDIR"
+install -d -m 0750 "$STATEDIR"
 
 if [[ $(readlink -f "$SRC") != $(readlink -f "$PREFIX/src") ]]; then
   install -d -m 0755 "$PREFIX/src"
@@ -525,7 +537,11 @@ if [[ $SKIP_FRONTEND -eq 0 ]]; then
   ok "admin dashboard built"
 fi
 
-chown -R "$SERVICE_USER:$SERVICE_USER" "$PREFIX"
+# Only what a service actually writes changes hands. `next start` keeps a cache
+# under .next/; everything else is read-only to the service user.
+if [[ $SKIP_FRONTEND -eq 0 && -d $SRC/frontend/admin/.next ]]; then
+  chown -R "$SERVICE_USER:$SERVICE_USER" "$SRC/frontend/admin/.next"
+fi
 
 # --------------------------------------------------------------------------- #
 # services
