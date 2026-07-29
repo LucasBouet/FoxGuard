@@ -95,6 +95,18 @@ fi
 # --------------------------------------------------------------------------- #
 section "Control plane"
 
+# A SQL_ASCII database makes psycopg hand SQLAlchemy bytes where it expects
+# text, and the failure surfaces as an unrelated-looking TypeError at connection
+# time. Worth naming explicitly.
+DBNAME=${FOXGUARD_DATABASE_URL##*/}
+ENC=$(sudo -u postgres psql -tAc \
+      "SELECT pg_encoding_to_char(encoding) FROM pg_database WHERE datname='${DBNAME%%\?*}'" 2>/dev/null)
+case ${ENC:-} in
+  UTF8) ok "database encoding is UTF8" ;;
+  "")   warn "could not read the database encoding" ;;
+  *)    bad "database encoding is $ENC — psycopg needs UTF8" ;;
+esac
+
 if api /healthz >/dev/null; then
   ok "API answers on $API"
 else

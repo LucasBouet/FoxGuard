@@ -141,7 +141,25 @@ PostgreSQL 15+, on this box or another one:
 
 ```sh
 sudo -u postgres createuser --pwprompt foxguard
-sudo -u postgres createdb -O foxguard foxguard
+sudo -u postgres createdb -O foxguard --template=template0 --encoding=UTF8 \
+  --lc-collate=C.UTF-8 --lc-ctype=C.UTF-8 foxguard
+```
+
+**Spell the encoding out.** On a minimal LXC with no locale configured, `initdb`
+creates the cluster as `SQL_ASCII` and `createdb` inherits it. psycopg then
+returns *bytes* where SQLAlchemy expects text, and the very first connection
+dies on a regex over the server version string:
+
+```
+TypeError: cannot use a string pattern on a bytes-like object
+```
+
+which says nothing about encodings. `template0` is the only template that lets
+you override it. To check an existing database:
+
+```sh
+sudo -u postgres psql -tAc \
+  "SELECT datname, pg_encoding_to_char(encoding) FROM pg_database"
 ```
 
 Generate the two tokens — they are unrelated and should never be the same value:
@@ -594,6 +612,10 @@ filtering table. Fix the policies, then start the agent again.
 bytes, and `nft -f` is a single transaction. If the table somehow disappears
 after a successful apply, the agent re-applies
 `/var/lib/foxguard/last-good.nft` on its own.
+
+**`TypeError: cannot use a string pattern on a bytes-like object` on startup or
+during migrations.** The database is `SQL_ASCII`, not UTF8 — see section 3. If
+it is still empty, recreate it; otherwise dump, recreate and restore.
 
 **A peer that must lose access right now.** Set its state to `quarantined` (or
 delete it). Because the quarantine drop is evaluated before the

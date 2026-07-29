@@ -410,9 +410,36 @@ fi
 sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='$DB_USER'" | grep -q 1 || \
   sudo -u postgres psql -qc "CREATE ROLE $DB_USER LOGIN PASSWORD '$DB_PASS'"
 sudo -u postgres psql -qc "ALTER ROLE $DB_USER PASSWORD '$DB_PASS'"
-sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='$DB_NAME'" | grep -q 1 || \
-  sudo -u postgres createdb -O "$DB_USER" "$DB_NAME"
-ok "database $DB_NAME ready"
+
+# The encoding is spelled out rather than inherited, and that is not pedantry.
+# On a minimal LXC with no locale configured, initdb creates the cluster as
+# SQL_ASCII; a database inheriting that makes psycopg return *bytes* for text
+# columns, and the first thing SQLAlchemy does with a new connection is run a
+# regex over the server version string. It fails with
+# "cannot use a string pattern on a bytes-like object" before a single query of
+# ours runs. template0 is the only template that allows overriding the encoding.
+if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='$DB_NAME'" | grep -q 1; then
+  sudo -u postgres createdb -O "$DB_USER" \
+    --template=template0 --encoding=UTF8 --lc-collate=C.UTF-8 --lc-ctype=C.UTF-8 \
+    "$DB_NAME" \
+    || die "could not create the database with UTF8 encoding."
+  ok "database $DB_NAME created (UTF8)"
+else
+  ENC=$(sudo -u postgres psql -tAc \
+        "SELECT pg_encoding_to_char(encoding) FROM pg_database WHERE datname='$DB_NAME'")
+  if [[ $ENC == UTF8 ]]; then
+    ok "database $DB_NAME ready (UTF8)"
+  else
+    die "database $DB_NAME exists with encoding $ENC, which psycopg cannot use.
+  Foxguard needs UTF8. If the database is empty, recreate it:
+
+    sudo -u postgres dropdb $DB_NAME
+    sudo -u postgres createdb -O $DB_USER --template=template0 --encoding=UTF8 \\
+      --lc-collate=C.UTF-8 --lc-ctype=C.UTF-8 $DB_NAME
+
+  If it already holds data, dump it, recreate as above, and restore."
+  fi
+fi
 
 [[ -f $CONFDIR/backend.env ]] && cp -a "$CONFDIR/backend.env" "$CONFDIR/backend.env.bak"
 
