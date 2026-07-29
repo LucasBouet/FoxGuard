@@ -1,0 +1,38 @@
+[Unit]
+Description=Foxguard admin dashboard
+Documentation=file:///opt/foxguard/src/docs/deployment.md
+After=network-online.target foxguard-api.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Holds FOXGUARD_API_URL and, until an administrator account exists,
+# FOXGUARD_ADMIN_API_TOKEN. Mode 0600: this file is a credential.
+EnvironmentFile=/etc/foxguard/dashboard.env
+WorkingDirectory=/opt/foxguard/src/frontend/admin
+Environment=NODE_ENV=production
+
+# Bound to the tunnel address, never the WAN. The dashboard renders server-side
+# and holds the admin credential; anyone who can reach this port is talking to
+# something that can already administer the network.
+ExecStart=/usr/bin/npx next start --hostname 10.88.0.1 --port 3000
+
+Restart=always
+RestartSec=5
+
+User=foxguard
+Group=foxguard
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

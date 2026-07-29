@@ -1,0 +1,1 @@
+You can use apt as you have the root rights w/o passwd, this container has the NET_ADMIN cap. You can test everything you want just dont use docker as you already are in a container and nesting is disabled, edit the md files as you progress

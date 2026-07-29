@@ -1,0 +1,43 @@
+[Unit]
+Description=Foxguard control plane (API, captive portal)
+Documentation=file:///opt/foxguard/src/docs/deployment.md
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/foxguard/backend.env
+WorkingDirectory=/opt/foxguard/src/backend
+
+# foxguard-serve, never plain uvicorn. uvicorn enables ProxyHeadersMiddleware by
+# default and trusts 127.0.0.1, which rewrites the client address from
+# X-Forwarded-For before the app sees it -- and the portal identifies peers *by*
+# that address. See docs/architecture.md section 5.
+#
+# --host is the tunnel address so quarantined peers can reach the portal on
+# FOXGUARD_PORTAL_PORT. Never bind this to the WAN.
+ExecStart=/opt/foxguard/venv/bin/foxguard-serve --host 10.88.0.1 --port 8080
+
+Restart=always
+RestartSec=5
+
+# The control plane never touches the network: no CAP_NET_ADMIN, unlike the
+# agent. If this process is compromised it can still rewrite the database, but
+# it cannot program nftables itself.
+User=foxguard
+Group=foxguard
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target

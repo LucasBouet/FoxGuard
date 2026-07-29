@@ -1,0 +1,294 @@
+"""Runtime configuration.
+
+Everything is environment-driven (12-factor) so the same image runs in dev and
+on the gateway. Nothing security-sensitive has a usable default: the API
+refuses to start without explicit tokens unless ``dev_mode`` is on.
+"""
+
+from __future__ import annotations
+
+import functools
+import ipaddress
+import json
+from typing import Annotated, Any
+
+from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+from .nftables.model import GatewayInputPolicy, GatewaySpec
+
+
+def _split_list(value: Any) -> Any:
+    """Accept both JSON lists and ``a,b,c`` in environment variables.
+
+    ``NoDecode`` on the field turns off pydantic-settings' own JSON handling, so
+    both forms are decoded here -- otherwise the comma-separated form documented
+    in ``.env.example`` raises a SettingsError before any validator runs.
+    """
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return []
+        if stripped.startswith("["):
+            try:
+                return json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"expected a JSON list, got {stripped!r}: {exc}") from exc
+        return [item.strip() for item in stripped.split(",") if item.strip()]
+    return value
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="FOXGUARD_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    # --- general -----------------------------------------------------------
+    dev_mode: bool = Field(
+        default=False,
+        description="Relaxes token requirements. Never enable on the gateway.",
+    )
+    log_level: str = "INFO"
+
+    # --- database ----------------------------------------------------------
+    # PostgreSQL only, dev and prod alike -- no SQLite fallback, on purpose.
+    database_url: str = "postgresql+psycopg://foxguard:foxguard@localhost:5432/foxguard"
+
+    # --- authentication ----------------------------------------------------
+    admin_api_token: SecretStr | None = Field(
+        default=None,
+        description=(
+            "Shared bearer token for machine access to the admin API "
+            "(provisioning scripts, CI). People sign in instead, which is what "
+            "gives the audit log a name; actions taken with this token are "
+            "recorded as 'admin-token'."
+        ),
+    )
+    #: How long an administrator stays signed in.
+    admin_session_lifetime_seconds: int = Field(default=12 * 3600, ge=300)
+    #: Throttling for admin sign-in, keyed on the source address.
+    admin_login_max_attempts: int = Field(default=10, ge=1)
+    admin_login_window_seconds: int = Field(default=300, ge=1)
+    agent_api_token: SecretStr | None = Field(
+        default=None, description="Bearer token used by the gateway agent."
+    )
+
+    # --- WireGuard / IPAM --------------------------------------------------
+    wg_interface: str = "wg0"
+    wg_listen_port: int = 51820
+    wg_public_key: str | None = None
+    wg_endpoint_host: str | None = None
+    wg_config_path: str = "/etc/wireguard/wg0.conf"
+    #: Address pool for enrolled peers.
+    wg_pool_v4: str = "10.88.0.0/24"
+    wg_pool_v6: str | None = None
+    #: Pool for peers that have registered a public key but not yet presented a
+    #: valid enrollment key. Kept separate so quarantine is visible in `wg show`.
+    wg_staging_pool_v4: str | None = None
+    wg_staging_pool_v6: str | None = None
+    #: Gateway address inside the tunnel. Defaults to the first host of the pool.
+    wg_gateway_ip: str | None = None
+
+    # --- dataplane ---------------------------------------------------------
+    nft_table_name: str = "foxguard"
+    nft_path: str = "nft"
+    wan_interface: str | None = None
+    portal_port: int = 8080
+    # NoDecode is required: without it pydantic-settings JSON-decodes list-typed
+    # fields inside the env source, before any validator runs, and the
+    # documented `a,b,c` form raises a SettingsError at import time.
+    internal_cidrs: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    allow_dns_in_quarantine: bool = True
+    allow_icmp_to_gateway: bool = True
+    gateway_input_policy: GatewayInputPolicy = GatewayInputPolicy.OPEN
+    log_dropped: bool = True
+
+    # --- sessions (Phase 3) ------------------------------------------------
+    default_session_lifetime_seconds: int = 8 * 3600
+    enrollment_key_bytes: int = 32
+    #: Turning this off means user peers stay active until they log out or an
+    #: admin intervenes. Only sensible if an external cron drives
+    #: POST /api/v1/sessions/sweep instead.
+    session_sweep_enabled: bool = True
+    #: How often the sweeper looks for expired sessions. This is the granularity
+    #: of expiry, not its accuracy: a 4h lifetime ends within one interval of 4h.
+    session_sweep_interval_seconds: int = Field(default=60, ge=5)
+
+    # --- portal / enrollment (Phase 2) -------------------------------------
+    #: Throttling for the two endpoints a confined peer can already reach.
+    #: Counted per source tunnel address, failures only. See services/ratelimit.
+    portal_login_max_attempts: int = Field(default=10, ge=1)
+    portal_login_window_seconds: int = Field(default=300, ge=1)
+    enroll_max_attempts: int = Field(default=10, ge=1)
+    enroll_window_seconds: int = Field(default=300, ge=1)
+    #: Shown in the authenticator app next to the account name.
+    totp_issuer: str = "Foxguard"
+    #: Directory holding the built captive-portal bundle. When set, it is served
+    #: at "/" by this same app, which is the only arrangement that keeps peer
+    #: identification working -- see api/static.py.
+    portal_static_dir: str | None = None
+
+    # --- OIDC (Phase 2, entirely optional) ---------------------------------
+    # Foxguard must stay fully usable with no IdP configured, so every field
+    # defaults to None and `oidc_enabled` is false until all of them are set.
+    oidc_issuer: str | None = None
+    oidc_client_id: str | None = None
+    oidc_client_secret: SecretStr | None = None
+    #: Absolute URL of the callback, as registered with the IdP. It must resolve
+    #: to the portal *inside the tunnel*.
+    oidc_redirect_url: str | None = None
+    oidc_scopes: str = "openid profile email"
+    #: How long an in-flight authorisation request stays valid.
+    oidc_transaction_ttl_seconds: int = Field(default=600, ge=30)
+    #: Where to send the browser after a successful callback. Unset -> the
+    #: callback answers with JSON, which is what the tests and API clients use.
+    oidc_post_login_redirect: str | None = None
+    #: Redirect URI for *administrator* sign-in, pointing at the dashboard's own
+    #: callback route rather than at the API. The dashboard finishes the exchange
+    #: server-side, so the session token lands in its httpOnly cookie instead of
+    #: travelling through a URL. Unset -> admin SSO is off even if the portal's
+    #: OIDC is configured.
+    oidc_admin_redirect_url: str | None = None
+
+    @field_validator("internal_cidrs", mode="before")
+    @classmethod
+    def _parse_internal_cidrs(cls, value: Any) -> Any:
+        return _split_list(value)
+
+    @field_validator("internal_cidrs")
+    @classmethod
+    def _validate_internal_cidrs(cls, value: list[str]) -> list[str]:
+        for cidr in value:
+            ipaddress.ip_network(cidr, strict=False)
+        return value
+
+    @field_validator("wg_pool_v4", "wg_staging_pool_v4")
+    @classmethod
+    def _validate_v4_pool(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        network = ipaddress.ip_network(value, strict=False)
+        if network.version != 4:
+            raise ValueError(f"{value} is not an IPv4 network")
+        return str(network)
+
+    @field_validator("wg_pool_v6", "wg_staging_pool_v6")
+    @classmethod
+    def _validate_v6_pool(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        network = ipaddress.ip_network(value, strict=False)
+        if network.version != 6:
+            raise ValueError(f"{value} is not an IPv6 network")
+        return str(network)
+
+    @model_validator(mode="after")
+    def _check_secrets(self) -> Settings:
+        if not self.dev_mode:
+            missing = [
+                name
+                for name, value in (
+                    ("FOXGUARD_ADMIN_API_TOKEN", self.admin_api_token),
+                    ("FOXGUARD_AGENT_API_TOKEN", self.agent_api_token),
+                )
+                if value is None or not value.get_secret_value()
+            ]
+            if missing:
+                raise ValueError(
+                    "missing required secrets: "
+                    + ", ".join(missing)
+                    + " (set FOXGUARD_DEV_MODE=true only for local development)"
+                )
+        return self
+
+    # --- derived -----------------------------------------------------------
+
+    @property
+    def gateway_ip(self) -> str:
+        if self.wg_gateway_ip:
+            return self.wg_gateway_ip
+        network = ipaddress.ip_network(self.wg_pool_v4, strict=False)
+        return str(next(network.hosts()))
+
+    @property
+    def oidc_enabled(self) -> bool:
+        """True only when the whole OIDC quartet is configured.
+
+        Half-configured is treated as off rather than as an error: the portal
+        must keep serving local logins on a box where someone started wiring an
+        IdP and stopped.
+        """
+        return all(
+            (
+                self.oidc_issuer,
+                self.oidc_client_id,
+                self.oidc_client_secret and self.oidc_client_secret.get_secret_value(),
+                self.oidc_redirect_url,
+            )
+        )
+
+    @property
+    def oidc_admin_enabled(self) -> bool:
+        """Admin SSO needs its own redirect URI on top of a working IdP."""
+        return self.oidc_enabled and bool(self.oidc_admin_redirect_url)
+
+    @property
+    def tunnel_pools(self) -> tuple[str, ...]:
+        return tuple(
+            pool
+            for pool in (
+                self.wg_pool_v4,
+                self.wg_pool_v6,
+                self.wg_staging_pool_v4,
+                self.wg_staging_pool_v6,
+            )
+            if pool
+        )
+
+    def is_tunnel_address(self, address: str) -> bool:
+        """Is ``address`` inside one of the WireGuard pools?
+
+        Defence in depth for the portal and the enrollment endpoint, which
+        identify their caller by source address. That identification is sound
+        *only* for packets that arrived on the tunnel: WireGuard's
+        cryptokey routing means a peer cannot send from an address outside its
+        own ``AllowedIPs``, so inside wg0 the source address is as trustworthy
+        as the peer's key.
+
+        Nothing in an ASGI scope says which interface a packet came in on, so we
+        check the next best thing -- that the address belongs to a pool we
+        allocate from. A request from the LAN or the WAN fails this immediately,
+        and an off-tunnel attacker who forges a pool address cannot complete a
+        TCP handshake, because the replies are routed into the tunnel.
+        """
+        try:
+            candidate = ipaddress.ip_address(address)
+        except ValueError:
+            return False
+        for pool in self.tunnel_pools:
+            network = ipaddress.ip_network(pool, strict=False)
+            if candidate.version == network.version and candidate in network:
+                return True
+        return False
+
+    def gateway_spec(self) -> GatewaySpec:
+        """Project settings onto the pure dataplane spec used by the generator."""
+        return GatewaySpec(
+            wg_interface=self.wg_interface,
+            wan_interface=self.wan_interface,
+            table_name=self.nft_table_name,
+            portal_port=self.portal_port,
+            internal_cidrs=tuple(self.internal_cidrs),
+            allow_dns_in_quarantine=self.allow_dns_in_quarantine,
+            allow_icmp_to_gateway=self.allow_icmp_to_gateway,
+            gateway_input_policy=self.gateway_input_policy,
+            log_dropped=self.log_dropped,
+        )
+
+
+@functools.lru_cache
+def get_settings() -> Settings:
+    return Settings()

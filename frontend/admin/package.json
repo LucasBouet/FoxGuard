@@ -1,0 +1,32 @@
+{
+  "name": "foxguard-admin",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Foxguard admin dashboard: peers, groups, policy matrix, audit log, kill switch",
+  "scripts": {
+    "dev": "next dev -p 3000",
+    "build": "next build",
+    "start": "next start -p 3000",
+    "lint": "next lint",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "next": "^15.5.22",
+    "react": "19.0.0",
+    "react-dom": "19.0.0",
+    "server-only": "0.0.1"
+  },
+  "overrides": {
+    "sharp": "^0.35.3",
+    "postcss": "$postcss"
+  },
+  "devDependencies": {
+    "@types/node": "22.10.7",
+    "@types/react": "19.0.7",
+    "@types/react-dom": "19.0.3",
+    "autoprefixer": "10.4.20",
+    "postcss": "8.5.24",
+    "tailwindcss": "3.4.17",
+    "typescript": "5.7.3"
+  }
+}

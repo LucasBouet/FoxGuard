@@ -1,0 +1,145 @@
+#!/usr/sbin/nft -f
+#
+# Foxguard generated ruleset -- DO NOT EDIT BY HAND.
+# Regenerate with: foxguard-cli ruleset render   (source of truth is the database)
+#
+# This file is byte-stable: identical database state produces identical bytes.
+#
+# Create-then-delete makes the script idempotent: the first line is a
+# no-op if the table exists, and guarantees the delete never fails.
+table inet foxguard
+delete table inet foxguard
+
+table inet foxguard {
+    # networks Foxguard considers internal (ipv4)
+    set fg_internal_v4 {
+        type ipv4_addr
+        flags interval
+        elements = { 10.0.0.0/8, 192.168.0.0/16 }
+    }
+
+    # networks Foxguard considers internal (ipv6)
+    set fg_internal_v6 {
+        type ipv6_addr
+        flags interval
+    }
+
+    # peers in staging/quarantine: portal access only (ipv4)
+    set fg_quarantine_v4 {
+        type ipv4_addr
+        elements = { 10.88.0.4 }
+    }
+
+    # peers in staging/quarantine: portal access only (ipv6)
+    set fg_quarantine_v6 {
+        type ipv6_addr
+    }
+
+    # members of group admin (ipv4)
+    set g_admin_v4 {
+        type ipv4_addr
+        elements = { 10.88.0.2, 10.88.0.5 }
+    }
+
+    # members of group admin (ipv6)
+    set g_admin_v6 {
+        type ipv6_addr
+    }
+
+    # members of group db (ipv4)
+    set g_db_v4 {
+        type ipv4_addr
+        elements = { 10.88.0.3 }
+    }
+
+    # members of group db (ipv6)
+    set g_db_v6 {
+        type ipv6_addr
+    }
+
+    # members of group lab (ipv4)
+    set g_lab_v4 {
+        type ipv4_addr
+        elements = { 10.88.0.5 }
+    }
+
+    # members of group lab (ipv6)
+    set g_lab_v6 {
+        type ipv6_addr
+    }
+
+    chain input {
+        type filter hook input priority filter; policy accept;
+
+        # Foxguard only governs traffic arriving from the tunnel.
+        # Accepting here means 'no opinion': other tables still filter.
+        iifname != "wg0" accept
+        ct state invalid counter drop
+
+        # --- staging / quarantined peers: captive portal only ---
+        # Deliberately evaluated BEFORE the established/related accept:
+        # moving a peer to quarantine (session expiry, kill switch) must
+        # cut its open flows immediately, not only its new ones.
+        ip saddr @fg_quarantine_v4 tcp dport 8080 counter accept comment "fg:quarantine-portal"
+        ip6 saddr @fg_quarantine_v6 tcp dport 8080 counter accept comment "fg:quarantine-portal"
+        ip saddr @fg_quarantine_v4 udp dport 53 counter accept comment "fg:quarantine-dns"
+        ip saddr @fg_quarantine_v4 tcp dport 53 counter accept comment "fg:quarantine-dns"
+        ip6 saddr @fg_quarantine_v6 udp dport 53 counter accept comment "fg:quarantine-dns"
+        ip6 saddr @fg_quarantine_v6 tcp dport 53 counter accept comment "fg:quarantine-dns"
+        ip saddr @fg_quarantine_v4 icmp type echo-request counter accept comment "fg:quarantine-ping"
+        ip6 saddr @fg_quarantine_v6 icmpv6 type echo-request counter accept comment "fg:quarantine-ping"
+        ip saddr @fg_quarantine_v4 counter drop comment "fg:quarantine-deny"
+        ip6 saddr @fg_quarantine_v6 counter drop comment "fg:quarantine-deny"
+
+        # --- below this point, only non-confined peers are left ---
+        ct state established,related counter accept
+        # ICMP errors must pass or PMTU discovery black-holes.
+        icmp type { destination-unreachable, time-exceeded, parameter-problem } counter accept
+        icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem } counter accept
+
+        # --- active peers: gateway-local services left to the host firewall ---
+        accept comment "fg:gateway-input-open"
+    }
+
+    chain forward {
+        type filter hook forward priority filter; policy accept;
+
+        # Traffic that neither enters nor leaves the tunnel is none of
+        # our business -- never break unrelated routing on this box.
+        iifname != "wg0" oifname != "wg0" accept comment "fg:foreign-traffic"
+        ct state invalid counter drop
+
+        # --- staging / quarantined peers never transit the gateway ---
+        # Before the established/related accept on purpose: quarantining
+        # a peer must tear its open flows down, not just block new ones.
+        ip saddr @fg_quarantine_v4 counter drop comment "fg:quarantine-no-forward"
+        ip daddr @fg_quarantine_v4 counter drop comment "fg:quarantine-unreachable"
+        ip6 saddr @fg_quarantine_v6 counter drop comment "fg:quarantine-no-forward"
+        ip6 daddr @fg_quarantine_v6 counter drop comment "fg:quarantine-unreachable"
+
+        # --- below this point, only non-confined peers are left ---
+        ct state established,related counter accept comment "fg:no-reset-on-reload"
+        icmp type { destination-unreachable, time-exceeded, parameter-problem } counter accept
+        icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem } counter accept
+
+        # --- ACL policy rules (priority asc, then rule id) ---
+        ip saddr @g_lab_v4 ip daddr @g_db_v4 counter drop comment "fg:r-deny:rule r-deny"
+        ip6 saddr @g_lab_v6 ip6 daddr @g_db_v6 counter drop comment "fg:r-deny:rule r-deny"
+        ip saddr @g_admin_v4 ip daddr @g_db_v4 tcp dport 5432 counter accept comment "fg:r-db:rule r-db"
+        ip6 saddr @g_admin_v6 ip6 daddr @g_db_v6 tcp dport 5432 counter accept comment "fg:r-db:rule r-db"
+        ip saddr @g_lab_v4 ip daddr 192.168.10.0/24 tcp dport 80-443 counter accept comment "fg:r-web:rule r-web"
+
+        # --- internet exit (never a shortcut into internal networks) ---
+        ip saddr @g_lab_v4 ip daddr != @fg_internal_v4 oifname "eth0" counter accept comment "fg:internet-exit:lab"
+        ip6 saddr @g_lab_v6 ip6 daddr != @fg_internal_v6 oifname "eth0" counter accept comment "fg:internet-exit:lab"
+
+        limit rate 5/minute burst 10 packets log prefix "fg-drop " level info
+        counter drop comment "fg:default-deny"
+    }
+
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        ip saddr @g_lab_v4 oifname "eth0" counter masquerade comment "fg:nat:lab"
+        ip6 saddr @g_lab_v6 oifname "eth0" counter masquerade comment "fg:nat:lab"
+    }
+}

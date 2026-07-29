@@ -1,0 +1,113 @@
+{
+  "version": 1,
+  "groups": [
+    {
+      "slug": "admin",
+      "name": "Administrators",
+      "description": "Full access laptops",
+      "kind": "group",
+      "internet_exit": false,
+      "session_lifetime_seconds": 86400
+    },
+    {
+      "slug": "pentest-lab",
+      "name": "Pentest lab",
+      "description": "Short-lived lab access, re-auth every 4h",
+      "kind": "group",
+      "internet_exit": true,
+      "session_lifetime_seconds": 14400
+    },
+    {
+      "slug": "prod-db",
+      "name": "Production databases",
+      "kind": "group",
+      "internet_exit": false,
+      "session_lifetime_seconds": null
+    },
+    {
+      "slug": "backup-svc",
+      "name": "Backup services",
+      "description": "Server peers, enrolled by key, no session expiry",
+      "kind": "group",
+      "internet_exit": false,
+      "session_lifetime_seconds": null
+    }
+  ],
+  "acl_rules": [
+    {
+      "ref": "deny-lab-to-prod",
+      "name": "lab must never reach production",
+      "description": "Evaluated first: a deny at low priority wins over the allows below.",
+      "priority": 10,
+      "enabled": true,
+      "action": "drop",
+      "src_kind": "group",
+      "src_group": "pentest-lab",
+      "dst_kind": "group",
+      "dst_group": "prod-db",
+      "protocol": "any"
+    },
+    {
+      "ref": "admin-to-prod-db",
+      "name": "admins reach postgres",
+      "priority": 100,
+      "enabled": true,
+      "action": "accept",
+      "src_kind": "group",
+      "src_group": "admin",
+      "dst_kind": "group",
+      "dst_group": "prod-db",
+      "protocol": "tcp",
+      "dst_port_start": 5432
+    },
+    {
+      "ref": "backup-to-prod-db",
+      "name": "backup agents reach postgres",
+      "priority": 100,
+      "enabled": true,
+      "action": "accept",
+      "src_kind": "group",
+      "src_group": "backup-svc",
+      "dst_kind": "group",
+      "dst_group": "prod-db",
+      "protocol": "tcp",
+      "dst_port_start": 5432
+    },
+    {
+      "ref": "admin-to-homelab",
+      "name": "admins reach the homelab subnet",
+      "priority": 100,
+      "enabled": true,
+      "action": "accept",
+      "src_kind": "group",
+      "src_group": "admin",
+      "dst_kind": "cidr",
+      "dst_cidr": "192.168.30.0/24",
+      "protocol": "any"
+    },
+    {
+      "ref": "lab-web-range",
+      "name": "lab reaches the lab web range",
+      "priority": 200,
+      "enabled": true,
+      "action": "accept",
+      "src_kind": "group",
+      "src_group": "pentest-lab",
+      "dst_kind": "cidr",
+      "dst_cidr": "192.168.99.0/24",
+      "protocol": "tcp",
+      "dst_port_start": 80,
+      "dst_port_end": 8443
+    },
+    {
+      "ref": "ping-everywhere",
+      "name": "allow ICMP between tunnel peers",
+      "priority": 900,
+      "enabled": true,
+      "action": "accept",
+      "src_kind": "any",
+      "dst_kind": "any",
+      "protocol": "icmp"
+    }
+  ]
+}

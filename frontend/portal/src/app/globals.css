@@ -1,0 +1,67 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * Values from the validated reference palette. Dark is a *selected* set of
+ * steps for the dark surface, not an automatic inversion of light.
+ *
+ * Declared under both scopes on purpose: the media query follows the OS, the
+ * data-theme scope follows an explicit toggle, and the toggle has to win in
+ * both directions.
+ */
+:root {
+  color-scheme: light;
+  --page: #f9f9f7;
+  --surface-1: #fcfcfb;
+  --text-primary: #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted: #898781;
+  --gridline: #e1e0d9;
+  --border: rgba(11, 11, 11, 0.1);
+
+  /* Status palette — fixed, never themed. */
+  --status-good: #0ca30c;
+  --status-warning: #fab219;
+  --status-serious: #ec835a;
+  --status-critical: #d03b3b;
+  /* Informational (staging): categorical slot 1, stepped per mode. */
+  --status-info: #2a78d6;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --page: #0d0d0d;
+    --surface-1: #1a1a19;
+    --text-primary: #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted: #898781;
+    --gridline: #2c2c2a;
+    --border: rgba(255, 255, 255, 0.1);
+    --status-info: #3987e5;
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d;
+  --surface-1: #1a1a19;
+  --text-primary: #ffffff;
+  --text-secondary: #c3c2b7;
+  --text-muted: #898781;
+  --gridline: #2c2c2a;
+  --border: rgba(255, 255, 255, 0.1);
+  --status-info: #3987e5;
+}
+
+body {
+  background: var(--page);
+  color: var(--text-primary);
+}
+
+/* Columns that must align vertically get tabular figures; standalone stat-tile
+ * numbers keep the default proportional ones. */
+.tabular {
+  font-variant-numeric: tabular-nums;
+}

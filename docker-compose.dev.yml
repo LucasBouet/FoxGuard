@@ -1,0 +1,41 @@
+# Development stack. PostgreSQL only -- the same engine as production, on
+# purpose: no SQLite fallback that would hide behaviour differences (INET
+# columns, native enums, regex CHECK constraints all matter here).
+#
+#   docker compose -f docker-compose.dev.yml up -d
+#   cd backend && alembic upgrade head && uvicorn foxguard.main:app --reload
+#
+# The API is NOT containerised in dev so you keep hot reload and a debugger.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: foxguard
+      POSTGRES_PASSWORD: foxguard
+      POSTGRES_DB: foxguard
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - foxguard-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U foxguard"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Separate database for the test suite so `pytest` can drop/recreate tables
+  # without wiping your development data.
+  postgres-test:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: foxguard
+      POSTGRES_PASSWORD: foxguard
+      POSTGRES_DB: foxguard_test
+    ports:
+      - "127.0.0.1:5433:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+
+volumes:
+  foxguard-pgdata:

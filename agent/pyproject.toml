@@ -1,0 +1,35 @@
+[project]
+name = "foxguard-agent"
+version = "0.1.0"
+description = "Foxguard gateway agent: applies nftables rulesets and syncs WireGuard peers"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27",
+    "pydantic>=2.8",
+    "pydantic-settings>=2.4",
+    # Reuses foxguard.nftables (generator model + applier) so the validation and
+    # safety guards are literally the same code as the control plane's.
+    # Installed from the monorepo: pip install -e ../backend
+    "foxguard-backend>=0.1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.2", "ruff>=0.6"]
+
+[project.scripts]
+foxguard-agent = "foxguard_agent.main:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["foxguard_agent*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
