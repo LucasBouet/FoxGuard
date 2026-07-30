@@ -102,7 +102,10 @@ Options:
   --wg-interface NAME    WireGuard interface (default: $WG_IF)
   --tunnel-ip ADDR       Bind address; detected from the interface if omitted
   --pool CIDR            Peer address pool; detected if omitted
-  --staging-pool CIDR    Pool for peers that have not enrolled yet (optional)
+  --staging-pool CIDR    Separate pool for newly registered peers. Usually skip
+                         this: addresses are permanent, so it does not mark
+                         confinement, and it must be a SUBNET of --pool or peers
+                         end up unroutable.
   --wan-interface NAME   Required only if a group will use internet_exit
   --api-port PORT        API + captive portal (default: $API_PORT)
   --dashboard-port PORT  Admin dashboard (default: $DASHBOARD_PORT)
@@ -326,6 +329,28 @@ cat <<EOF
 EOF
 
 [[ -n $POOL ]] || die "could not determine the peer pool; pass --pool"
+
+# This script gives the interface the pool's own prefix (Address = $TUNNEL_IP/${POOL##*/}),
+# so here -- unlike in the API, which may not even run on this box -- "inside the
+# pool" and "reachable through the tunnel" are the same statement, and a hard
+# error is warranted. wg syncconf adds no routes, so a peer outside that prefix
+# gets its replies sent out of the default route: the handshake succeeds and
+# nothing else does. Caught now rather than at first boot.
+if [[ -n $STAGING_POOL ]]; then
+  if python3 - "$STAGING_POOL" "$POOL" <<'PY'
+import ipaddress, sys
+sys.exit(0 if ipaddress.ip_network(sys.argv[1]).subnet_of(ipaddress.ip_network(sys.argv[2])) else 1)
+PY
+  then
+    ok "staging pool $STAGING_POOL is inside $POOL"
+  else
+    die "--staging-pool $STAGING_POOL is not inside --pool $POOL.
+  Peers there would be unroutable: wg syncconf adds no routes, so the only route
+  to the tunnel is the one the interface address implies. Either widen --pool, or
+  drop --staging-pool entirely -- addresses never change after registration, so a
+  separate range buys nothing."
+  fi
+fi
 
 if [[ $CHECK_ONLY -eq 1 ]]; then
   printf '\n%sPreflight passed.%s Nothing was changed.\n\n' "$G" "$N"

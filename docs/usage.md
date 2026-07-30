@@ -9,6 +9,58 @@ your own gateway address throughout.
 
 ---
 
+## Reaching the dashboard
+
+The gateway has no desktop, and both the dashboard and the portal are bound to
+the **tunnel address** — never the LAN, never the WAN. So there are two ways in,
+and you want to know both before you need the second one.
+
+### Through the tunnel — the normal way
+
+```
+connect WireGuard  →  you land in quarantine  →  portal on :8080  →  sign in
+                   →  you are active          →  dashboard on :3000
+```
+
+That ordering is the ruleset, not a convention. A quarantined peer is allowed
+exactly one thing:
+
+```
+ip saddr @fg_quarantine_v4 tcp dport 8080 counter accept  comment "fg:quarantine-portal"
+ip saddr @fg_quarantine_v4                counter drop    comment "fg:quarantine-deny"
+```
+
+Port 3000 is not in that list. Once you sign in you are out of the quarantine
+set, and with the default `FOXGUARD_GATEWAY_INPUT_POLICY=open` the gateway's own
+services — including the dashboard — become reachable.
+
+**The bootstrap:** your laptop has to be a registered peer before any of this
+works, and registering it needs the dashboard you cannot reach yet. Break the
+loop with `curl` over SSH once (see "Day one" below), or let the installer do it
+with `--bootstrap-peer`.
+
+### Over SSH — the way that works when the tunnel does not
+
+```sh
+# from your workstation
+ssh -L 3000:10.88.0.1:3000 -L 8080:10.88.0.1:8080 root@<gateway LAN address>
+```
+
+Then open `http://localhost:3000`. The forward terminates on the gateway, which
+reaches its own tunnel address locally, so nothing has to be exposed.
+
+Keep this in your notes. The moment you actually need the dashboard is often the
+moment the tunnel is broken, and a management path that depends on the thing you
+are trying to fix is not a management path. It is the same reason the ruleset
+opens with `iifname != "wg0" accept`.
+
+> Do **not** "solve" this by binding the dashboard to `0.0.0.0` or putting a
+> reverse proxy in front of it. It holds a credential that administers your
+> network, and a proxy in front of the *portal* breaks peer identification
+> outright.
+
+---
+
 ## The model, in four sentences
 
 A **peer** is one device with one fixed tunnel address. Peers belong to

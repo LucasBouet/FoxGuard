@@ -10,12 +10,15 @@ from __future__ import annotations
 import functools
 import ipaddress
 import json
+import logging
 from typing import Annotated, Any
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from .nftables.model import GatewayInputPolicy, GatewaySpec
+
+logger = logging.getLogger(__name__)
 
 
 def _split_list(value: Any) -> Any:
@@ -184,6 +187,66 @@ class Settings(BaseSettings):
         if network.version != 6:
             raise ValueError(f"{value} is not an IPv6 network")
         return str(network)
+
+    @model_validator(mode="after")
+    def _warn_if_staging_pool_looks_unroutable(self) -> Settings:
+        """Flag a staging pool that sits outside the main pool.
+
+        Foxguard programs peers with ``wg syncconf``, which sets the crypto
+        configuration and **does not touch the routing table** -- deliberately,
+        because that is what lets untouched peers keep their handshakes. The
+        only route to the tunnel is therefore the connected one implied by the
+        interface's own address, e.g. ``10.88.0.1/24`` covering ``10.88.0.0/24``.
+
+        Give a peer an address outside that prefix and the gateway sends its
+        replies out of the default route instead: the handshake succeeds and
+        nothing else works. Measured: with the interface on ``10.13.37.1/24``,
+        ``ip route get 10.13.38.1`` resolves via ``eth0``, not the tunnel.
+
+        A warning rather than a startup error, because the invariant that
+        actually matters is *"every pool is covered by the interface's prefix"*,
+        and this process may not be able to see the interface -- the control
+        plane is allowed to run somewhere other than the gateway. A wide
+        interface (``10.13.0.1/16``) routes two sibling ``/24``s perfectly well.
+        All that can be said from configuration alone is that a staging pool
+        outside the main pool is unusual enough to name. The authoritative check
+        runs where the interface is: installer preflight and
+        ``deploy/foxguard-healthcheck.sh``.
+        """
+        for staging, main, label in (
+            (self.wg_staging_pool_v4, self.wg_pool_v4, "V4"),
+            (self.wg_staging_pool_v6, self.wg_pool_v6, "V6"),
+        ):
+            if not staging:
+                continue
+            if not main:
+                logger.warning(
+                    "FOXGUARD_WG_STAGING_POOL_%s is set but FOXGUARD_WG_POOL_%s "
+                    "is not, so every peer is allocated out of the staging pool.",
+                    label,
+                    label,
+                )
+                continue
+            staging_net = ipaddress.ip_network(staging, strict=False)
+            main_net = ipaddress.ip_network(main, strict=False)
+            if not staging_net.subnet_of(main_net):
+                logger.warning(
+                    "FOXGUARD_WG_STAGING_POOL_%s (%s) is not inside "
+                    "FOXGUARD_WG_POOL_%s (%s). Peers are allocated there at "
+                    "registration and never move, so unless %s's own address "
+                    "covers both ranges they are unroutable: wg syncconf adds "
+                    "no routes, and the only route to the tunnel is the one the "
+                    "interface address implies. Run foxguard-healthcheck.sh on "
+                    "the gateway to find out. Dropping the staging pool costs "
+                    "nothing -- an address never changes after registration, so "
+                    "a separate range does not mark confinement.",
+                    label,
+                    staging_net,
+                    label,
+                    main_net,
+                    self.wg_interface,
+                )
+        return self
 
     @model_validator(mode="after")
     def _check_secrets(self) -> Settings:

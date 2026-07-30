@@ -179,8 +179,10 @@ FOXGUARD_AGENT_API_TOKEN=<agent token>
 
 FOXGUARD_WG_INTERFACE=wg0
 FOXGUARD_WG_POOL_V4=10.88.0.0/24
-FOXGUARD_WG_STAGING_POOL_V4=10.88.9.0/24
 FOXGUARD_WG_GATEWAY_IP=10.88.0.1
+# Leave FOXGUARD_WG_STAGING_POOL_V4 unset. It does not mark confinement --
+# addresses are permanent -- and outside the prefix wg0 carries it makes peers
+# unroutable. See "The staging pool" in docs/architecture.md.
 
 FOXGUARD_WAN_INTERFACE=eth0
 FOXGUARD_PORTAL_PORT=8080

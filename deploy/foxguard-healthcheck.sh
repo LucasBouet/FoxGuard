@@ -196,8 +196,57 @@ ok "$OTHER nftables table(s) present in total — Foxguard never flushes the oth
 # --------------------------------------------------------------------------- #
 section "WireGuard"
 
+# Is a pool actually reachable through the tunnel?
+#
+# `wg syncconf` sets crypto state and never touches the routing table -- which is
+# what lets untouched peers keep their handshakes, so it is not going to change.
+# The consequence is that a pool outside whatever prefix the interface carries is
+# silently unroutable: the handshake succeeds and nothing else does, because the
+# gateway sends its replies out of the default route.
+#
+# Measured rather than inferred. Comparing the pool against the interface's
+# prefix would be arithmetic on an assumption; an operator may have added routes
+# by hand, which is a perfectly good way to make a pool reachable, and `ip route
+# get` accounts for that on its own.
+pool_routes_into_tunnel() {
+  local pool=$1 label=$2 probe dev
+  [[ -n $pool ]] || return 0
+  probe=$(python3 - "$pool" "$TUNNEL_IP" 2>/dev/null <<'PY'
+import ipaddress, sys
+net = ipaddress.ip_network(sys.argv[1], strict=False)
+for host in (net.network_address + 1, net.broadcast_address - 1):
+    if host in net and str(host) != sys.argv[2]:
+        print(host)
+        break
+PY
+)
+  if [[ -z $probe ]]; then
+    warn "$label $pool is too small to probe"
+    return 0
+  fi
+  dev=$(ip route get "$probe" 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -1)
+  if [[ $dev == "$WG_IF" ]]; then
+    ok "$label $pool routes into $WG_IF"
+  elif [[ -z $dev ]]; then
+    bad "$label $pool has no route at all (probed $probe)"
+  else
+    bad "$label $pool is unroutable: $probe leaves via $dev, not $WG_IF.
+    Peers there complete a handshake and nothing else. Either widen $WG_IF's
+    address to cover the pool, or move the pool inside the prefix it already has."
+  fi
+}
+
 if ip link show "$WG_IF" >/dev/null 2>&1; then
   ok "interface $WG_IF is up"
+
+  pool_routes_into_tunnel "${FOXGUARD_WG_POOL_V4:-}" "peer pool"
+  pool_routes_into_tunnel "${FOXGUARD_WG_POOL_V6:-}" "peer pool"
+  # Not a confinement boundary: an address is allocated once, at registration,
+  # and never changes, so with this set *every* peer lives here permanently --
+  # which makes it exactly as load-bearing as the main pool.
+  pool_routes_into_tunnel "${FOXGUARD_WG_STAGING_POOL_V4:-}" "staging pool"
+  pool_routes_into_tunnel "${FOXGUARD_WG_STAGING_POOL_V6:-}" "staging pool"
+
   LIVE=$(wg show "$WG_IF" peers 2>/dev/null | wc -l)
   WANTED=$(curl -sf -m 10 -H "Authorization: Bearer ${FOXGUARD_AGENT_API_TOKEN:-}" \
            "$API/api/v1/agent/state" 2>/dev/null | jq -r '.wg_peers | length' 2>/dev/null)

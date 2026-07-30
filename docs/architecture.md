@@ -65,9 +65,53 @@ So the flow is:
    inside the tunnel*. The hash matches and the key has not expired → the peer
    moves to `active` and joins its groups. The ruleset is regenerated.
 
-A separate staging pool is worth configuring: it makes the confinement visible
-in `wg show` and in flow logs, rather than having quarantined and active peers
-interleaved in one range.
+### The staging pool does less than it looks like, and can break routing
+
+`FOXGUARD_WG_STAGING_POOL_V4` was introduced on the theory that it would make
+confinement visible in `wg show` — quarantined peers in one range, active peers
+in another. **It does not do that**, and the claim was wrong:
+
+* A peer's address is allocated **once**, at registration, and never changes.
+  There is a single allocation site and every peer is created in `staging`, so
+  with a staging pool configured *every* peer gets an address from it —
+  permanently, including after it goes active. The main pool ends up unused for
+  peer addressing.
+* Worse, if the staging pool is not covered by a route into the tunnel, its
+  peers are **unroutable**. Foxguard programs peers with `wg syncconf`, which
+  sets the crypto configuration and does not touch the routing table (that is
+  what lets untouched peers keep their handshakes). Unless routes were added by
+  hand, the only route to the tunnel is the connected one implied by the
+  interface address, so with `wg0` on `10.13.37.1/24` a peer at `10.13.38.1`
+  gets its replies sent out the default route. The handshake succeeds and
+  nothing else works — measured, not theorised.
+
+The first failure is inherent: a WireGuard peer needs a stable address, since
+the client bakes it into its own config and `AllowedIPs` must match, so
+state-dependent addressing is not something this design can offer.
+
+The second is checked in three places, at decreasing strength:
+
+| Where | Check | Severity |
+| --- | --- | --- |
+| `foxguard-install.sh` preflight | `--staging-pool` ⊆ `--pool` | fatal |
+| `foxguard-healthcheck.sh` | `ip route get` into each pool lands on `wg0` | failure |
+| `Settings` | staging pool ⊆ main pool | warning only |
+
+The installer can be strict because it creates the interface itself, with the
+main pool's prefix — there, "inside the pool" and "reachable" are the same
+statement. The healthcheck runs on the gateway and measures the real invariant
+directly, which also credits routes an operator added by hand. `Settings` only
+warns: the control plane is allowed to run somewhere other than the gateway, so
+it cannot see the interface, and subnet arithmetic on the pools alone would
+reject a perfectly good deployment — a `wg0` on `10.13.0.1/16` routes two
+sibling `/24`s without complaint.
+
+**Recommendation: use one pool.** Set `FOXGUARD_WG_POOL_V4` and leave the
+staging pool unset. If you want a separate range anyway, carve it out of the
+range the interface's address already covers (`10.88.0.128/25` under a
+`10.88.0.1/24` interface) and know that it is simply where peers are allocated,
+not a marker of their state. `peers.state` is the marker, and the `fg_quarantine_*`
+nftables sets are what enforce it.
 
 Server-peer enrollment keys:
 
