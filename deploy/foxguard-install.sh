@@ -59,6 +59,13 @@ BOOTSTRAP_PEER=""
 ENDPOINT=""
 DEFAULT_POOL=10.88.0.0/24
 
+# Internal DNS is opt-in: it puts a resolver on the gateway, which is a service
+# nobody asked for by installing an access-control system.
+DNS_ENABLED=0
+DNS_ZONE="fox.internal"
+DNS_MODE="forward"
+DNS_UPSTREAMS=""
+
 # --------------------------------------------------------------------------- #
 # output
 # --------------------------------------------------------------------------- #
@@ -112,6 +119,15 @@ Options:
   --admin-user NAME      First administrator account (default: $ADMIN_USER)
   --skip-frontend        Do not build the portal or dashboard
   --check-only           Run the preflight checks and exit
+
+Internal DNS (opt-in — a resolver on the gateway, for the tunnel only):
+  --dns                  Install dnsmasq and serve names for peers and zones
+  --dns-zone NAME        Zone every device lives in (default: $DNS_ZONE)
+  --dns-mode MODE        forward (resolve everything, send the rest upstream)
+                         or split (answer for the zone, REFUSE the rest). split
+                         only works if clients are configured to send just
+                         in-zone queries here. Default: $DNS_MODE
+  --dns-upstream ADDR    Upstream resolver, repeatable. Forward mode only.
   -y, --yes              Do not prompt
   -h, --help             This text
 
@@ -140,6 +156,10 @@ while [[ $# -gt 0 ]]; do
     --dashboard-port)  DASHBOARD_PORT=$2; shift 2 ;;
     --admin-user)      ADMIN_USER=$2; shift 2 ;;
     --skip-frontend)   SKIP_FRONTEND=1; shift ;;
+    --dns)             DNS_ENABLED=1; shift ;;
+    --dns-zone)        DNS_ZONE=$2; DNS_ENABLED=1; shift 2 ;;
+    --dns-mode)        DNS_MODE=$2; DNS_ENABLED=1; shift 2 ;;
+    --dns-upstream)    DNS_UPSTREAMS="${DNS_UPSTREAMS:+$DNS_UPSTREAMS,}$2"; DNS_ENABLED=1; shift 2 ;;
     --bootstrap-wireguard) BOOTSTRAP_WG=1; shift ;;
     --listen-port)     LISTEN_PORT=$2; shift 2 ;;
     --bootstrap-peer)  BOOTSTRAP_PEER=$2; shift 2 ;;
@@ -304,6 +324,34 @@ for port in "$API_PORT" "$DASHBOARD_PORT"; do
   fi
 done
 
+# Port 53. Checked separately from the two above because it is normal for
+# something to already hold it -- systemd-resolved holds it on most desktops --
+# and because the check has to be per address, not global: Foxguard's resolver
+# binds only $TUNNEL_IP, so a stub listener on 127.0.0.53 is not a conflict.
+if [[ $DNS_ENABLED -eq 1 ]]; then
+  if [[ -z $TUNNEL_IP ]]; then
+    # Without a bind address the match below would degenerate to ":53" and
+    # report free for a resolver that will collide. Say so instead of guessing.
+    warn "cannot check udp/53 yet: no tunnel address (the interface is missing above)"
+  elif ss -lun 2>/dev/null | awk 'NR>1 {print $4}' \
+       | grep -qE "^(${TUNNEL_IP//./\\.}|0\.0\.0\.0|\[?::\]?|\*):53\$"; then
+    fail "udp/53 on $TUNNEL_IP is already taken -- stop that resolver, or bind it"
+    fail "to its own address (systemd-resolved: DNSStubListener=no)"
+    PREFLIGHT_FAILED=1
+  else
+    ok "udp/53 on $TUNNEL_IP is free"
+  fi
+  case $DNS_MODE in
+    forward|split) ok "DNS mode $DNS_MODE, zone $DNS_ZONE" ;;
+    *) fail "--dns-mode must be 'forward' or 'split', got $DNS_MODE"; PREFLIGHT_FAILED=1 ;;
+  esac
+  if [[ $DNS_MODE == split && -n $DNS_UPSTREAMS ]]; then
+    warn "--dns-upstream is ignored in split mode: it has no upstream by design"
+  fi
+  # .local is mDNS. Serving it here fights with Avahi/Bonjour on every client.
+  [[ $DNS_ZONE == *.local ]] && warn "$DNS_ZONE ends in .local, which is mDNS territory -- expect clients to resolve it inconsistently"
+fi
+
 # IP forwarding: without it the gateway filters traffic it never routes.
 if [[ $(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null) == 1 ]]; then
   ok "IPv4 forwarding is on"
@@ -370,6 +418,10 @@ apt-get update -qq
 PACKAGES=(nftables wireguard-tools iproute2 postgresql python3 python3-venv python3-dev
           libpq-dev build-essential curl jq)
 [[ $SKIP_FRONTEND -eq 0 ]] && PACKAGES+=(nodejs npm)
+# dnsmasq-base, not dnsmasq: the full package ships an /etc/dnsmasq.conf and a
+# system unit that would bind :53 itself and fight with the instance Foxguard
+# runs on its own configuration file.
+[[ $DNS_ENABLED -eq 1 ]] && PACKAGES+=(dnsmasq-base)
 apt-get install -y -qq "${PACKAGES[@]}"
 ok "packages installed"
 
@@ -507,6 +559,19 @@ FOXGUARD_INTERNAL_CIDRS=10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
 FOXGUARD_GATEWAY_INPUT_POLICY=open
 FOXGUARD_LOG_DROPPED=true
 
+$( [[ $DNS_ENABLED -eq 1 ]] && cat <<DNSEOF
+FOXGUARD_DNS_ENABLED=true
+FOXGUARD_DNS_ZONE=$DNS_ZONE
+FOXGUARD_DNS_MODE=$DNS_MODE
+FOXGUARD_DNS_GATEWAY_LABEL=gw
+# Tunnel addresses only. A WAN address here publishes an open resolver.
+FOXGUARD_DNS_LISTEN_ADDRESSES=$TUNNEL_IP
+FOXGUARD_DNS_UPSTREAMS=$DNS_UPSTREAMS
+FOXGUARD_DNS_HOSTS_PATH=$CONFDIR/dns/hosts
+FOXGUARD_DNS_CONF_PATH=$CONFDIR/dns/dnsmasq.conf
+DNSEOF
+)
+
 FOXGUARD_DEFAULT_SESSION_LIFETIME_SECONDS=28800
 FOXGUARD_SESSION_SWEEP_ENABLED=true
 FOXGUARD_SESSION_SWEEP_INTERVAL_SECONDS=60
@@ -527,6 +592,12 @@ FOXGUARD_AGENT_LOG_LEVEL=INFO
 # ruleset and validates it with 'nft -c -f' but applies nothing. Read the rules,
 # then set this to false and restart. See docs/deployment.md section 4.
 FOXGUARD_AGENT_DRY_RUN=true
+
+# Dry run covers routes too: the agent reports what it would install and
+# touches the routing table only once you turn it off.
+FOXGUARD_AGENT_MANAGE_ROUTES=true
+FOXGUARD_AGENT_MANAGE_DNS=$( [[ $DNS_ENABLED -eq 1 ]] && echo true || echo false )
+FOXGUARD_AGENT_DNS_DIR=$CONFDIR/dns
 EOF
 chmod 0600 "$CONFDIR/agent.env"
 
@@ -583,6 +654,17 @@ render_unit() { # render_unit <source> <dest>
 
 render_unit "$SRC/backend/systemd/foxguard-api.service"  /etc/systemd/system/foxguard-api.service
 render_unit "$SRC/agent/systemd/foxguard-agent.service"  /etc/systemd/system/foxguard-agent.service
+if [[ $DNS_ENABLED -eq 1 ]]; then
+  # The zone itself is written by the agent on its first poll. The directory has
+  # to exist first, and world-traversable: dnsmasq drops privileges at startup
+  # and re-reads the hosts file as an unprivileged user, so 0700 here produces a
+  # resolver that works until its first reload and then serves nothing.
+  install -d -m 0755 "$CONFDIR/dns"
+  render_unit "$SRC/agent/systemd/foxguard-dns.service" /etc/systemd/system/foxguard-dns.service
+  sed -i "s|/etc/foxguard/dns|$CONFDIR/dns|g; s|wg-quick@wg0.service|wg-quick@$WG_IF.service|" \
+      /etc/systemd/system/foxguard-dns.service
+  ok "foxguard-dns unit installed (started by the agent once it has a zone)"
+fi
 [[ $SKIP_FRONTEND -eq 0 ]] && \
   render_unit "$SRC/frontend/admin/systemd/foxguard-dashboard.service" \
               /etc/systemd/system/foxguard-dashboard.service

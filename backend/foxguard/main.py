@@ -15,6 +15,7 @@ from .api.routes import (
     agent,
     audit,
     dashboard,
+    dns,
     enroll,
     groups,
     killswitch,
@@ -24,6 +25,7 @@ from .api.routes import (
     ruleset,
     sessions,
     users,
+    zones,
 )
 from .api.static import mount_portal
 from .config import get_settings
@@ -80,8 +82,10 @@ def create_app() -> FastAPI:
     for router in (
         users.router,
         groups.router,
+        zones.router,
         peers.router,
         acl.router,
+        dns.router,
         policies.router,
         ruleset.router,
         audit.router,

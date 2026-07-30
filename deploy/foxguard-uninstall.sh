@@ -45,7 +45,9 @@ REMOVE_WG=0
 REMOVE_PACKAGES=0
 REMOVE_DATABASE=0
 
-UNITS=(foxguard-agent foxguard-dashboard foxguard-api)
+# Agent first: it is what writes the nft table, the DNS zone and the routes, so
+# stopping anything else before it just gives it a chance to put them back.
+UNITS=(foxguard-agent foxguard-dns foxguard-dashboard foxguard-api)
 
 # What the installer apt-installs and what is safe to purge afterwards.
 #
@@ -55,7 +57,7 @@ UNITS=(foxguard-agent foxguard-dashboard foxguard-api)
 # up after Foxguard trades a clean uninstall for an unbootable-ish machine.
 # They were almost certainly present before Foxguard anyway.
 REMOVABLE=(nftables wireguard-tools postgresql python3-venv python3-dev
-           libpq-dev build-essential jq nodejs npm)
+           libpq-dev build-essential jq nodejs npm dnsmasq-base)
 NEVER_REMOVE=(python3 curl iproute2)
 
 # --------------------------------------------------------------------------- #
@@ -289,7 +291,42 @@ else
 fi
 
 # --------------------------------------------------------------------------- #
-# 4. units, files, user
+# 4. kernel routes the agent installed
+#
+# Not opt-in, and not left behind either: these point into a tunnel interface
+# whose peers nothing manages any more, so leaving them is leaving a black hole
+# in the routing table. Only the ones recorded in the state file are removed --
+# the same rule the agent itself follows, so a route an operator added by hand
+# to the same network survives.
+# --------------------------------------------------------------------------- #
+
+step "Kernel routes"
+
+ROUTES_FILE=$STATEDIR/routes.json
+if [[ ! -f $ROUTES_FILE ]]; then
+  skip "no routes recorded in $ROUTES_FILE"
+elif ! command -v jq >/dev/null; then
+  warn "jq is gone, so $ROUTES_FILE cannot be read; remove its routes by hand:"
+  warn "  ip route show dev $WG_IF"
+  PROBLEMS+=("removed the routes listed in $ROUTES_FILE")
+else
+  mapfile -t recorded < <(jq -r '.[]?' "$ROUTES_FILE" 2>/dev/null)
+  if [[ ${#recorded[@]} -eq 0 ]]; then
+    skip "no routes recorded in $ROUTES_FILE"
+  fi
+  for cidr in "${recorded[@]}"; do
+    [[ -n $cidr ]] || continue
+    family=-4; [[ $cidr == *:* ]] && family=-6
+    if ip "$family" route show exact "$cidr" 2>/dev/null | grep -q .; then
+      attempt "removed route $cidr" ip "$family" route del "$cidr" dev "$WG_IF"
+    else
+      skip "route $cidr is already gone"
+    fi
+  done
+fi
+
+# --------------------------------------------------------------------------- #
+# 5. units, files, user
 # --------------------------------------------------------------------------- #
 
 step "Removing files"
@@ -317,7 +354,7 @@ else
 fi
 
 # --------------------------------------------------------------------------- #
-# 5. WireGuard (opt-in)
+# 6. WireGuard (opt-in)
 # --------------------------------------------------------------------------- #
 
 step "WireGuard"
@@ -344,7 +381,7 @@ else
 fi
 
 # --------------------------------------------------------------------------- #
-# 6. packages (opt-in)
+# 7. packages (opt-in)
 #
 # Simulated first and shown in full. apt is allowed to have the last word: if
 # purging these would cascade into something else, that is exactly the thing

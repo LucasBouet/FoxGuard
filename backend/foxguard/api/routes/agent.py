@@ -7,16 +7,25 @@ binary works whether it runs on the API box or on a separate gateway.
 
 from __future__ import annotations
 
+import uuid
+
 from fastapi import APIRouter, Depends, Request
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ...config import Settings, get_settings
 from ...db import get_db
-from ...models import ActorType, Peer, RulesetStatus, RulesetVersion
+from ...models import ActorType, Peer, RulesetStatus, RulesetVersion, ZoneRoute
 from ...nftables import PeerState, ruleset_digest
-from ...schemas import AgentReport, AgentStateResponse, AgentWireGuardPeer
+from ...schemas import (
+    AgentDnsState,
+    AgentReport,
+    AgentRoute,
+    AgentStateResponse,
+    AgentWireGuardPeer,
+)
 from ...services import audit
+from ...services import dns as dns_service
 from ...services import ruleset as ruleset_service
 from ..deps import client_ip, require_agent
 
@@ -52,6 +61,30 @@ def get_state(
         .scalars()
         .all()
     )
+
+    # Networks a peer carries for a zone. They belong in that peer's AllowedIPs
+    # because WireGuard's cryptokey routing is what decides which peer a packet
+    # for 192.168.10.7 is encrypted to -- without it the kernel route into the
+    # tunnel exists and every packet is dropped as unroutable at the wg layer.
+    # Only enabled routes, and only where the zone itself still exists.
+    routed: dict[uuid.UUID, list[str]] = {}
+    carried = (
+        session.execute(
+            select(ZoneRoute)
+            .where(ZoneRoute.enabled.is_(True), ZoneRoute.via_peer_id.is_not(None))
+            .order_by(ZoneRoute.cidr)
+        )
+        .scalars()
+        .all()
+    )
+    for route in carried:
+        routed.setdefault(route.via_peer_id, []).append(route.cidr)
+
+    # Only peers that can actually be on the interface carry anything: a route
+    # whose peer is disabled or revoked would sit in the kernel table pointing
+    # at a tunnel that will drop every packet.
+    present = {peer.id for peer in peers}
+
     wg_peers = []
     for peer in peers:
         allowed: list[str] = []
@@ -59,16 +92,41 @@ def get_state(
             allowed.append(f"{peer.tunnel_ip}/32")
         if peer.tunnel_ip6:
             allowed.append(f"{peer.tunnel_ip6}/128")
+        # Sorted so an unchanged fleet produces an unchanged config and
+        # ``wg syncconf`` stays a no-op.
+        allowed.extend(sorted(routed.get(peer.id, ())))
         if allowed:
             wg_peers.append(
                 AgentWireGuardPeer(public_key=peer.wg_public_key, allowed_ips=allowed)
             )
+
+    # Rendered last and allowed to yield nothing. A hand-authored DNS record
+    # must never be able to stop firewall rules reaching the kernel, so the
+    # failure is logged there and the agent simply leaves the resolver alone.
+    rendered = dns_service.render_or_none(session, settings)
+    dns_state = (
+        AgentDnsState(
+            digest=rendered[2],
+            hosts=rendered[0],
+            conf=rendered[1],
+            hosts_path=settings.dns_hosts_path,
+            conf_path=settings.dns_conf_path,
+        )
+        if rendered
+        else None
+    )
 
     return AgentStateResponse(
         digest=ruleset_digest(content),
         ruleset=content,
         wg_interface=settings.wg_interface,
         wg_peers=wg_peers,
+        routes=[
+            AgentRoute(cidr=route.cidr, via_peer_id=route.via_peer_id)
+            for route in carried
+            if route.via_peer_id in present
+        ],
+        dns=dns_state,
     )
 
 
@@ -107,4 +165,18 @@ def report(
         source_ip=client_ip(request),
         detail={"digest": payload.digest, "error": payload.error},
     )
+
+    # Its own entry rather than a field on the one above: a resolver that will
+    # not reload and a ruleset that will not apply are different incidents, and
+    # the audit log is where someone looks to tell them apart.
+    if payload.dns_error:
+        audit.record(
+            session,
+            action="dns.apply_failed",
+            actor_type=ActorType.AGENT,
+            actor_label="gateway-agent",
+            object_type="dns_zone",
+            source_ip=client_ip(request),
+            detail={"digest": payload.dns_digest, "error": payload.dns_error},
+        )
     session.commit()

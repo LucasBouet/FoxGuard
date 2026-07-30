@@ -22,6 +22,7 @@ from .generator import (
     quarantine_set_name,
     ruleset_digest,
     validate_spec,
+    zone_set_name,
 )
 from .model import (
     FAMILIES,
@@ -36,8 +37,10 @@ from .model import (
     PeerState,
     PeerType,
     Protocol,
+    RouteSpec,
     RulesetSpec,
     RuleSpec,
+    ZoneSpec,
 )
 
 __all__ = [
@@ -60,14 +63,17 @@ __all__ = [
     "PeerState",
     "PeerType",
     "Protocol",
+    "RouteSpec",
     "RuleSpec",
     "RulesetSpec",
     "RulesetValidationError",
     "SubprocessRunner",
+    "ZoneSpec",
     "generate_ruleset",
     "group_set_name",
     "internal_set_name",
     "quarantine_set_name",
     "ruleset_digest",
     "validate_spec",
+    "zone_set_name",
 ]

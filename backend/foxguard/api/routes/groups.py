@@ -11,11 +11,15 @@ from sqlalchemy.orm import Session
 
 from ...config import Settings, get_settings
 from ...db import get_db
-from ...models import Group
+from ...models import Group, GroupKind
 from ...schemas import GroupCreate, GroupRead, GroupUpdate
 from ...services import audit
-from ...services import ruleset as ruleset_service
-from ..deps import audit_context, integrity_conflict, require_admin
+from ..deps import (
+    audit_context,
+    integrity_conflict,
+    regenerate_or_422,
+    require_admin,
+)
 
 router = APIRouter(
     prefix="/api/v1/groups", tags=["groups"], dependencies=[Depends(require_admin)]
@@ -23,15 +27,26 @@ router = APIRouter(
 
 
 def _get_or_404(session: Session, group_id: uuid.UUID) -> Group:
+    """Zones share this table but are not reachable through this router.
+
+    Returning one here would let it be renamed, have ``internet_exit`` flipped,
+    or be deleted without the zone endpoints' route handling ever running.
+    """
     group = session.get(Group, group_id)
-    if group is None:
+    if group is None or group.kind is GroupKind.ZONE:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "group not found")
     return group
 
 
 @router.get("", response_model=list[GroupRead])
 def list_groups(session: Session = Depends(get_db)) -> list[Group]:
-    return list(session.execute(select(Group).order_by(Group.slug)).scalars().all())
+    return list(
+        session.execute(
+            select(Group).where(Group.kind != GroupKind.ZONE).order_by(Group.slug)
+        )
+        .scalars()
+        .all()
+    )
 
 
 @router.post("", response_model=GroupRead, status_code=status.HTTP_201_CREATED)
@@ -41,6 +56,13 @@ def create_group(
     session: Session = Depends(get_db),
     settings: Settings = Depends(get_settings),
 ) -> Group:
+    if payload.kind is GroupKind.ZONE:
+        # Creating one here would skip everything that makes a zone a zone --
+        # routes, the single-zone-per-peer rule, the dashboard's own page.
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "create zones through POST /api/v1/zones",
+        )
     group = Group(**payload.model_dump())
     session.add(group)
     try:
@@ -59,7 +81,7 @@ def create_group(
         **audit_context(request),
         detail={"slug": group.slug},
     )
-    ruleset_service.regenerate(session, settings, generated_by="group.create")
+    regenerate_or_422(session, settings, "group.create")
     session.commit()
     return group
 
@@ -91,7 +113,7 @@ def update_group(
         **audit_context(request),
         detail={"slug": group.slug, "changes": list(changes)},
     )
-    ruleset_service.regenerate(session, settings, generated_by="group.update")
+    regenerate_or_422(session, settings, "group.update")
     session.commit()
     return group
 
@@ -118,5 +140,5 @@ def delete_group(
         **audit_context(request),
         detail={"slug": slug},
     )
-    ruleset_service.regenerate(session, settings, generated_by="group.delete")
+    regenerate_or_422(session, settings, "group.delete")
     session.commit()

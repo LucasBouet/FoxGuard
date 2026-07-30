@@ -10,7 +10,7 @@ import {
   relative,
 } from "@/components/ui";
 import { tryGet } from "@/lib/api";
-import type { Group, Peer, PeerState, Tag, User } from "@/lib/types";
+import type { Group, Peer, PeerState, Tag, User, Zone } from "@/lib/types";
 
 import { CreatePeer, PeerActions } from "./peer-admin";
 
@@ -70,9 +70,10 @@ export default async function PeersPage({
   const filters = await searchParams;
   const query = buildQuery(filters);
 
-  const [peers, groups, tags, users] = await Promise.all([
+  const [peers, groups, zones, tags, users] = await Promise.all([
     tryGet<Peer[]>(`/api/v1/peers${query}`),
     tryGet<Group[]>("/api/v1/groups"),
+    tryGet<Zone[]>("/api/v1/zones"),
     tryGet<Tag[]>("/api/v1/tags"),
     tryGet<User[]>("/api/v1/users"),
   ]);
@@ -86,7 +87,11 @@ export default async function PeersPage({
 
   return (
     <div className="space-y-4">
-      <CreatePeer groups={groups.data ?? []} users={users.data ?? []} />
+      <CreatePeer
+        groups={groups.data ?? []}
+        zones={zones.data ?? []}
+        users={users.data ?? []}
+      />
 
       {/* Filters sit in one row above the table, never inside it. */}
       <div className="space-y-2 rounded-lg border border-hairline bg-surface p-4">
@@ -177,7 +182,11 @@ export default async function PeersPage({
                   : relative(peer.last_authenticated_at)}
               </Cell>
               <Cell className="text-right">
-                <PeerActions peer={peer} groups={groups.data ?? []} />
+                <PeerActions
+                  peer={peer}
+                  groups={groups.data ?? []}
+                  zones={zones.data ?? []}
+                />
               </Cell>
             </Row>
           ))}

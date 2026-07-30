@@ -22,8 +22,10 @@ from foxguard.nftables import (
     PeerState,
     PeerType,
     Protocol,
+    RouteSpec,
     RulesetSpec,
     RuleSpec,
+    ZoneSpec,
 )
 
 # --------------------------------------------------------------------------- #
@@ -52,6 +54,7 @@ def peer(
     ip6: str | None = None,
     state: PeerState = PeerState.ACTIVE,
     groups: tuple[str, ...] = (),
+    zone: str | None = None,
     peer_type: PeerType = PeerType.USER,
 ) -> PeerSpec:
     return PeerSpec(
@@ -62,6 +65,23 @@ def peer(
         tunnel_ip=ip,
         tunnel_ip6=ip6,
         group_slugs=groups,
+        zone_slug=zone,
+    )
+
+
+def zone(
+    slug: str,
+    *,
+    intra_zone: bool = False,
+    internet_exit: bool = False,
+    routes: tuple[str, ...] = (),
+    via: str | None = None,
+) -> ZoneSpec:
+    return ZoneSpec(
+        slug=slug,
+        intra_zone=intra_zone,
+        internet_exit=internet_exit,
+        routes=tuple(RouteSpec(cidr=cidr, via_peer_id=via) for cidr in routes),
     )
 
 
@@ -93,12 +113,13 @@ def rule(
 def spec(
     *,
     groups: tuple[GroupSpec, ...] = (),
+    zones: tuple[ZoneSpec, ...] = (),
     peers: tuple[PeerSpec, ...] = (),
     rules: tuple[RuleSpec, ...] = (),
     gw: GatewaySpec | None = None,
 ) -> RulesetSpec:
     return RulesetSpec(
-        gateway=gw or gateway(), groups=groups, peers=peers, rules=rules
+        gateway=gw or gateway(), groups=groups, zones=zones, peers=peers, rules=rules
     )
 
 

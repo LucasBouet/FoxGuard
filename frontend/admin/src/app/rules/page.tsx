@@ -1,6 +1,6 @@
 import { ActionBadge, Card, Cell, Dot, ErrorPanel, Row, Table } from "@/components/ui";
 import { tryGet } from "@/lib/api";
-import type { AclEndpoint, AclRule, Group } from "@/lib/types";
+import type { AclEndpoint, AclRule, Group, Zone } from "@/lib/types";
 
 import { CreateRule, RuleActions } from "./rule-admin";
 
@@ -8,6 +8,9 @@ export const dynamic = "force-dynamic";
 
 function describe(endpoint: AclEndpoint): string {
   if (endpoint.kind === "group") return endpoint.group_slug ?? "?";
+  // Prefixed, because a zone and a group can never share a slug but a reader
+  // still has to know which kind of thing the rule is about.
+  if (endpoint.kind === "zone") return `zone:${endpoint.zone_slug ?? "?"}`;
   if (endpoint.kind === "cidr") return endpoint.cidr ?? "?";
   return "any";
 }
@@ -22,9 +25,10 @@ function ports(rule: AclRule): string {
 }
 
 export default async function RulesPage() {
-  const [rules, groups] = await Promise.all([
+  const [rules, groups, zones] = await Promise.all([
     tryGet<AclRule[]>("/api/v1/acl-rules"),
     tryGet<Group[]>("/api/v1/groups"),
+    tryGet<Zone[]>("/api/v1/zones"),
   ]);
   if (rules.error || !rules.data) return <ErrorPanel message={rules.error ?? "no data"} />;
 
@@ -43,7 +47,7 @@ export default async function RulesPage() {
         </p>
       </div>
 
-      <CreateRule groups={groups.data ?? []} />
+      <CreateRule groups={groups.data ?? []} zones={zones.data ?? []} />
 
       <Card>
         <Table
@@ -76,7 +80,11 @@ export default async function RulesPage() {
                 )}
               </Cell>
               <Cell className="text-right">
-                <RuleActions rule={rule} groups={groups.data ?? []} />
+                <RuleActions
+                  rule={rule}
+                  groups={groups.data ?? []}
+                  zones={zones.data ?? []}
+                />
               </Cell>
             </Row>
           ))}

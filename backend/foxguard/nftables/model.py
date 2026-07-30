@@ -27,8 +27,10 @@ __all__ = [
     "PeerState",
     "PeerType",
     "Protocol",
+    "RouteSpec",
     "RuleSpec",
     "RulesetSpec",
+    "ZoneSpec",
     "FAMILIES",
 ]
 
@@ -118,6 +120,10 @@ class EndpointKind(str, Enum):
     ANY = "any"
     GROUP = "group"
     CIDR = "cidr"
+    #: A whole network zone: its member peers *and* the networks routed inside
+    #: it. Distinct from ``GROUP`` because the two answer different questions --
+    #: a group is a set of devices, a zone is a region of the address space.
+    ZONE = "zone"
 
 
 class GatewayInputPolicy(str, Enum):
@@ -144,6 +150,7 @@ class Endpoint:
     kind: EndpointKind
     group_slug: str | None = None
     cidr: str | None = None
+    zone_slug: str | None = None
 
     @classmethod
     def any_(cls) -> Endpoint:
@@ -152,6 +159,10 @@ class Endpoint:
     @classmethod
     def group(cls, slug: str) -> Endpoint:
         return cls(kind=EndpointKind.GROUP, group_slug=slug)
+
+    @classmethod
+    def zone(cls, slug: str) -> Endpoint:
+        return cls(kind=EndpointKind.ZONE, zone_slug=slug)
 
     @classmethod
     def network(cls, cidr: str) -> Endpoint:
@@ -170,15 +181,57 @@ class Endpoint:
             return "any"
         if self.kind is EndpointKind.GROUP:
             return f"group:{self.group_slug}"
+        if self.kind is EndpointKind.ZONE:
+            return f"zone:{self.zone_slug}"
         return f"cidr:{self.cidr}"
 
 
 @dataclass(frozen=True, slots=True)
 class GroupSpec:
-    """A group of peers. Phase 5 turns this into a zone via ``kind``/``parent``."""
+    """A group of peers -- a role, not a place. Rendered as a plain address set."""
 
     slug: str
     internet_exit: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class RouteSpec:
+    """A network reachable inside a zone.
+
+    ``via_peer_id`` is the peer that routes it. ``None`` means the gateway
+    reaches it directly (a LAN behind the gateway), in which case nothing needs
+    to be added to anybody's ``AllowedIPs`` and no tunnel route is installed --
+    the CIDR only widens the zone's address set.
+    """
+
+    cidr: str
+    via_peer_id: str | None = None
+    comment: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ZoneSpec:
+    """A network zone: the peers assigned to it plus the networks routed in it.
+
+    Zones are rendered as *interval* sets, unlike groups, because they hold
+    prefixes as well as host addresses. A peer belongs to at most one zone --
+    the segment it sits in -- while it may hold any number of groups.
+    """
+
+    slug: str
+    #: Whether members may reach each other without an explicit ACL rule.
+    #: Defaults to off: everywhere else in Foxguard access is denied until
+    #: something grants it, and a zone should not be the one exception.
+    intra_zone: bool = False
+    internet_exit: bool = False
+    routes: tuple[RouteSpec, ...] = ()
+
+    def route_cidrs(self, family: Family) -> tuple[str, ...]:
+        return tuple(
+            route.cidr
+            for route in self.routes
+            if ipaddress.ip_network(route.cidr, strict=False).version == family.version
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,6 +243,8 @@ class PeerSpec:
     tunnel_ip: str | None = None
     tunnel_ip6: str | None = None
     group_slugs: tuple[str, ...] = ()
+    #: At most one. A peer is in one place and can play several roles.
+    zone_slug: str | None = None
 
     def addresses(self, family: Family) -> tuple[str, ...]:
         value = self.tunnel_ip if family is Family.V4 else self.tunnel_ip6
@@ -237,9 +292,14 @@ class GatewaySpec:
 class RulesetSpec:
     gateway: GatewaySpec = field(default_factory=GatewaySpec)
     groups: tuple[GroupSpec, ...] = ()
+    zones: tuple[ZoneSpec, ...] = ()
     peers: tuple[PeerSpec, ...] = ()
     rules: tuple[RuleSpec, ...] = ()
 
     @property
     def group_slugs(self) -> frozenset[str]:
         return frozenset(g.slug for g in self.groups)
+
+    @property
+    def zone_slugs(self) -> frozenset[str]:
+        return frozenset(z.slug for z in self.zones)

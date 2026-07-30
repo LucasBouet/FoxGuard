@@ -1,0 +1,10 @@
+# Foxguard generated hosts file -- DO NOT EDIT BY HAND.
+#
+# Written by foxguard-agent on every reconciliation; the source of truth is
+# the control plane's database, so an edit here survives until the next poll.
+# The first name on a line is canonical: it is what reverse lookups return.
+#
+10.88.0.1	gw.fox.internal	# gateway
+10.88.0.5	laptop.fox.internal	# user peer
+10.88.0.6	backup.fox.internal nas.fox.internal	# server peer
+fd00:88::1	gw6.fox.internal

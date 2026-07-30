@@ -17,6 +17,8 @@ import type {
   AclAction,
   AclEndpoint,
   AclRule,
+  DnsRecord,
+  DnsRecordKind,
   EnrollmentKey,
   Group,
   KillSwitchResult,
@@ -26,6 +28,8 @@ import type {
   Protocol,
   TotpProvision,
   User,
+  Zone,
+  ZoneRoute,
 } from "./types";
 import type { AdminLoginResponse, AdminWhoAmI } from "./types";
 
@@ -188,12 +192,15 @@ export async function sweepSessions(): Promise<Result<unknown>> {
 // --------------------------------------------------------------------------- //
 
 function refreshEverything() {
-  // A group or rule change re-renders the ruleset, so the overview's sync
-  // banner and the matrix are both stale afterwards.
+  // A group, zone or rule change re-renders the ruleset, so the overview's sync
+  // banner and the matrix are both stale afterwards. Zones additionally change
+  // what /dns would serve, since a peer's name follows it around.
   revalidatePath("/");
   revalidatePath("/groups");
+  revalidatePath("/zones");
   revalidatePath("/peers");
   revalidatePath("/rules");
+  revalidatePath("/dns");
 }
 
 export async function createGroup(input: {
@@ -229,6 +236,120 @@ export async function deleteGroup(id: string): Promise<Result<void>> {
 }
 
 // --------------------------------------------------------------------------- //
+// zones
+// --------------------------------------------------------------------------- //
+
+export async function createZone(input: {
+  slug: string;
+  name: string;
+  description?: string;
+  internet_exit: boolean;
+  intra_zone: boolean;
+  session_lifetime_seconds: number | null;
+}): Promise<Result<Zone>> {
+  const result = await run(() => api.post<Zone>("/api/v1/zones", input));
+  if (result.ok) refreshEverything();
+  return result;
+}
+
+export async function updateZone(
+  id: string,
+  patch: Partial<{
+    name: string;
+    description: string;
+    internet_exit: boolean;
+    intra_zone: boolean;
+    session_lifetime_seconds: number | null;
+  }>,
+): Promise<Result<Zone>> {
+  const result = await run(() => api.patch<Zone>(`/api/v1/zones/${id}`, patch));
+  if (result.ok) refreshEverything();
+  return result;
+}
+
+export async function deleteZone(id: string): Promise<Result<void>> {
+  const result = await run(() => api.delete<void>(`/api/v1/zones/${id}`));
+  if (result.ok) refreshEverything();
+  return result;
+}
+
+/**
+ * Add a network to a zone.
+ *
+ * With `via_peer_id`, the gateway also installs a kernel route into the tunnel
+ * on the agent's next poll. Without it, the CIDR only widens the zone's address
+ * set -- which is what you want for a LAN the gateway already reaches itself.
+ */
+export async function createZoneRoute(
+  zoneId: string,
+  input: { cidr: string; via_peer_id: string | null; description?: string },
+): Promise<Result<ZoneRoute>> {
+  const result = await run(() =>
+    api.post<ZoneRoute>(`/api/v1/zones/${zoneId}/routes`, {
+      ...input,
+      via_peer_id: input.via_peer_id || null,
+    }),
+  );
+  if (result.ok) refreshEverything();
+  return result;
+}
+
+export async function updateZoneRoute(
+  zoneId: string,
+  routeId: string,
+  patch: Partial<{ via_peer_id: string | null; description: string; enabled: boolean }>,
+): Promise<Result<ZoneRoute>> {
+  const result = await run(() =>
+    api.patch<ZoneRoute>(`/api/v1/zones/${zoneId}/routes/${routeId}`, patch),
+  );
+  if (result.ok) refreshEverything();
+  return result;
+}
+
+export async function deleteZoneRoute(
+  zoneId: string,
+  routeId: string,
+): Promise<Result<void>> {
+  const result = await run(() =>
+    api.delete<void>(`/api/v1/zones/${zoneId}/routes/${routeId}`),
+  );
+  if (result.ok) refreshEverything();
+  return result;
+}
+
+// --------------------------------------------------------------------------- //
+// DNS records
+// --------------------------------------------------------------------------- //
+
+export async function createDnsRecord(input: {
+  name: string;
+  kind: DnsRecordKind;
+  value: string;
+  description?: string;
+}): Promise<Result<DnsRecord>> {
+  const result = await run(() => api.post<DnsRecord>("/api/v1/dns/records", input));
+  if (result.ok) revalidatePath("/dns");
+  return result;
+}
+
+export async function updateDnsRecord(
+  id: string,
+  patch: Partial<{ name: string; value: string; description: string; enabled: boolean }>,
+): Promise<Result<DnsRecord>> {
+  const result = await run(() =>
+    api.patch<DnsRecord>(`/api/v1/dns/records/${id}`, patch),
+  );
+  if (result.ok) revalidatePath("/dns");
+  return result;
+}
+
+export async function deleteDnsRecord(id: string): Promise<Result<void>> {
+  const result = await run(() => api.delete<void>(`/api/v1/dns/records/${id}`));
+  if (result.ok) revalidatePath("/dns");
+  return result;
+}
+
+// --------------------------------------------------------------------------- //
 // peers
 // --------------------------------------------------------------------------- //
 
@@ -238,6 +359,8 @@ export async function createPeer(input: {
   peer_type: "server" | "user";
   wg_public_key: string;
   owner_user_id?: string | null;
+  dns_label?: string | null;
+  zone_slug?: string | null;
   group_slugs: string[];
   tags: string[];
 }): Promise<Result<Peer>> {
@@ -245,6 +368,8 @@ export async function createPeer(input: {
     api.post<Peer>("/api/v1/peers", {
       ...input,
       owner_user_id: input.owner_user_id || null,
+      dns_label: input.dns_label || null,
+      zone_slug: input.zone_slug || null,
     }),
   );
   if (result.ok) refreshEverything();
@@ -257,6 +382,8 @@ export async function updatePeer(
     name: string;
     description: string;
     state: PeerState;
+    dns_label: string | null;
+    zone_slug: string | null;
     group_slugs: string[];
     tags: string[];
   }>,

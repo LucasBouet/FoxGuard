@@ -24,6 +24,10 @@ sudo ./deploy/foxguard-install.sh --check-only
 
 # Bring WireGuard up first (section 1), then:
 sudo ./deploy/foxguard-install.sh --wan-interface eth0
+
+# With internal DNS, so devices get names instead of addresses:
+sudo ./deploy/foxguard-install.sh --wan-interface eth0 \
+     --dns --dns-zone fox.internal --dns-upstream 1.1.1.1
 ```
 
 ### Letting it create the interface too
@@ -553,6 +557,94 @@ Peers already `revoked` — and, in quarantine mode, `disabled` — are delibera
 left alone: both are stricter than the targets, and the kill switch must never
 widen anyone's access.
 
+## 5f. Internal DNS and zones (optional)
+
+Both are off until you ask for them, and neither changes anything about how
+access is decided — a zone is a *segment*, and DNS is a *name service*. Access
+still comes from `peers.state` and the ACL rules.
+
+### DNS
+
+Turn it on with `--dns` at install time, or in `/etc/foxguard/backend.env`:
+
+```sh
+FOXGUARD_DNS_ENABLED=true
+FOXGUARD_DNS_ZONE=fox.internal
+FOXGUARD_DNS_MODE=forward          # or split -- see below
+FOXGUARD_DNS_UPSTREAMS=1.1.1.1,9.9.9.9
+FOXGUARD_DNS_LISTEN_ADDRESSES=10.88.0.1
+```
+
+then `systemctl restart foxguard-api`. The agent renders the zone on its next
+poll, writes `/etc/foxguard/dns/{hosts,dnsmasq.conf}` and starts
+`foxguard-dns.service`. Every peer gets a name derived from its own
+(`laptop.fox.internal`), the gateway answers to `gw.fox.internal`, and
+`/api/v1/dns/records` adds aliases and A records for services that live off the
+tunnel.
+
+**Clients have to be told.** Add the resolver and a search domain to the peer's
+config, or names resolve nowhere:
+
+```ini
+[Interface]
+PrivateKey = ...
+Address = 10.88.0.5/32
+DNS = 10.88.0.1, fox.internal
+```
+
+`forward` mode resolves everything and sends what is not in the zone upstream,
+which is what makes that line work on its own. `split` mode answers for the zone
+and REFUSES the rest — better for privacy, but a client that sends *all* its
+queries here then gets REFUSED for the internet and needs a second resolver to
+fall through to. Use `split` only where clients are configured for it.
+
+Two things worth knowing before you enable it:
+
+- **Do not put a WAN address in `FOXGUARD_DNS_LISTEN_ADDRESSES`.** That is an
+  open resolver; `foxguard-healthcheck.sh` fails if it finds one.
+- **A quarantined peer can resolve the whole zone**, so device names disclose
+  your inventory to a device that has not authenticated yet. If that matters,
+  set `FOXGUARD_ALLOW_DNS_IN_QUARANTINE=false`.
+
+### Zones
+
+A zone is a network segment: a peer sits in exactly one, and the zone can own
+routes to networks behind its peers — Netbird's "networks", in Foxguard's model.
+
+```sh
+# a zone, and a network reachable through one of its peers
+curl -sX POST -H "$AUTH" -H 'Content-Type: application/json' \
+  http://10.88.0.1:8080/api/v1/zones \
+  -d '{"slug":"office","name":"Office network"}'
+
+curl -sX POST -H "$AUTH" -H 'Content-Type: application/json' \
+  http://10.88.0.1:8080/api/v1/zones/$ZONE_ID/routes \
+  -d '{"cidr":"192.168.10.0/24","via_peer_id":"'"$ROUTER_PEER_ID"'"}'
+```
+
+The CIDR then joins the zone's nftables set, so one ACL rule naming `office`
+covers the devices *and* the network behind them. On its next poll the agent
+puts the CIDR in the routing peer's `AllowedIPs` and installs
+`ip route add 192.168.10.0/24 dev wg0`. Both halves are needed; the healthcheck
+reports a route with no carrier as a black hole.
+
+Three things it will refuse, and you want it to:
+
+- a **default route** as a zone route — it would replace the gateway's own and
+  cut every remote session;
+- a **prefix covering an address this gateway already answers on** — a route for
+  `192.168.1.0/24` on a box whose LAN address is `192.168.1.10` sends your own
+  SSH replies into the tunnel;
+- **replacing a route it did not install** — it warns and leaves it alone.
+
+Traffic *inside* a zone is denied until you tick "allow traffic inside the
+zone". That is deliberate: everywhere else here, access is denied until
+something grants it.
+
+`FOXGUARD_AGENT_MANAGE_ROUTES=false` turns the kernel-route half off entirely if
+you would rather manage the routing table yourself. The `AllowedIPs` half still
+happens, so an `ip route add <cidr> dev wg0` by hand completes the path.
+
 ## 6. Operating it
 
 **See what is live:**
@@ -672,11 +764,17 @@ sudo ./deploy/foxguard-uninstall.sh --dry-run       # print the plan, change not
 sudo ./deploy/foxguard-uninstall.sh                 # the default removal
 ```
 
-The default stops and disables the three units, deletes `inet foxguard` from
-nftables, and removes `/opt/foxguard`, `/etc/foxguard`, `/var/lib/foxguard`, the
-unit files and the service user. It leaves the database, the WireGuard interface
-and every apt package alone, because none of those is unambiguously Foxguard's
-to delete.
+The default stops and disables the four units, deletes `inet foxguard` from
+nftables, withdraws the kernel routes the agent installed for zone networks, and
+removes `/opt/foxguard`, `/etc/foxguard`, `/var/lib/foxguard`, the unit files and
+the service user. It leaves the database, the WireGuard interface and every apt
+package alone, because none of those is unambiguously Foxguard's to delete.
+
+The routes are not opt-in and not left behind either: they point into a tunnel
+whose peers nothing manages any more, so leaving them is leaving a black hole in
+the routing table. Only the ones recorded in `/var/lib/foxguard/routes.json` are
+removed — the same rule the agent follows — so a route you added by hand to the
+same network survives.
 
 Three flags go further, each opt-in for its own reason:
 
@@ -684,7 +782,7 @@ Three flags go further, each opt-in for its own reason:
 | --- | --- | --- |
 | `--remove-database` | drops the `foxguard` database and role | takes the audit log with it; a gzipped `pg_dump` lands in `/root` first, and an empty dump aborts the drop |
 | `--remove-wireguard` | `wg-quick@wg0` down, interface deleted, keys removed | if you reached the box through that tunnel, this is the command that ends your session |
-| `--remove-packages` | purges the apt packages the installer added | naming ten packages routinely removes several hundred — `nodejs` drags the whole `node-*` tree — and purging `postgresql` destroys **every** database on the machine, not only Foxguard's |
+| `--remove-packages` | purges the apt packages the installer added, `dnsmasq-base` included | naming ten packages routinely removes several hundred — `nodejs` drags the whole `node-*` tree — and purging `postgresql` destroys **every** database on the machine, not only Foxguard's |
 
 `--remove-packages` simulates with `apt-get -s purge` first, prints the count and
 the head of the list, refuses outright if apt reports essential packages, and
@@ -799,3 +897,11 @@ because there is no lockout; if you need it cleared immediately, restart the API
 - [ ] `deploy/foxguard-backup.sh` runs on a schedule, its output leaves this
       box, and you have restored one somewhere to prove it works.
 - [ ] The ACL document is exported to a git repository you actually commit to.
+- [ ] With DNS enabled: `ss -lun | grep :53` shows only tunnel addresses. A
+      `0.0.0.0:53` there is an open resolver on the WAN.
+- [ ] With DNS enabled: you accept that a quarantined peer can enumerate your
+      device names, or `FOXGUARD_ALLOW_DNS_IN_QUARANTINE` is false.
+- [ ] Every zone route in `/var/lib/foxguard/routes.json` still points at the
+      tunnel interface and has a peer carrying it — the healthcheck says so.
+- [ ] No zone route covers an address this gateway answers on. The agent refuses
+      them, but a route added by hand to the same prefix is yours to check.

@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import binascii
 import ipaddress
+import re
 import uuid
 from datetime import datetime
 from typing import Annotated, Any, Literal
@@ -18,6 +19,7 @@ from pydantic import (
     model_validator,
 )
 
+from .dns import RecordKind, ResolverMode
 from .models import ActorType, AuthMethod, GroupKind, RulesetStatus
 from .nftables import Action, EndpointKind, PeerState, PeerType, Protocol
 from .services.killswitch import CONFIRMATION as KILL_SWITCH_CONFIRMATION
@@ -26,9 +28,19 @@ from .services.killswitch import KillSwitchMode
 SLUG_PATTERN = r"^[a-z0-9][a-z0-9_-]{0,23}$"
 REF_PATTERN = r"^[A-Za-z0-9_.:-]{1,64}$"
 
+#: One DNS label (RFC 1123). Underscores are excluded: legal in some record
+#: types, not in host names, and resolvers disagree about how strict to be.
+DNS_LABEL_PATTERN = r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+#: A zone-relative name, which may carry dots: ``git.services``.
+DNS_NAME_PATTERN = (
+    r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$"
+)
+
 Slug = Annotated[str, Field(pattern=SLUG_PATTERN, max_length=24)]
 Ref = Annotated[str, Field(pattern=REF_PATTERN, max_length=64)]
 Port = Annotated[int, Field(ge=1, le=65535)]
+DnsLabel = Annotated[str, Field(pattern=DNS_LABEL_PATTERN, max_length=63)]
+DnsName = Annotated[str, Field(pattern=DNS_NAME_PATTERN, max_length=253)]
 
 _IP_TYPES = (
     ipaddress.IPv4Address,
@@ -108,6 +120,81 @@ class GroupRead(GroupBase):
     id: uuid.UUID
     slug: str
     parent_id: uuid.UUID | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+# --------------------------------------------------------------------------- #
+# zones
+# --------------------------------------------------------------------------- #
+
+
+class ZoneRouteBase(ApiModel):
+    cidr: str = Field(max_length=64)
+    #: The peer that carries this network. Omitted, the gateway is assumed to
+    #: reach it directly (a LAN behind the gateway) and no tunnel route is
+    #: installed for it.
+    via_peer_id: uuid.UUID | None = None
+    description: str | None = None
+    enabled: bool = True
+
+    @field_validator("cidr")
+    @classmethod
+    def _check_cidr(cls, value: str) -> str:
+        network = ipaddress.ip_network(value, strict=False)
+        if network.prefixlen == 0:
+            raise ValueError(
+                "a zone route may not be a default route: the gateway would "
+                "route its own traffic into the tunnel and lose every remote "
+                "session, including the one making this request"
+            )
+        return str(network)
+
+
+class ZoneRouteCreate(ZoneRouteBase):
+    pass
+
+
+class ZoneRouteUpdate(ApiModel):
+    via_peer_id: uuid.UUID | None = None
+    description: str | None = None
+    enabled: bool | None = None
+
+
+class ZoneRouteRead(ZoneRouteBase):
+    id: uuid.UUID
+    zone_id: uuid.UUID
+    created_at: datetime
+    updated_at: datetime
+
+
+class ZoneBase(ApiModel):
+    name: str = Field(max_length=128)
+    description: str | None = None
+    internet_exit: bool = False
+    #: Off by default. Everywhere else in Foxguard access is denied until
+    #: something grants it, and a zone is not the exception.
+    intra_zone: bool = False
+    session_lifetime_seconds: int | None = Field(default=None, ge=60)
+
+
+class ZoneCreate(ZoneBase):
+    slug: Slug
+
+
+class ZoneUpdate(ApiModel):
+    name: str | None = Field(default=None, max_length=128)
+    description: str | None = None
+    internet_exit: bool | None = None
+    intra_zone: bool | None = None
+    session_lifetime_seconds: int | None = Field(default=None, ge=60)
+
+
+class ZoneRead(ZoneBase):
+    id: uuid.UUID
+    slug: str
+    routes: list[ZoneRouteRead] = Field(default_factory=list)
+    peer_count: int = 0
     created_at: datetime
     updated_at: datetime
 
@@ -194,6 +281,11 @@ class PeerCreate(PeerBase):
     #: Optional fixed address. Left empty, the next free pool address is used.
     tunnel_ip: str | None = None
     tunnel_ip6: str | None = None
+    #: Name inside FOXGUARD_DNS_ZONE. Left empty, one is derived from ``name``;
+    #: a derivation that collides is a 409, never a silent ``laptop-2``.
+    dns_label: DnsLabel | None = None
+    #: The one zone this peer sits in. Groups are a separate, many-valued thing.
+    zone_slug: Slug | None = None
 
     @field_validator("wg_public_key")
     @classmethod
@@ -216,6 +308,8 @@ class PeerUpdate(ApiModel):
     owner_user_id: uuid.UUID | None = None
     group_slugs: list[Slug] | None = None
     tags: list[str] | None = None
+    dns_label: DnsLabel | None = None
+    zone_slug: Slug | None = None
 
 
 class PeerRead(PeerBase):
@@ -227,6 +321,8 @@ class PeerRead(PeerBase):
     tunnel_ip: IpString | None
     tunnel_ip6: IpString | None
     owner_user_id: uuid.UUID | None
+    dns_label: str | None = None
+    zone_slug: str | None = None
     group_slugs: list[str] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
     enrollment_key_expires_at: datetime | None = None
@@ -248,6 +344,76 @@ class EnrollmentKeyRead(ApiModel):
     #: Shown exactly once. Only its hash is stored.
     enrollment_key: str
     expires_at: datetime | None
+
+
+# --------------------------------------------------------------------------- #
+# DNS records
+# --------------------------------------------------------------------------- #
+
+
+class DnsRecordBase(ApiModel):
+    #: Relative to FOXGUARD_DNS_ZONE. Storing it qualified would orphan every
+    #: record the day the zone is renamed.
+    name: DnsName
+    kind: RecordKind
+    #: An IP address for A/AAAA, another record's relative name for CNAME.
+    value: str = Field(max_length=253)
+    description: str | None = None
+    enabled: bool = True
+
+    @model_validator(mode="after")
+    def _value_matches_the_kind(self) -> DnsRecordBase:
+        if self.kind is RecordKind.CNAME:
+            if not re.match(DNS_NAME_PATTERN, self.value):
+                raise ValueError("a CNAME value must be a DNS name")
+            return self
+        address = ipaddress.ip_address(self.value)
+        expected = 4 if self.kind is RecordKind.A else 6
+        if address.version != expected:
+            raise ValueError(f"an {self.kind.value} record needs an IPv{expected} address")
+        return self
+
+
+class DnsRecordCreate(DnsRecordBase):
+    pass
+
+
+class DnsRecordUpdate(ApiModel):
+    """Every field optional, but ``kind`` and ``value`` still have to agree.
+
+    They are re-checked in the route against the merged row rather than here:
+    a PATCH carrying only ``value`` has no ``kind`` to validate it against.
+    """
+
+    name: DnsName | None = None
+    kind: RecordKind | None = None
+    value: str | None = Field(default=None, max_length=253)
+    description: str | None = None
+    enabled: bool | None = None
+
+
+class DnsRecordRead(DnsRecordBase):
+    id: uuid.UUID
+    created_at: datetime
+    updated_at: datetime
+
+
+class DnsZoneRead(ApiModel):
+    """What the zone currently looks like, rendered from the database."""
+
+    enabled: bool
+    zone: str
+    mode: ResolverMode
+    listen_addresses: list[str]
+    upstreams: list[str]
+    digest: str | None = None
+    hosts: str | None = None
+    conf: str | None = None
+    #: Populated instead of the artefacts when the state cannot be rendered.
+    errors: list[str] = Field(default_factory=list)
+    #: Things that are not being served but do not stop the zone rendering --
+    #: an alias whose target was revoked, typically.
+    warnings: list[str] = Field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- #
@@ -528,6 +694,11 @@ class PolicyMatrixRead(ApiModel):
 class AclEndpoint(ApiModel):
     kind: EndpointKind = EndpointKind.ANY
     group_slug: Slug | None = None
+    #: Zones and groups both live in the ``groups`` table, so one column stores
+    #: either. The field is separate here because the *caller* should have to
+    #: say which it means: a rule reading ``zone_slug: office`` and one reading
+    #: ``group_slug: office`` would otherwise be indistinguishable in an export.
+    zone_slug: Slug | None = None
     cidr: str | None = None
 
     @field_validator("cidr")
@@ -539,6 +710,8 @@ class AclEndpoint(ApiModel):
     def _consistent(self) -> AclEndpoint:
         if self.kind is EndpointKind.GROUP and not self.group_slug:
             raise ValueError("kind=group requires group_slug")
+        if self.kind is EndpointKind.ZONE and not self.zone_slug:
+            raise ValueError("kind=zone requires zone_slug")
         if self.kind is EndpointKind.CIDR and not self.cidr:
             raise ValueError("kind=cidr requires cidr")
         return self
@@ -691,6 +864,35 @@ class AgentWireGuardPeer(ApiModel):
     allowed_ips: list[str]
 
 
+class AgentRoute(ApiModel):
+    """A network the gateway must route into the tunnel.
+
+    Only routes carried *by a peer* appear here. A zone route with no
+    ``via_peer_id`` is a network the gateway already reaches on its own, and
+    installing a tunnel route for it would break the path that works.
+    """
+
+    cidr: str
+    #: The peer that carries it, for the agent's logs and for the audit trail.
+    via_peer_id: uuid.UUID
+
+
+class AgentDnsState(ApiModel):
+    """The rendered zone, or nothing at all.
+
+    Absent when DNS is disabled *or* when the current database state cannot be
+    rendered into a valid zone. Both mean the same thing to the agent -- leave
+    the resolver exactly as it is -- and neither may stop the ruleset in the
+    same response from being applied.
+    """
+
+    digest: str
+    hosts: str
+    conf: str
+    hosts_path: str
+    conf_path: str
+
+
 class AgentStateResponse(ApiModel):
     """Everything the gateway agent needs for one reconciliation pass."""
 
@@ -698,12 +900,20 @@ class AgentStateResponse(ApiModel):
     ruleset: str
     wg_interface: str
     wg_peers: list[AgentWireGuardPeer]
+    routes: list[AgentRoute] = Field(default_factory=list)
+    #: Carries its own digest: the ruleset digest identifies a row in
+    #: ``ruleset_versions`` and must keep meaning exactly that.
+    dns: AgentDnsState | None = None
 
 
 class AgentReport(ApiModel):
     digest: str
     success: bool
     error: str | None = None
+    #: Reported separately so a resolver that will not reload cannot be mistaken
+    #: for a ruleset that would not apply.
+    dns_digest: str | None = None
+    dns_error: str | None = None
 
 
 class AuditLogRead(ApiModel):

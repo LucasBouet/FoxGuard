@@ -1,0 +1,42 @@
+[Unit]
+Description=Foxguard internal DNS (dnsmasq, tunnel zone only)
+Documentation=https://github.com/your-org/foxguard
+# The zone binds to the gateway's tunnel address, which does not exist until
+# the interface is up. Without this the daemon fails to bind and systemd
+# restarts it in a loop until wg-quick happens to win the race.
+After=network-online.target wg-quick@wg0.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# --conf-file with nothing else: this instance never reads /etc/dnsmasq.conf or
+# /etc/dnsmasq.d, so it cannot be altered by the host's own resolver packaging,
+# and it cannot alter it either. Same principle as owning a single nft table.
+ExecStart=/usr/sbin/dnsmasq --keep-in-foreground --conf-file=/etc/foxguard/dns/dnsmasq.conf
+# SIGHUP re-reads the hosts file and flushes the cache without dropping the
+# listening socket. This is the normal path: adding a peer is a reload, and only
+# a change to the configuration itself needs a restart.
+ExecReload=/bin/kill -HUP $MAINPID
+ExecStartPre=/usr/sbin/dnsmasq --test --conf-file=/etc/foxguard/dns/dnsmasq.conf
+Restart=on-failure
+RestartSec=2
+
+User=root
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_SETUID CAP_SETGID CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# Read-only: the zone is written by foxguard-agent, never by the daemon.
+ReadOnlyPaths=/etc/foxguard/dns
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target

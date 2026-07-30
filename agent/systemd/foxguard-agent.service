@@ -1,5 +1,5 @@
 [Unit]
-Description=Foxguard gateway agent (nftables + WireGuard reconciliation)
+Description=Foxguard gateway agent (nftables + WireGuard + DNS reconciliation)
 Documentation=https://github.com/your-org/foxguard
 After=network-online.target wg-quick@wg0.service
 Wants=network-online.target
@@ -21,7 +21,11 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
-ReadWritePaths=/var/lib/foxguard
+# ProtectSystem=strict makes the whole filesystem read-only, so every path the
+# agent writes has to be named here. /etc/foxguard/dns is where it renders the
+# resolver's zone; without it DNS reconciliation fails with EROFS on a box where
+# everything else works.
+ReadWritePaths=/var/lib/foxguard /etc/foxguard/dns
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes

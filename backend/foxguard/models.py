@@ -2,12 +2,12 @@
 
 Extensibility notes for the Phase 5 roadmap (kept cheap on purpose):
 
-* ``groups.kind`` already distinguishes ``group`` from ``zone`` and
-  ``groups.parent_id`` allows nesting, so network zones with their own routes /
-  exit nodes can land without a table rewrite.
+* ``groups.kind`` distinguishes ``group`` from ``zone`` and ``groups.parent_id``
+  allows nesting, which is what let network zones with their own routes and
+  exit nodes land in ``0005`` without a table rewrite.
 * ACL endpoints are modelled as ``(kind, group_id, cidr)`` rather than a bare
-  ``src_group_id``. Adding a ``zone`` endpoint kind is one enum value, not a
-  migration of every rule.
+  ``src_group_id``, so the ``zone`` endpoint kind cost one enum value rather
+  than a migration of every rule.
 * ``acl_rules.extra`` / ``groups.extra`` are JSONB escape hatches for things
   like reverse-proxy hints or CrowdSec metadata that must not shape the core
   schema today.
@@ -31,6 +31,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy import (
     Enum as SAEnum,
@@ -38,6 +39,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import INET, JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
+from .dns.model import RecordKind
 from .nftables.model import Action, EndpointKind, PeerState, PeerType, Protocol
 
 
@@ -230,6 +232,10 @@ class Group(Base):
     internet_exit: Mapped[bool] = mapped_column(
         Boolean, default=False, nullable=False
     )
+    #: Zones only: whether members may reach each other without an explicit ACL
+    #: rule. Off by default -- everywhere else in Foxguard access is denied
+    #: until something grants it, and a zone is not the exception.
+    intra_zone: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     #: Session lifetime override for user peers (Phase 3). NULL -> global default.
     session_lifetime_seconds: Mapped[int | None] = mapped_column(Integer)
 
@@ -245,6 +251,51 @@ class Group(Base):
     peers: Mapped[list[Peer]] = relationship(
         secondary="peer_groups", back_populates="groups"
     )
+    routes: Mapped[list[ZoneRoute]] = relationship(
+        back_populates="zone", cascade="all, delete-orphan", lazy="selectin"
+    )
+
+
+class ZoneRoute(Base):
+    """A network reachable inside a zone.
+
+    ``via_peer_id`` is the peer that carries it -- Netbird's "routing peer".
+    NULL means the gateway reaches the network itself, in which case the CIDR
+    only widens the zone's address set and no tunnel route is installed.
+
+    Deleting the routing peer cascades this row away rather than leaving the
+    route pointing nowhere: a network is advertised *because* some peer can
+    carry it, and an orphaned route would keep widening the zone's set while
+    nothing could deliver the packets.
+    """
+
+    __tablename__ = "zone_routes"
+    __table_args__ = (
+        UniqueConstraint("zone_id", "cidr", name="uq_zone_routes_zone_cidr"),
+        Index("ix_zone_routes_zone", "zone_id"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    zone_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("groups.id", ondelete="CASCADE"), nullable=False
+    )
+    cidr: Mapped[str] = mapped_column(String(64), nullable=False)
+    via_peer_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("peers.id", ondelete="CASCADE")
+    )
+    description: Mapped[str | None] = mapped_column(Text)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+    extra: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(
+        TimestampColumn, server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TimestampColumn, server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    zone: Mapped[Group] = relationship(back_populates="routes")
 
 
 class Peer(Base):
@@ -262,6 +313,12 @@ class Peer(Base):
         ),
         Index("ix_peers_state", "state"),
         Index("ix_peers_type", "peer_type"),
+        Index("ix_peers_zone", "zone_id"),
+        # On lower(), because DNS is case-insensitive: without it the column
+        # would happily hold both "Laptop" and "laptop" as distinct labels for
+        # what a resolver considers one name. Mirrors migration 0004 -- the two
+        # must agree, or `create_all` in tests enforces less than production.
+        Index("uq_peers_dns_label", text("lower(dns_label)"), unique=True),
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
@@ -285,8 +342,22 @@ class Peer(Base):
     tunnel_ip: Mapped[str | None] = mapped_column(INET, unique=True)
     tunnel_ip6: Mapped[str | None] = mapped_column(INET, unique=True)
 
+    #: Single DNS label inside ``FOXGUARD_DNS_ZONE``. Materialised at
+    #: registration rather than derived at render time, so that two peers
+    #: wanting the same name is a 409 on the request that caused it instead of
+    #: a zone that will not render. Uniqueness is enforced on ``lower()``,
+    #: since DNS is case-insensitive (migration ``0004``).
+    dns_label: Mapped[str | None] = mapped_column(String(63))
+
     owner_user_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL")
+    )
+
+    #: The one zone this peer sits in, if any. A single FK rather than a second
+    #: many-to-many: a zone owns routes, and "which zone's routes apply" has to
+    #: have one answer. ON DELETE SET NULL, so removing a zone narrows access.
+    zone_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("groups.id", ondelete="SET NULL")
     )
 
     #: Only the hash is stored; the plaintext is shown once at generation time.
@@ -307,6 +378,7 @@ class Peer(Base):
     )
 
     owner: Mapped[User | None] = relationship(back_populates="peers")
+    zone: Mapped[Group | None] = relationship(foreign_keys=[zone_id], lazy="joined")
     groups: Mapped[list[Group]] = relationship(
         secondary="peer_groups", back_populates="peers", lazy="selectin"
     )
@@ -318,13 +390,16 @@ class Peer(Base):
 class AclRule(Base):
     __tablename__ = "acl_rules"
     __table_args__ = (
+        # 'zone' shares the group_id column: a zone *is* a groups row, so the
+        # foreign key already points at the right table and the kind is what
+        # says how to read it.
         CheckConstraint(
-            "(src_kind <> 'group' OR src_group_id IS NOT NULL) AND "
+            "(src_kind NOT IN ('group', 'zone') OR src_group_id IS NOT NULL) AND "
             "(src_kind <> 'cidr' OR src_cidr IS NOT NULL)",
             name="ck_acl_src_consistent",
         ),
         CheckConstraint(
-            "(dst_kind <> 'group' OR dst_group_id IS NOT NULL) AND "
+            "(dst_kind NOT IN ('group', 'zone') OR dst_group_id IS NOT NULL) AND "
             "(dst_kind <> 'cidr' OR dst_cidr IS NOT NULL)",
             name="ck_acl_dst_consistent",
         ),
@@ -391,6 +466,43 @@ class AclRule(Base):
     )
     dst_group: Mapped[Group | None] = relationship(
         foreign_keys=[dst_group_id], lazy="joined"
+    )
+
+
+class DnsRecord(Base):
+    """A record an administrator authored by hand.
+
+    Peers name themselves through ``peers.dns_label``; this table is for
+    everything else -- an alias for the portal, an A record for a service that
+    lives on the LAN behind the gateway, a friendlier name for a server peer.
+
+    ``name`` and (for CNAMEs) ``value`` are *relative to the zone*. Storing
+    fully qualified names would orphan every row the day someone changes
+    ``FOXGUARD_DNS_ZONE``.
+    """
+
+    __tablename__ = "dns_records"
+    __table_args__ = (
+        Index("uq_dns_records_name", text("lower(name)"), unique=True),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    name: Mapped[str] = mapped_column(String(253), nullable=False)
+    kind: Mapped[RecordKind] = mapped_column(
+        _enum(RecordKind, "dns_record_kind"), nullable=False
+    )
+    #: An IP address for A/AAAA, another record's relative name for CNAME.
+    value: Mapped[str] = mapped_column(String(253), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+    extra: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(
+        TimestampColumn, server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TimestampColumn, server_default=func.now(), onupdate=func.now(), nullable=False
     )
 
 

@@ -22,14 +22,24 @@ import {
   updatePeer,
 } from "@/lib/actions";
 import type { Result } from "@/lib/actions";
-import type { EnrollmentKey, Group, Peer, User } from "@/lib/types";
+import type { EnrollmentKey, Group, Peer, User, Zone } from "@/lib/types";
 
-export function CreatePeer({ groups, users }: { groups: Group[]; users: User[] }) {
+export function CreatePeer({
+  groups,
+  zones,
+  users,
+}: {
+  groups: Group[];
+  zones: Zone[];
+  users: User[];
+}) {
   const [name, setName] = useState("");
   const [peerType, setPeerType] = useState<"server" | "user">("server");
   const [publicKey, setPublicKey] = useState("");
   const [owner, setOwner] = useState("");
   const [groupSlugs, setGroupSlugs] = useState<string[]>([]);
+  const [zoneSlug, setZoneSlug] = useState("");
+  const [dnsLabel, setDnsLabel] = useState("");
   const [tags, setTags] = useState("");
   const [result, setResult] = useState<Result<Peer> | null>(null);
   const [created, setCreated] = useState<Peer | null>(null);
@@ -49,6 +59,8 @@ export function CreatePeer({ groups, users }: { groups: Group[]; users: User[] }
         peer_type: peerType,
         wg_public_key: publicKey.trim(),
         owner_user_id: peerType === "user" ? owner : null,
+        dns_label: dnsLabel || null,
+        zone_slug: zoneSlug || null,
         group_slugs: groupSlugs,
         tags: parseList(tags),
       });
@@ -57,6 +69,7 @@ export function CreatePeer({ groups, users }: { groups: Group[]; users: User[] }
         setCreated(response.data);
         setName("");
         setPublicKey("");
+        setDnsLabel("");
         setTags("");
       }
     });
@@ -158,6 +171,34 @@ export function CreatePeer({ groups, users }: { groups: Group[]; users: User[] }
           </div>
         </div>
 
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Field
+            label="Zone"
+            hint="Where the device sits. At most one, and its routes come with it. Groups above are what the device does, and it can hold several."
+          >
+            <Select value={zoneSlug} onChange={(event) => setZoneSlug(event.target.value)}>
+              <option value="">no zone</option>
+              {zones.map((zone) => (
+                <option key={zone.id} value={zone.slug}>
+                  {zone.slug}
+                </option>
+              ))}
+            </Select>
+          </Field>
+          <Field
+            label="DNS name"
+            hint="Left empty, one is derived from the device name. A name that is already taken is refused rather than silently numbered."
+          >
+            <Input
+              value={dnsLabel}
+              onChange={(event) => setDnsLabel(event.target.value)}
+              maxLength={63}
+              className="font-mono"
+              placeholder="derived from the name"
+            />
+          </Field>
+        </div>
+
         <Field label="Tags" hint="Comma separated. Dashboard filtering only — no effect on ACLs.">
           <Input value={tags} onChange={(event) => setTags(event.target.value)} />
         </Field>
@@ -180,12 +221,21 @@ export function CreatePeer({ groups, users }: { groups: Group[]; users: User[] }
   );
 }
 
-export function PeerActions({ peer, groups }: { peer: Peer; groups: Group[] }) {
+export function PeerActions({
+  peer,
+  groups,
+  zones,
+}: {
+  peer: Peer;
+  groups: Group[];
+  zones: Zone[];
+}) {
   const [result, setResult] = useState<Result<unknown> | null>(null);
   const [key, setKey] = useState<EnrollmentKey | null>(null);
   const [expiry, setExpiry] = useState("");
   const [open, setOpen] = useState(false);
   const [memberOf, setMemberOf] = useState<string[]>(peer.group_slugs);
+  const [zoneSlug, setZoneSlug] = useState(peer.zone_slug ?? "");
   const [tags, setTags] = useState(peer.tags.join(", "));
   const [pending, start] = useTransition();
 
@@ -195,6 +245,7 @@ export function PeerActions({ peer, groups }: { peer: Peer; groups: Group[] }) {
 
   const membershipChanged =
     memberOf.slice().sort().join() !== peer.group_slugs.slice().sort().join() ||
+    zoneSlug !== (peer.zone_slug ?? "") ||
     parseList(tags).join() !== peer.tags.join();
 
   return (
@@ -235,6 +286,19 @@ export function PeerActions({ peer, groups }: { peer: Peer; groups: Group[] }) {
                 </button>
               ))}
             </div>
+            <Field label="Zone">
+              <Select
+                value={zoneSlug}
+                onChange={(event) => setZoneSlug(event.target.value)}
+              >
+                <option value="">no zone</option>
+                {zones.map((zone) => (
+                  <option key={zone.id} value={zone.slug}>
+                    {zone.slug}
+                  </option>
+                ))}
+              </Select>
+            </Field>
             <Field label="Tags">
               <Input value={tags} onChange={(event) => setTags(event.target.value)} />
             </Field>
@@ -244,6 +308,7 @@ export function PeerActions({ peer, groups }: { peer: Peer; groups: Group[] }) {
                 act(() =>
                   updatePeer(peer.id, {
                     group_slugs: memberOf,
+                    zone_slug: zoneSlug || null,
                     tags: parseList(tags),
                   }),
                 )

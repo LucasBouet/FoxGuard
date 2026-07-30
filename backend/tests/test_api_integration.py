@@ -1733,3 +1733,351 @@ def test_an_admin_can_still_quarantine_a_user_peer(api, tag):
     ).status_code == 200
     assert _state_of(api, peer) == "quarantined"
     assert peer["id"] not in [row["peer_id"] for row in api.get("/api/v1/sessions").json()]
+
+
+# --------------------------------------------------------------------------- #
+# zones
+# --------------------------------------------------------------------------- #
+
+
+def _net(tag: str, index: int = 0) -> str:
+    """A routed network unique to this test run.
+
+    Fixed CIDRs would be a trap here: the end-to-end database is not reset
+    between runs, and two zones routing the same prefix through *different*
+    peers is exactly what the generator refuses -- so the second run would
+    poison the dataset for every later test. Derived from the tag instead.
+    """
+    return f"10.{int(tag[:2], 16)}.{(int(tag[2:4], 16) + index) % 256}.0/24"
+
+
+def _off_tunnel_ip(tag: str, index: int = 0) -> str:
+    """An address outside the pool, unique to this run.
+
+    A fixed one collides across runs of this suite, and the collision is not a
+    bug: several names on one address legitimately merge onto a single hosts
+    line. Unique addresses keep the assertions about that line meaningful.
+    """
+    return f"192.168.{int(tag[:2], 16)}.{(int(tag[2:4], 16) + index) % 254 + 1}"
+
+
+def _zone(api, tag: str, slug_prefix: str = "zn", **extra) -> dict:
+    slug = f"{slug_prefix}-{tag}"
+    response = api.post("/api/v1/zones", json={"slug": slug, "name": slug, **extra})
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+def test_a_zone_is_not_listed_among_the_groups(api, tag):
+    """They share a table; conflating them in the UI would let a zone be
+    attached to a peer as a group, which silently drops its routes."""
+    zone = _zone(api, tag)
+    slugs = {group["slug"] for group in api.get("/api/v1/groups").json()}
+    assert zone["slug"] not in slugs
+    assert zone["slug"] in {z["slug"] for z in api.get("/api/v1/zones").json()}
+
+
+def test_a_zone_cannot_be_created_through_the_groups_endpoint(api, tag):
+    response = api.post(
+        "/api/v1/groups", json={"slug": f"gz-{tag}", "name": "x", "kind": "zone"}
+    )
+    assert response.status_code == 422
+    assert "/api/v1/zones" in response.text
+
+
+def test_a_zone_and_a_group_cannot_share_a_slug(api, tag):
+    """An ACL rule naming it must never be ambiguous."""
+    group = _group(api, tag)
+    response = api.post(
+        "/api/v1/zones", json={"slug": group["slug"], "name": "clash"}
+    )
+    assert response.status_code == 409
+
+
+def test_a_peer_belongs_to_one_zone_and_several_groups(api, tag):
+    zone = _zone(api, tag)
+    first, second = _group(api, tag, "ga"), _group(api, tag, "gb")
+    peer = _create_peer(
+        api,
+        tag,
+        zone_slug=zone["slug"],
+        group_slugs=[first["slug"], second["slug"]],
+    )
+    assert peer["zone_slug"] == zone["slug"]
+    assert sorted(peer["group_slugs"]) == sorted([first["slug"], second["slug"]])
+
+
+def test_a_zone_cannot_be_attached_as_a_group(api, tag):
+    zone = _zone(api, tag)
+    response = api.post(
+        "/api/v1/peers",
+        json={
+            "name": f"peer-{tag}",
+            "peer_type": "server",
+            "wg_public_key": wg_key(),
+            "group_slugs": [zone["slug"]],
+        },
+    )
+    assert response.status_code == 422
+    assert "zone_slug" in response.text
+
+
+def test_a_zone_route_reaches_the_zones_nftables_set(api, tag):
+    zone = _zone(api, tag)
+    peer = _create_peer(api, tag, zone_slug=zone["slug"])
+    api.patch(f"/api/v1/peers/{peer['id']}", json={"state": "active"})
+
+    created = api.post(
+        f"/api/v1/zones/{zone['id']}/routes", json={"cidr": _net(tag)}
+    )
+    assert created.status_code == 201, created.text
+
+    ruleset = api.get("/api/v1/ruleset/preview").json()["content"]
+    elements = _set_body(ruleset, f"z_{zone['slug'].replace('-', '_')}_v4")
+    assert _net(tag) in elements
+    assert f"{peer['tunnel_ip']}/32" in elements
+
+
+def test_a_refused_route_leaves_no_row_behind(api, tag):
+    """The regression that made this test exist.
+
+    ``Group.routes`` is already loaded when the endpoint validates, so inserting
+    by foreign key left the validator looking at a stale collection: a route the
+    generator rejects was accepted, committed, and then every *later*
+    regeneration in the whole application failed with the same error. One bad
+    POST poisoned the dataset until somebody deleted the row by hand.
+    """
+    zone_a, zone_b = _zone(api, tag, "ra"), _zone(api, tag, "rb")
+    first = _create_peer(api, f"{tag}-a", zone_slug=zone_a["slug"])
+    second = _create_peer(api, f"{tag}-b", zone_slug=zone_b["slug"])
+    cidr = _net(tag, 7)
+
+    assert api.post(
+        f"/api/v1/zones/{zone_a['id']}/routes",
+        json={"cidr": cidr, "via_peer_id": first["id"]},
+    ).status_code == 201
+
+    # The same network through a different peer: WireGuard would hand it to
+    # whichever was configured last, so the generator refuses it.
+    refused = api.post(
+        f"/api/v1/zones/{zone_b['id']}/routes",
+        json={"cidr": cidr, "via_peer_id": second["id"]},
+    )
+    assert refused.status_code == 422, refused.text
+    assert "carried by two different peers" in refused.text
+
+    # Nothing persisted, and unrelated writes still work.
+    assert [r["cidr"] for r in api.get(f"/api/v1/zones/{zone_b['id']}/routes").json()] == []
+    assert _create_peer(api, f"{tag}-c")["state"] == "staging"
+
+
+def test_a_default_route_in_a_zone_is_refused(api, tag):
+    """It would replace the gateway's own and cut every remote session."""
+    zone = _zone(api, tag)
+    response = api.post(
+        f"/api/v1/zones/{zone['id']}/routes", json={"cidr": "0.0.0.0/0"}
+    )
+    assert response.status_code == 422
+    assert "default route" in response.text
+
+
+def test_the_agent_is_told_which_routes_to_install(api, tag):
+    zone = _zone(api, tag)
+    router = _create_peer(api, tag, zone_slug=zone["slug"])
+    api.post(
+        f"/api/v1/zones/{zone['id']}/routes",
+        json={"cidr": _net(tag), "via_peer_id": router["id"]},
+    )
+
+    state = api.get("/api/v1/agent/state").json()
+    assert _net(tag) in [route["cidr"] for route in state["routes"]]
+
+    # Both halves: cryptokey routing decides which peer, the kernel route
+    # decides that it reaches the interface at all.
+    entry = next(
+        p for p in state["wg_peers"] if p["public_key"] == router["wg_public_key"]
+    )
+    assert _net(tag) in entry["allowed_ips"]
+    assert f"{router['tunnel_ip']}/32" in entry["allowed_ips"]
+
+
+def test_a_route_the_gateway_reaches_itself_needs_no_kernel_route(api, tag):
+    zone = _zone(api, tag)
+    api.post(f"/api/v1/zones/{zone['id']}/routes", json={"cidr": _net(tag)})
+    state = api.get("/api/v1/agent/state").json()
+    assert _net(tag) not in [route["cidr"] for route in state["routes"]]
+
+
+def test_a_disabled_route_leaves_the_dataplane(api, tag):
+    zone = _zone(api, tag)
+    route = api.post(
+        f"/api/v1/zones/{zone['id']}/routes", json={"cidr": _net(tag)}
+    ).json()
+    set_name = f"z_{zone['slug'].replace('-', '_')}_v4"
+    assert _net(tag) in _set_body(
+        api.get("/api/v1/ruleset/preview").json()["content"], set_name
+    )
+
+    api.patch(
+        f"/api/v1/zones/{zone['id']}/routes/{route['id']}", json={"enabled": False}
+    )
+    assert _net(tag) not in _set_body(
+        api.get("/api/v1/ruleset/preview").json()["content"], set_name
+    )
+
+
+def test_deleting_a_zone_unassigns_its_peers_without_deleting_them(api, tag):
+    """Deleting narrows access. It must never delete the devices themselves."""
+    zone = _zone(api, tag)
+    peer = _create_peer(api, tag, zone_slug=zone["slug"])
+    assert api.delete(f"/api/v1/zones/{zone['id']}").status_code == 204
+
+    after = api.get(f"/api/v1/peers/{peer['id']}")
+    assert after.status_code == 200
+    assert after.json()["zone_slug"] is None
+
+
+def test_a_rule_can_name_a_zone_on_either_side(api, tag):
+    source, destination = _zone(api, tag, "za"), _zone(api, tag, "zb")
+    response = api.post(
+        "/api/v1/acl-rules",
+        json={
+            "ref": f"z2z-{tag}",
+            "name": "zone to zone",
+            "action": "accept",
+            "src": {"kind": "zone", "zone_slug": source["slug"]},
+            "dst": {"kind": "zone", "zone_slug": destination["slug"]},
+        },
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["src"]["zone_slug"] == source["slug"]
+    assert response.json()["src"]["group_slug"] is None
+
+    ruleset = api.get("/api/v1/ruleset/preview").json()["content"]
+    src_set = f"z_{source['slug'].replace('-', '_')}_v4"
+    dst_set = f"z_{destination['slug'].replace('-', '_')}_v4"
+    assert f"ip saddr @{src_set} ip daddr @{dst_set}" in ruleset
+
+
+def test_a_rule_naming_a_group_as_a_zone_is_refused(api, tag):
+    """It would render against a set that is never populated -- a rule that
+    silently matches nothing is worse than one that is refused."""
+    group = _group(api, tag)
+    response = api.post(
+        "/api/v1/acl-rules",
+        json={
+            "ref": f"bad-{tag}",
+            "name": "mislabelled",
+            "action": "accept",
+            "src": {"kind": "zone", "zone_slug": group["slug"]},
+            "dst": {"kind": "any"},
+        },
+    )
+    assert response.status_code == 422
+    assert "is a group, not a zone" in response.text
+
+
+def test_intra_zone_traffic_is_off_until_asked_for(api, tag):
+    zone = _zone(api, tag)
+    assert zone["intra_zone"] is False
+    assert f"fg:intra-zone:{zone['slug']}" not in (
+        api.get("/api/v1/ruleset/preview").json()["content"]
+    )
+
+    api.patch(f"/api/v1/zones/{zone['id']}", json={"intra_zone": True})
+    assert f"fg:intra-zone:{zone['slug']}" in (
+        api.get("/api/v1/ruleset/preview").json()["content"]
+    )
+
+
+# --------------------------------------------------------------------------- #
+# DNS
+# --------------------------------------------------------------------------- #
+
+
+def test_a_peer_gets_a_dns_name_derived_from_its_own(api, tag):
+    peer = _create_peer(api, tag)
+    assert peer["dns_label"] == f"peer-{tag}"
+
+
+def test_two_peers_cannot_take_the_same_name(api, tag):
+    """Refused, never silently numbered: a name nobody can predict from the
+    dashboard is worse than an error."""
+    _create_peer(api, tag, dns_label=f"dup-{tag}")
+    response = api.post(
+        "/api/v1/peers",
+        json={
+            "name": f"other-{tag}",
+            "peer_type": "server",
+            "wg_public_key": wg_key(),
+            "dns_label": f"dup-{tag}",
+        },
+    )
+    assert response.status_code == 409
+
+
+def test_the_zone_endpoint_reports_what_would_be_served(api, tag):
+    peer = _create_peer(api, tag, dns_label=f"host-{tag}")
+    zone = api.get("/api/v1/dns").json()
+    assert zone["errors"] == []
+    assert f"{peer['tunnel_ip']}\t{peer['dns_label']}.{zone['zone']}" in zone["hosts"]
+    assert f"local=/{zone['zone']}/" in zone["conf"]
+
+
+def test_an_a_record_can_name_something_off_the_tunnel(api, tag):
+    response = api.post(
+        "/api/v1/dns/records",
+        json={"name": f"nas-{tag}", "kind": "A", "value": _off_tunnel_ip(tag)},
+    )
+    assert response.status_code == 201, response.text
+    zone = api.get("/api/v1/dns").json()
+    assert f"{_off_tunnel_ip(tag)}\tnas-{tag}.{zone['zone']}" in zone["hosts"]
+
+
+def test_a_cname_must_point_at_something_that_exists(api, tag):
+    """An alias to an unknown target is a silently dead record, so the API
+    refuses it rather than letting the agent skip the whole zone."""
+    response = api.post(
+        "/api/v1/dns/records",
+        json={"name": f"alias-{tag}", "kind": "CNAME", "value": f"ghost-{tag}"},
+    )
+    assert response.status_code == 409
+    assert "not a name this resolver knows" in response.text
+
+
+def test_a_cname_to_a_real_name_is_accepted_and_served(api, tag):
+    peer = _create_peer(api, tag, dns_label=f"target-{tag}")
+    response = api.post(
+        "/api/v1/dns/records",
+        json={"name": f"alias-{tag}", "kind": "CNAME", "value": peer["dns_label"]},
+    )
+    assert response.status_code == 201, response.text
+    zone = api.get("/api/v1/dns").json()
+    assert f"cname=alias-{tag}.{zone['zone']},target-{tag}.{zone['zone']}" in zone["conf"]
+
+
+def test_a_record_fighting_a_peer_for_a_name_is_refused(api, tag):
+    peer = _create_peer(api, tag, dns_label=f"taken-{tag}")
+    response = api.post(
+        "/api/v1/dns/records",
+        json={"name": peer["dns_label"], "kind": "A", "value": _off_tunnel_ip(tag, 1)},
+    )
+    assert response.status_code == 409
+
+
+def test_an_a_record_rejects_an_ipv6_value(api, tag):
+    response = api.post(
+        "/api/v1/dns/records",
+        json={"name": f"v6-{tag}", "kind": "A", "value": "fd00::1"},
+    )
+    assert response.status_code == 422
+
+
+def test_a_revoked_peer_loses_its_name(api, tag):
+    """A name resolving to a device that cannot be on the tunnel is a wrong
+    answer, not a stale one."""
+    peer = _create_peer(api, tag, dns_label=f"gone-{tag}")
+    assert f"gone-{tag}." in api.get("/api/v1/dns").json()["hosts"]
+
+    api.patch(f"/api/v1/peers/{peer['id']}", json={"state": "revoked"})
+    assert f"gone-{tag}." not in api.get("/api/v1/dns").json()["hosts"]

@@ -12,7 +12,8 @@ from sqlalchemy.orm import Session
 
 from ...config import Settings, get_settings
 from ...db import get_db
-from ...models import Group, Peer, Tag
+from ...dns import derive_label, fallback_label
+from ...models import Group, GroupKind, Peer, Tag
 from ...nftables import PeerState, PeerType
 from ...schemas import (
     EnrollmentKeyCreate,
@@ -22,8 +23,12 @@ from ...schemas import (
     PeerUpdate,
 )
 from ...services import audit, enrollment, ipam, peer_state, sessions
-from ...services import ruleset as ruleset_service
-from ..deps import audit_context, integrity_conflict, require_admin
+from ..deps import (
+    audit_context,
+    integrity_conflict,
+    regenerate_or_422,
+    require_admin,
+)
 
 router = APIRouter(
     prefix="/api/v1/peers", tags=["peers"], dependencies=[Depends(require_admin)]
@@ -42,6 +47,8 @@ def _serialise(peer: Peer) -> dict:
         "tunnel_ip": str(peer.tunnel_ip) if peer.tunnel_ip else None,
         "tunnel_ip6": str(peer.tunnel_ip6) if peer.tunnel_ip6 else None,
         "owner_user_id": peer.owner_user_id,
+        "dns_label": peer.dns_label,
+        "zone_slug": peer.zone.slug if peer.zone else None,
         "group_slugs": sorted(group.slug for group in peer.groups),
         "tags": sorted(tag.name for tag in peer.tags),
         "enrollment_key_expires_at": peer.enrollment_key_expires_at,
@@ -70,7 +77,39 @@ def _resolve_groups(session: Session, slugs: list[str]) -> list[Group]:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY, f"unknown groups: {', '.join(missing)}"
         )
+    # Attaching a zone as a group would put the peer in the group set, which for
+    # a zone is never rendered -- the peer would appear assigned in the API and
+    # be absent from the dataplane.
+    zones = sorted(g.slug for g in groups if g.kind is GroupKind.ZONE)
+    if zones:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"{', '.join(zones)} are zones, not groups: use zone_slug "
+            "(a peer belongs to at most one zone)",
+        )
     return list(groups)
+
+
+def _resolve_zone(session: Session, slug: str | None) -> Group | None:
+    if not slug:
+        return None
+    zone = session.execute(
+        select(Group).where(Group.slug == slug)
+    ).scalar_one_or_none()
+    if zone is None or zone.kind is not GroupKind.ZONE:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"unknown zone {slug!r}")
+    return zone
+
+
+def _dns_label(payload_label: str | None, name: str, peer_id: uuid.UUID) -> str:
+    """The DNS label a peer gets, chosen once and stored.
+
+    Deriving this at render time instead would push every collision out to the
+    resolver, where the only options are refusing to serve the zone at all or
+    picking a winner nobody chose. Stored, a clash is a 409 on the request that
+    caused it -- and the caller can pass ``dns_label`` to settle it.
+    """
+    return payload_label or derive_label(name) or fallback_label(str(peer_id))
 
 
 def _resolve_tags(session: Session, names: list[str]) -> list[Tag]:
@@ -129,6 +168,7 @@ def create_peer(
         )
 
     peer = Peer(
+        id=uuid.uuid4(),
         name=payload.name,
         description=payload.description,
         peer_type=payload.peer_type,
@@ -139,18 +179,25 @@ def create_peer(
         tunnel_ip6=tunnel_ip6,
         owner_user_id=payload.owner_user_id,
     )
+    # The id is assigned above rather than left to the column default because
+    # the fallback label is derived from it, and a peer whose name yields no
+    # usable label still needs one before the insert.
+    peer.dns_label = _dns_label(payload.dns_label, payload.name, peer.id)
     # Added to the session before the relationships are populated: _resolve_tags
     # flushes, and assigning a persistent Group to a transient Peer otherwise
     # emits "object not in session, add operation won't proceed".
     session.add(peer)
     peer.groups = _resolve_groups(session, payload.group_slugs)
+    peer.zone = _resolve_zone(session, payload.zone_slug)
     peer.tags = _resolve_tags(session, payload.tags)
     try:
         session.flush()
     except IntegrityError as exc:
         session.rollback()
         raise integrity_conflict(
-            exc, "a peer with this public key or tunnel address already exists"
+            exc,
+            "a peer with this public key, tunnel address or DNS label already "
+            "exists (pass dns_label to choose a different name)",
         ) from exc
 
     audit.record(
@@ -161,7 +208,7 @@ def create_peer(
         **audit_context(request),
         detail={"name": peer.name, "type": peer.peer_type.value, "ip": str(tunnel_ip)},
     )
-    ruleset_service.regenerate(session, settings, generated_by="peer.create")
+    regenerate_or_422(session, settings, "peer.create")
     session.commit()
     return _serialise(peer)
 
@@ -215,6 +262,10 @@ def update_peer(
             )
     if "group_slugs" in changes:
         peer.groups = _resolve_groups(session, changes.pop("group_slugs") or [])
+    if "zone_slug" in changes:
+        # Explicit null clears the assignment, which narrows access -- so unlike
+        # `state`, it needs no transition guard.
+        peer.zone = _resolve_zone(session, changes.pop("zone_slug"))
     if "tags" in changes:
         peer.tags = _resolve_tags(session, changes.pop("tags") or [])
     for key, value in changes.items():
@@ -225,7 +276,11 @@ def update_peer(
     # authenticated.
     if previous_state is PeerState.ACTIVE and peer.state is not PeerState.ACTIVE:
         sessions.revoke_sessions(session, peer)
-    session.flush()
+    try:
+        session.flush()
+    except IntegrityError as exc:
+        session.rollback()
+        raise integrity_conflict(exc, "another peer already has that DNS label") from exc
 
     audit.record(
         session,
@@ -235,7 +290,7 @@ def update_peer(
         **audit_context(request),
         detail={"changes": list(payload.model_dump(exclude_unset=True))},
     )
-    ruleset_service.regenerate(session, settings, generated_by="peer.update")
+    regenerate_or_422(session, settings, "peer.update")
     session.commit()
     return _serialise(peer)
 
@@ -260,7 +315,7 @@ def delete_peer(
         **audit_context(request),
         detail={"name": name},
     )
-    ruleset_service.regenerate(session, settings, generated_by="peer.delete")
+    regenerate_or_422(session, settings, "peer.delete")
     session.commit()
 
 
@@ -354,8 +409,6 @@ def revoke_enrollment_key(
         **audit_context(request),
         detail={"quarantined": quarantine},
     )
-    ruleset_service.regenerate(
-        session, session_settings, generated_by="peer.enrollment_key.revoke"
-    )
+    regenerate_or_422(session, session_settings, "peer.enrollment_key.revoke")
     session.commit()
     return _serialise(peer)

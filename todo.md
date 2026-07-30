@@ -1,0 +1,1 @@
+no storage config generator with settings that take the private key, a peer profile and generate the associated key for wireguard

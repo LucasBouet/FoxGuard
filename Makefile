@@ -110,3 +110,15 @@ lint: ## Lint both Python packages
 .PHONY: ruleset
 ruleset: ## Print the ruleset the current database state implies
 	cd $(BACKEND) && python -c "from foxguard.config import get_settings; from foxguard.db import SessionLocal; from foxguard.services import ruleset; print(ruleset.render(SessionLocal(), get_settings()))"
+
+.PHONY: test-dns-live
+test-dns-live: ## Run the generated zone against a real dnsmasq (needs dnsmasq + dig)
+	cd $(BACKEND) && FOXGUARD_LIVE_DNS=1 pytest tests/test_dns_live.py -v
+
+.PHONY: test-routes-live
+test-routes-live: ## Reconcile real kernel routes on a dummy interface (needs sudo + CAP_NET_ADMIN)
+	cd $(AGENT) && FOXGUARD_LIVE_ROUTES=1 pytest tests/test_routes_live.py -v
+
+.PHONY: dns
+dns: ## Print the DNS zone the current database state implies
+	cd $(BACKEND) && python -c "from foxguard.config import get_settings; from foxguard.db import SessionLocal; from foxguard.services import dns; h, c = dns.render(SessionLocal(), get_settings()); print(h); print(c)"

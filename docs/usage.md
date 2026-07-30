@@ -232,6 +232,55 @@ they can reach until they authenticate.
 Same, but type *server*, no owner, and an enrollment key it presents itself. No
 portal and no expiry.
 
+### Giving a device a name
+
+Every peer already has one: **Peers** → *Manage* shows its DNS name, derived
+from the device name at registration and editable there. Turn the resolver on
+first (`FOXGUARD_DNS_ENABLED=true`) and add this to the client config:
+
+```ini
+DNS = 10.88.0.1, fox.internal
+```
+
+`ssh laptop.fox.internal` then works from anywhere on the tunnel. **DNS** in the
+dashboard shows the whole zone as the gateway will serve it, plus a place to add
+aliases (`portal` → `gw`) and A records for things that live off the tunnel
+(`nas` → `192.168.1.50`).
+
+Two devices cannot take the same name. Foxguard refuses the second rather than
+inventing `laptop-2`, because a name nobody can predict from the dashboard is
+worse than an error.
+
+### Reaching a network behind a peer
+
+A branch office, a lab subnet, a NAS network — anything that is not the peer
+itself. **Zones** → create a zone, then add a route to it:
+
+| Field | Meaning |
+| --- | --- |
+| Network | `192.168.10.0/24` — the network you want to reach |
+| Carried by | the peer that routes it. Empty means the gateway reaches it itself |
+
+Put the peers that should live in that segment into the zone (**Peers** →
+*Manage* → Zone), and write one ACL rule with a **zone** endpoint. The rule
+covers the peers *and* the network behind them — that is the difference from a
+group.
+
+Two things to expect:
+
+- **Traffic inside the zone is denied** until you tick "allow traffic inside the
+  zone". Everywhere else here access is denied until something grants it, and a
+  zone is not the exception.
+- **The far side has to route back.** Foxguard puts the network into the routing
+  peer's `AllowedIPs` and installs the kernel route on the gateway. The device
+  at `192.168.10.7` still needs a way back to `10.88.0.0/24` — usually
+  masquerading on the routing peer, which is that machine's job, not the
+  gateway's.
+
+If a route stops working, `deploy/foxguard-healthcheck.sh` says which half is
+missing: no route at all, a route pointing at the wrong interface, or a route
+into the tunnel that no peer carries.
+
 ### Cutting access
 
 | Situation | What to do |
@@ -311,6 +360,10 @@ their secrets live solely in the database. See "Backup and restore" in
 | A machine keeps dropping off | It is registered as a *user* peer. It should be a *server* peer |
 | Changes have no effect | **Overview** — is the dataplane in sync? Is the agent running? |
 | Nobody can reach anything | `nft list table inet foxguard`, then `journalctl -u foxguard-agent` |
+| Names do not resolve | Is `DNS = <gateway>, <zone>` in the client config? Then `systemctl status foxguard-dns` |
+| One name stopped resolving | **DNS** → "Not currently served". An alias is dropped when its target is revoked |
+| A zone's network is unreachable | `deploy/foxguard-healthcheck.sh` → **Zone routes**: it says which half is missing |
+| A zone route will not save | It is refused for a reason — a default route, or one covering an address the gateway already answers on |
 
 Every allowed and denied decision carries a counter and a `fg:<ref>:<name>`
 comment in the live ruleset, so you can map a hit count back to the rule that

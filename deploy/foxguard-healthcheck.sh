@@ -59,7 +59,10 @@ done
 # --------------------------------------------------------------------------- #
 section "Configuration safety"
 
-if [[ ${FOXGUARD_DEV_MODE,,} == true ]]; then
+# Defaulted, not bare: this script runs under `set -u`, and a backend.env that
+# simply omits an optional setting would abort the whole run on the first
+# reference -- which defeats the point of not using `set -e`.
+if [[ ${FOXGUARD_DEV_MODE:-false} == [Tt]rue ]]; then
   bad "FOXGUARD_DEV_MODE=true — admin authentication is weakened. Never on a gateway."
 else
   ok "dev mode is off"
@@ -112,7 +115,8 @@ section "Control plane"
 # A SQL_ASCII database makes psycopg hand SQLAlchemy bytes where it expects
 # text, and the failure surfaces as an unrelated-looking TypeError at connection
 # time. Worth naming explicitly.
-DBNAME=${FOXGUARD_DATABASE_URL##*/}
+DBNAME=${FOXGUARD_DATABASE_URL:-}
+DBNAME=${DBNAME##*/}
 ENC=$(sudo -u postgres psql -tAc \
       "SELECT pg_encoding_to_char(encoding) FROM pg_database WHERE datname='${DBNAME%%\?*}'" 2>/dev/null)
 case ${ENC:-} in
@@ -265,6 +269,97 @@ if [[ $(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null) == 1 ]]; then
   ok "IPv4 forwarding is on"
 else
   bad "IPv4 forwarding is off — peers cannot route through this gateway"
+fi
+
+# --------------------------------------------------------------------------- #
+section "Zone routes"
+
+# The routes the agent installed for zone networks. Both halves are checked,
+# because either one missing is a silent black hole: cryptokey routing decides
+# which peer a packet is encrypted to, and the kernel route decides that it
+# reaches the tunnel at all.
+ROUTES_FILE=${FOXGUARD_AGENT_STATE_DIR:-/var/lib/foxguard}/routes.json
+if [[ ! -f $ROUTES_FILE ]]; then
+  ok "no zone routes are managed on this gateway"
+else
+  mapfile -t MANAGED < <(jq -r '.[]?' "$ROUTES_FILE" 2>/dev/null)
+  if [[ ${#MANAGED[@]} -eq 0 ]]; then
+    ok "no zone routes are managed on this gateway"
+  fi
+  ALLOWED=$(wg show "$WG_IF" allowed-ips 2>/dev/null)
+  for cidr in "${MANAGED[@]}"; do
+    [[ -n $cidr ]] || continue
+    family=-4; [[ $cidr == *:* ]] && family=-6
+    dev=$(ip "$family" route show exact "$cidr" 2>/dev/null \
+          | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -1)
+    if [[ -z $dev ]]; then
+      bad "$cidr is recorded as installed but has no route — the agent will re-add it next poll"
+    elif [[ $dev != "$WG_IF" ]]; then
+      bad "$cidr routes via $dev, not $WG_IF — something else owns that prefix now"
+    elif ! grep -qF "$cidr" <<<"$ALLOWED"; then
+      # The route exists and points at the tunnel, but no peer claims the
+      # prefix, so WireGuard drops every packet as unroutable.
+      bad "$cidr routes into $WG_IF but no peer has it in AllowedIPs — a black hole"
+    else
+      ok "$cidr routes into $WG_IF and a peer carries it"
+    fi
+  done
+fi
+
+# --------------------------------------------------------------------------- #
+section "Internal DNS"
+
+if [[ ${FOXGUARD_DNS_ENABLED:-false} != true ]]; then
+  ok "internal DNS is off"
+else
+  ZONE=${FOXGUARD_DNS_ZONE:-fox.internal}
+  DNS_PORT=${FOXGUARD_DNS_PORT:-53}
+  if systemctl is-active --quiet foxguard-dns 2>/dev/null; then
+    ok "foxguard-dns is running"
+  else
+    bad "foxguard-dns is not running (journalctl -u foxguard-dns -n 30)"
+  fi
+
+  # An open resolver is the failure that costs someone else's bandwidth rather
+  # than yours, so it is a failure and not a warning.
+  # $4 is "Local Address:Port". The header row splits into more fields than the
+  # data rows, which is why NR>1 matters as much as the column number.
+  LISTENERS=$(ss -lun 2>/dev/null | awk -v p=":$DNS_PORT" 'NR>1 && $4 ~ p"$" {print $4}')
+  if grep -qE '^(0\.0\.0\.0|\*|\[?::\]?):' <<<"$LISTENERS"; then
+    bad "something answers DNS on every address — that is an open resolver on the WAN"
+  elif [[ -z $LISTENERS ]]; then
+    bad "nothing is listening on udp/$DNS_PORT"
+  else
+    ok "DNS listens only on $(paste -sd' ' <<<"$LISTENERS")"
+  fi
+
+  GW_NAME="${FOXGUARD_DNS_GATEWAY_LABEL:-gw}.$ZONE"
+  if command -v dig >/dev/null 2>&1; then
+    # `dig +short` writes its own errors to stdout ("communications error to
+    # ...", "no servers could be reached"), so an unreachable resolver would
+    # otherwise be reported as a name resolving to that sentence. Keep only
+    # lines that are actually addresses.
+    ANSWER=$(dig +short +time=2 +tries=1 "@$TUNNEL_IP" -p "$DNS_PORT" "$GW_NAME" A 2>/dev/null \
+             | grep -E '^[0-9a-fA-F:.]+$' | head -1)
+    if [[ $ANSWER == "$TUNNEL_IP" ]]; then
+      ok "$GW_NAME resolves to $TUNNEL_IP"
+    elif [[ -n $ANSWER ]]; then
+      bad "$GW_NAME resolves to $ANSWER, not $TUNNEL_IP"
+    else
+      bad "$GW_NAME does not resolve — the zone may not have been applied yet"
+    fi
+  else
+    warn "dig is not installed, so the zone was not queried (apt install dnsutils)"
+  fi
+
+  DIGEST=$(api /api/v1/dns | jq -r '.digest // empty' 2>/dev/null)
+  ERRORS=$(api /api/v1/dns | jq -r '.errors | length' 2>/dev/null || echo 0)
+  if [[ ${ERRORS:-0} -gt 0 ]]; then
+    bad "$ERRORS problem(s) stop the zone rendering; the agent is leaving the resolver alone"
+    api /api/v1/dns | jq -r '.errors[]' 2>/dev/null | sed 's/^/      /'
+  elif [[ -n $DIGEST ]]; then
+    ok "the zone renders (digest ${DIGEST:0:12})"
+  fi
 fi
 
 # --------------------------------------------------------------------------- #

@@ -21,7 +21,9 @@ from sqlalchemy.orm import Session
 from ..config import Settings, get_settings
 from ..db import get_db
 from ..models import Peer
+from ..nftables import RulesetValidationError
 from ..services import admin_auth
+from ..services import ruleset as ruleset_service
 from ..services.admin_auth import AdminIdentity
 from ..services.ratelimit import RateLimited, RateLimiter
 
@@ -170,6 +172,27 @@ def require_admin(
     identity = AdminIdentity.machine()
     request.state.admin = identity
     return identity
+
+
+def regenerate_or_422(session: Session, settings, actor: str) -> None:
+    """Regenerate the ruleset, turning generator rejections into a 422.
+
+    Every mutating route calls this instead of ``ruleset_service.regenerate``
+    directly, so a state that cannot be expressed in nftables is refused by the
+    request that caused it rather than committed.
+
+    It matters on routes that seem unrelated too. The generator validates the
+    *whole* spec, so once one bad row exists every later regeneration fails --
+    and without this, registering an unrelated peer answers 500 instead of
+    saying which rule or route is the problem. Observed exactly that way.
+    """
+    try:
+        ruleset_service.regenerate(session, settings, generated_by=actor)
+    except RulesetValidationError as exc:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            {"message": "resulting ruleset is invalid", "errors": list(exc.errors)},
+        ) from exc
 
 
 def audit_context(request: Request) -> dict:

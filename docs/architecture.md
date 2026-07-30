@@ -566,6 +566,210 @@ The bypass is now confined to loopback callers. Local development is unaffected
 error. Verified live: a request from a non-loopback address is refused where a
 loopback one succeeds.
 
+## 16. Internal DNS: a rendered artefact, not a service to configure
+
+`FOXGUARD_DNS_ENABLED` puts a resolver on the gateway that answers for a zone of
+your choosing: `gw.fox.internal`, `laptop.fox.internal`, whatever you name your
+devices. It follows the same shape as the ruleset — the control plane renders
+two artefacts from the database, the agent installs them and reloads the daemon,
+and there is no incremental path that could drift.
+
+### dnsmasq, and its own instance
+
+dnsmasq rather than CoreDNS or unbound: it is one small Debian package, it reads
+a hosts-format file, and `SIGHUP` re-reads that file without dropping the
+listening socket. That last property is what makes adding a device cost nothing
+— measured, not assumed.
+
+It runs as **`foxguard-dns.service` on its own configuration file**, never as a
+drop-in under `/etc/dnsmasq.d`. Same principle as owning a single nftables
+table: the host's resolver packaging cannot change what Foxguard serves, and
+Foxguard cannot change what the host serves. Uninstalling removes one unit.
+
+### Reload and restart are different, and the difference matters
+
+`SIGHUP` re-reads the hosts files and flushes the cache. It does **not** re-read
+the configuration file. So:
+
+| Change | What the agent does |
+| --- | --- |
+| a peer registered, renamed or revoked | `systemctl reload` → SIGHUP |
+| the zone, upstreams or listen address changed | `systemctl restart` |
+
+Treating everything as a restart would drop in-flight queries every time
+somebody registers a device. `ExecReload=/bin/kill -HUP $MAINPID` in the unit is
+what makes the first row possible.
+
+### `dnsmasq --test` is this component's `nft -c -f`
+
+The agent writes the artefacts, runs `dnsmasq --test` against the new
+configuration, and only then reloads. A configuration the daemon rejects never
+reaches it, and the previous zone is restored — so a bad zone costs one
+reconciliation rather than name resolution for the fleet.
+
+### The hosts file is 0644, and that is not an oversight
+
+dnsmasq drops privileges at startup and re-reads `addn-hosts` **as the
+unprivileged user it dropped to**. Every other file Foxguard writes is 0600;
+copying that habit here produces a resolver that works until its first reload
+and then quietly serves an empty zone. Found by breaking it.
+
+### Names are fully qualified, never bare
+
+`expand-hosts` is deliberately absent. It would make the resolver authoritative
+for bare labels globally, so a peer named `wpad` or `mail` would answer for a
+name its clients expect to resolve elsewhere. Short names are the search
+domain's job — which is why a client config carries `DNS = <gateway>, <zone>`.
+
+### A broken zone must never break the dataplane
+
+DNS records are hand-authored, so an administrator can write a CNAME loop or two
+records fighting over a name. If that made `GET /api/v1/agent/state` fail, a
+typo in a DNS record would stop *firewall* rules reaching the kernel — access
+control taken down by a name service. So:
+
+- `services/dns.render_or_none` swallows the failure, logs it, and the agent
+  leaves the resolver exactly as it is;
+- the mutation endpoints re-render the whole zone inside the transaction and
+  roll back, so the typo is refused at the source rather than discovered later;
+- `GET /api/v1/dns` reports the validation errors instead of a 500, because
+  "your zone is broken" is the most useful thing it can say.
+
+### An alias whose target is revoked is dropped, not an error
+
+A CNAME points at a name; revoking the peer that held it takes the name away.
+Treating that as a broken zone means the **kill switch** — the one action
+guaranteed to only ever narrow access — silently stops the whole fleet resolving
+anything. Found exactly that way, by running the end-to-end suite twice against
+one database.
+
+So the projection drops aliases whose target is gone and the zone still renders;
+`GET /api/v1/dns` lists them under `warnings` so it is visible rather than
+magic. The *typo* case is still a 409: `POST /api/v1/dns/records` asks whether
+the target exists before committing, because an alias to a name that never
+existed is a mistake worth catching at the source.
+
+### Which peers have a name
+
+`staging`, `quarantined` and `active` — the same set the agent keeps on the
+WireGuard interface. A `disabled` or `revoked` peer keeps its address in the
+database and loses its name: a name resolving to a device that cannot be on the
+tunnel is a wrong answer, not a stale one.
+
+Labels are **stored**, not derived at render time (`peers.dns_label`, migration
+`0004`). Deriving would push every collision — "Laptop" and "laptop" both want
+`laptop` — out to the resolver, where the only options are refusing to serve the
+whole zone or picking a winner nobody chose. Stored, the clash is a 409 on the
+request that caused it. The unique index is on `lower(dns_label)`, because DNS
+is case-insensitive and the column would otherwise happily hold both.
+
+### Forward or split, and why forward is the default
+
+`split` answers for the zone and REFUSES everything else, so nothing about the
+fleet's browsing reaches the gateway. It is the better posture and it is *not*
+the default, for one practical reason: `DNS = 10.88.0.1` in a WireGuard config
+replaces the client's resolver entirely, and in split mode that client gets
+REFUSED for the whole internet. It only works where clients are configured to
+send in-zone queries alone. `forward` is what makes the feature work out of the
+box; `split` is the hardening step.
+
+> **Known limitation.** A quarantined peer can resolve the whole zone, so the
+> naming reveals your inventory to a device that has not authenticated. There is
+> no per-client view here, and adding one would mean a second resolver instance.
+> If that matters, set `FOXGUARD_ALLOW_DNS_IN_QUARANTINE=false` — confined peers
+> then reach the portal and nothing else.
+
+## 17. Zones: a region of the address space, not another group
+
+Groups answer "what does this device do". Zones answer "where does it sit", and
+the difference has consequences:
+
+- **A peer is in exactly one zone** (`peers.zone_id`) and any number of groups.
+  A zone owns routes, and "which zone's routes apply" has to have one answer.
+- **A zone's nft set is an interval set** (`z_<slug>_v4`), because it holds
+  routed prefixes as well as peer addresses. Groups keep the cheaper plain set.
+- **Slugs share one namespace.** A group and a zone can never have the same
+  slug, so an ACL rule naming `servers` is never ambiguous about which it means.
+
+Zones are `groups` rows with `kind = 'zone'` — the column was reserved for this
+in `0001`, so `0005` added the behaviour without a table rewrite. ACL endpoints
+reuse `src_group_id`: a zone *is* a groups row, and `src_kind` says how to read
+the reference.
+
+### The set holds the devices *and* the networks behind them
+
+"Who may reach the office" has to mean both, or every routed subnet would need
+its own ACL rule alongside the zone's. So a zone route joins the zone's set,
+and one rule covers the whole segment.
+
+### Intra-zone traffic is denied by default
+
+A zone whose members cannot talk to each other reads as odd, and it is still the
+right default: everywhere else in Foxguard access is denied until something
+grants it, and making a zone the exception would mean creating one silently
+opens paths. It is one checkbox, and the accept it emits sits *after* the ACL
+rules — so an explicit drop still carves a subset out of a zone that talks to
+itself, exactly as with internet exit.
+
+### A routed network needs two halves, and neither is optional
+
+`wg syncconf` sets cryptokey routing and does not touch the routing table.
+A zone route therefore needs:
+
+1. the CIDR in the **carrying peer's `AllowedIPs`**, which decides *which peer*
+   a packet for `192.168.10.7` is encrypted to;
+2. a **kernel route into the interface**, which decides that the packet reaches
+   `wg0` at all.
+
+Measured on a real WireGuard interface: with the route but no `AllowedIPs`, the
+kernel refuses the packet with `sendmsg: Required key not available` — the wg
+layer has no peer for that destination. With both, it is accepted for
+encryption. Two different refusals at two different layers, which is why the
+healthcheck tests for both and reports a route with no carrier as a black hole.
+
+A route with no `via_peer_id` is a network the gateway already reaches itself.
+It widens the zone's set and **no** kernel route is installed for it — adding one
+would break the path that works.
+
+### The route reconciler is written as four refusals
+
+It is the only component that can take away the operator's own access, so:
+
+1. **Never a default route.** `0.0.0.0/0` would replace the gateway's own and
+   cut every remote session, including the one that asked for it. Refused in the
+   API schema, in the ruleset generator *and* in the agent — three layers,
+   because the first two can be bypassed by editing the database.
+2. **Never a prefix covering an address this box already answers on.** A route
+   for `192.168.1.0/24` on a gateway whose LAN address is `192.168.1.10` sends
+   the operator's own SSH replies into the tunnel. The list is read live from
+   `ip -json addr show`, and a failure to read it refuses *every* route — not
+   knowing what the box answers on is when a route is most dangerous.
+   The control plane's own address is protected on top of that, so a zone route
+   can never cut the agent off from the API that would tell it to undo the route.
+3. **Never touch a route it did not install.** If something is already there it
+   belongs to whoever put it there — possibly the operator's own static route to
+   that very network. The reconciler says so and moves on.
+4. **Never guess on withdrawal.** Only routes recorded in
+   `/var/lib/foxguard/routes.json` are removed, so a lost state file removes
+   nothing rather than everything.
+
+One route that will not install never stops the others being withdrawn: problems
+are collected and reported, because a half-reconciled routing table is worse
+than a fully reported one.
+
+A CIDR may be carried by **one** peer across every zone. WireGuard resolves an
+address to a peer through `AllowedIPs`, and two peers claiming the same prefix is
+not a tie it reports — `wg` gives it to whichever was configured last, so the
+route would work until an unrelated change reordered them. The generator refuses
+that outright.
+
+### What is deliberately not here
+
+`0.0.0.0/0` as a zone route — an "exit node that is a peer" — needs policy
+routing (a separate table plus an `ip rule`), not a route in the main table.
+Doing it in the main table is exactly failure mode 1. Internet exit through the
+*gateway's* WAN is what `internet_exit` already does, per group and per zone.
+
 ---
 
 ## The nftables ruleset

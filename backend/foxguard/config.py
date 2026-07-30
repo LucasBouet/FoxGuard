@@ -16,6 +16,7 @@ from typing import Annotated, Any
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+from .dns.model import NAME_RE, DnsSpec, ResolverMode
 from .nftables.model import GatewayInputPolicy, GatewaySpec
 
 logger = logging.getLogger(__name__)
@@ -109,6 +110,36 @@ class Settings(BaseSettings):
     gateway_input_policy: GatewayInputPolicy = GatewayInputPolicy.OPEN
     log_dropped: bool = True
 
+    # --- internal DNS (Phase 5) --------------------------------------------
+    #: Off by default. Turning it on makes the gateway a resolver for the
+    #: tunnel, which is a service an existing deployment did not ask for.
+    dns_enabled: bool = False
+    #: The zone every peer and record lives in. Use a name you control or one
+    #: reserved for the purpose; ``.local`` is mDNS and will fight with it.
+    dns_zone: str = "fox.internal"
+    #: Label the gateway answers to inside the zone.
+    dns_gateway_label: str = "gw"
+    #: ``forward`` resolves everything and sends the rest upstream, which is
+    #: what makes ``DNS = <gateway>`` in a client config work on its own.
+    #: ``split`` answers for the zone and REFUSES the rest, which only works if
+    #: the client is configured to send just in-zone queries here.
+    dns_mode: ResolverMode = ResolverMode.FORWARD
+    dns_upstreams: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    dns_port: int = Field(default=53, ge=1, le=65535)
+    #: Defaults to the gateway's own tunnel address. Never set this to a WAN
+    #: address: it would publish an open resolver.
+    dns_listen_addresses: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    #: Where the agent writes the artefacts. Part of the rendered configuration
+    #: (``addn-hosts=``), so it is the control plane that decides it.
+    dns_hosts_path: str = "/etc/foxguard/dns/hosts"
+    dns_conf_path: str = "/etc/foxguard/dns/dnsmasq.conf"
+    dns_cache_size: int = Field(default=1000, ge=0)
+    dns_stop_dns_rebind: bool = False
+    dns_log_queries: bool = False
+    #: Raw dnsmasq options, appended verbatim. Operator-supplied escape hatch;
+    #: each entry must be a single ``name`` or ``name=value`` line.
+    dns_extra_options: Annotated[list[str], NoDecode] = Field(default_factory=list)
+
     # --- sessions (Phase 3) ------------------------------------------------
     default_session_lifetime_seconds: int = 8 * 3600
     enrollment_key_bytes: int = 32
@@ -156,10 +187,32 @@ class Settings(BaseSettings):
     #: OIDC is configured.
     oidc_admin_redirect_url: str | None = None
 
-    @field_validator("internal_cidrs", mode="before")
+    @field_validator(
+        "internal_cidrs",
+        "dns_upstreams",
+        "dns_listen_addresses",
+        "dns_extra_options",
+        mode="before",
+    )
     @classmethod
     def _parse_internal_cidrs(cls, value: Any) -> Any:
         return _split_list(value)
+
+    @field_validator("dns_zone")
+    @classmethod
+    def _validate_dns_zone(cls, value: str) -> str:
+        """A bad zone is a configuration mistake, so it fails at startup.
+
+        Unlike the pool checks below, nothing about this needs to see the
+        gateway: either the string is a DNS name or it is not.
+        """
+        candidate = value.strip().rstrip(".").lower()
+        if not candidate or not NAME_RE.match(candidate) or len(candidate) > 253:
+            raise ValueError(
+                f"FOXGUARD_DNS_ZONE {value!r} is not a valid DNS name "
+                "(lowercase letters, digits and hyphens, dot-separated)"
+            )
+        return candidate
 
     @field_validator("internal_cidrs")
     @classmethod
@@ -336,6 +389,39 @@ class Settings(BaseSettings):
             if candidate.version == network.version and candidate in network:
                 return True
         return False
+
+    @property
+    def dns_listen(self) -> tuple[str, ...]:
+        """Addresses the resolver binds to.
+
+        Defaults to the gateway's own tunnel address rather than to everything:
+        the failure mode of guessing wide here is an open resolver on the WAN,
+        and the failure mode of guessing narrow is a resolver that answers only
+        inside the tunnel -- which is the whole point.
+        """
+        if self.dns_listen_addresses:
+            return tuple(self.dns_listen_addresses)
+        return (self.gateway_ip,)
+
+    def dns_base_spec(self) -> DnsSpec:
+        """Project settings onto a DNS spec with no records in it yet.
+
+        ``services/dns.py`` fills in the hosts and aliases from the database,
+        exactly as ``services/ruleset.py`` fills in peers and rules.
+        """
+        return DnsSpec(
+            zone=self.dns_zone,
+            listen_addresses=self.dns_listen,
+            port=self.dns_port,
+            hosts_path=self.dns_hosts_path,
+            mode=self.dns_mode,
+            upstreams=tuple(self.dns_upstreams),
+            cache_size=self.dns_cache_size,
+            reverse_pools=self.tunnel_pools,
+            stop_dns_rebind=self.dns_stop_dns_rebind,
+            log_queries=self.dns_log_queries,
+            extra_options=tuple(self.dns_extra_options),
+        )
 
     def gateway_spec(self) -> GatewaySpec:
         """Project settings onto the pure dataplane spec used by the generator."""

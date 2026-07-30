@@ -15,17 +15,32 @@ import {
 } from "@/components/forms";
 import { createRule, deleteRule, updateRule } from "@/lib/actions";
 import type { Result, RuleInput } from "@/lib/actions";
-import type { AclEndpoint, AclRule, EndpointKind, Group, Protocol } from "@/lib/types";
+import type {
+  AclEndpoint,
+  AclRule,
+  EndpointKind,
+  Group,
+  Protocol,
+  Zone,
+} from "@/lib/types";
 
-/** One side of a rule: any, a group, or a literal CIDR. */
+/**
+ * One side of a rule: any, a group, a zone, or a literal CIDR.
+ *
+ * A zone endpoint covers its member peers *and* the networks routed inside it,
+ * which is the reason it exists as a separate kind rather than being a group
+ * with extra fields.
+ */
 function EndpointFields({
   side,
   groups,
+  zones,
   value,
   onChange,
 }: {
   side: "Source" | "Destination";
   groups: Group[];
+  zones: Zone[];
   value: AclEndpoint;
   onChange: (next: AclEndpoint) => void;
 }) {
@@ -38,12 +53,14 @@ function EndpointFields({
           onChange({
             kind: event.target.value as EndpointKind,
             group_slug: null,
+            zone_slug: null,
             cidr: null,
           })
         }
       >
         <option value="any">any</option>
         <option value="group">group</option>
+        <option value="zone">zone</option>
         <option value="cidr">CIDR</option>
       </Select>
 
@@ -62,6 +79,22 @@ function EndpointFields({
         </Select>
       )}
 
+      {value.kind === "zone" && (
+        <Select
+          value={value.zone_slug ?? ""}
+          onChange={(event) => onChange({ ...value, zone_slug: event.target.value })}
+          required
+        >
+          <option value="">Select a zone…</option>
+          {zones.map((zone) => (
+            <option key={zone.id} value={zone.slug}>
+              {zone.slug}
+              {zone.routes.length > 0 && ` (+${zone.routes.length} network)`}
+            </option>
+          ))}
+        </Select>
+      )}
+
       {value.kind === "cidr" && (
         <Input
           value={value.cidr ?? ""}
@@ -75,9 +108,9 @@ function EndpointFields({
   );
 }
 
-const ANY: AclEndpoint = { kind: "any", group_slug: null, cidr: null };
+const ANY: AclEndpoint = { kind: "any", group_slug: null, zone_slug: null, cidr: null };
 
-export function CreateRule({ groups }: { groups: Group[] }) {
+export function CreateRule({ groups, zones }: { groups: Group[]; zones: Zone[] }) {
   const [ref, setRef] = useState("");
   const [name, setName] = useState("");
   const [action, setAction] = useState<"accept" | "drop" | "reject">("accept");
@@ -146,10 +179,17 @@ export function CreateRule({ groups }: { groups: Group[] }) {
         </div>
 
         <div className="grid gap-3 sm:grid-cols-2">
-          <EndpointFields side="Source" groups={groups} value={src} onChange={setSrc} />
+          <EndpointFields
+            side="Source"
+            groups={groups}
+            zones={zones}
+            value={src}
+            onChange={setSrc}
+          />
           <EndpointFields
             side="Destination"
             groups={groups}
+            zones={zones}
             value={dst}
             onChange={setDst}
           />
@@ -232,7 +272,7 @@ export function CreateRule({ groups }: { groups: Group[] }) {
   );
 }
 
-export function RuleActions({ rule, groups }: { rule: AclRule; groups: Group[] }) {
+export function RuleActions({ rule, groups, zones }: { rule: AclRule; groups: Group[]; zones: Zone[] }) {
   const [result, setResult] = useState<Result<unknown> | null>(null);
   const [editing, setEditing] = useState(false);
   const [name, setName] = useState(rule.name);
@@ -273,10 +313,17 @@ export function RuleActions({ rule, groups }: { rule: AclRule; groups: Group[] }
       <div className="space-y-2 py-2 text-left">
         <Input value={name} onChange={(event) => setName(event.target.value)} />
         <div className="grid gap-2 sm:grid-cols-2">
-          <EndpointFields side="Source" groups={groups} value={src} onChange={setSrc} />
+          <EndpointFields
+            side="Source"
+            groups={groups}
+            zones={zones}
+            value={src}
+            onChange={setSrc}
+          />
           <EndpointFields
             side="Destination"
             groups={groups}
+            zones={zones}
             value={dst}
             onChange={setDst}
           />

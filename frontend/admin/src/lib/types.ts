@@ -14,6 +14,8 @@ export type PeerState =
   | "disabled"
   | "revoked";
 export type PeerType = "server" | "user";
+export type DnsRecordKind = "A" | "AAAA" | "CNAME";
+export type ResolverMode = "forward" | "split";
 export type AclAction = "accept" | "drop" | "reject";
 export type AuthMethod = "local" | "oidc";
 
@@ -27,6 +29,8 @@ export interface Peer {
   tunnel_ip: string | null;
   tunnel_ip6: string | null;
   owner_user_id: string | null;
+  dns_label: string | null;
+  zone_slug: string | null;
   group_slugs: string[];
   tags: string[];
   enrolled_at: string | null;
@@ -43,6 +47,61 @@ export interface Group {
   kind: "group" | "zone";
   internet_exit: boolean;
   session_lifetime_seconds: number | null;
+}
+
+/**
+ * A network zone: the peers assigned to it plus the networks routed inside it.
+ *
+ * Distinct from `Group` in the UI as well as in the API, because the two answer
+ * different questions -- a group is a set of devices, a zone is a region of the
+ * address space, and a peer sits in exactly one of them.
+ */
+export interface Zone {
+  id: string;
+  slug: string;
+  name: string;
+  description: string | null;
+  internet_exit: boolean;
+  intra_zone: boolean;
+  session_lifetime_seconds: number | null;
+  routes: ZoneRoute[];
+  peer_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ZoneRoute {
+  id: string;
+  zone_id: string;
+  cidr: string;
+  /** The peer that carries it. Null means the gateway reaches it directly. */
+  via_peer_id: string | null;
+  description: string | null;
+  enabled: boolean;
+}
+
+export interface DnsRecord {
+  id: string;
+  name: string;
+  kind: DnsRecordKind;
+  value: string;
+  description: string | null;
+  enabled: boolean;
+}
+
+export interface DnsZone {
+  enabled: boolean;
+  zone: string;
+  mode: ResolverMode;
+  listen_addresses: string[];
+  upstreams: string[];
+  digest: string | null;
+  hosts: string | null;
+  conf: string | null;
+  /** Populated instead of the artefacts when the state cannot be rendered. */
+  errors: string[];
+  /** Served-nothing but harmless: an alias whose target was revoked. */
+  warnings: string[];
 }
 
 export interface Tag {
@@ -180,12 +239,13 @@ export interface User {
   auth_methods: AuthMethod[];
 }
 
-export type EndpointKind = "any" | "group" | "cidr";
+export type EndpointKind = "any" | "group" | "zone" | "cidr";
 export type Protocol = "any" | "tcp" | "udp" | "icmp";
 
 export interface AclEndpoint {
   kind: EndpointKind;
   group_slug: string | null;
+  zone_slug: string | null;
   cidr: string | null;
 }
 

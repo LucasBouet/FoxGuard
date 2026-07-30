@@ -39,6 +39,7 @@ from .model import (
     Protocol,
     RulesetSpec,
     RuleSpec,
+    ZoneSpec,
 )
 
 __all__ = [
@@ -49,6 +50,7 @@ __all__ = [
     "group_set_name",
     "quarantine_set_name",
     "internal_set_name",
+    "zone_set_name",
 ]
 
 # nft identifiers are limited (historically NFT_NAME_MAXLEN=32 for set names).
@@ -112,6 +114,18 @@ def group_set_name(slug: str, family: Family) -> str:
     return f"g_{slug.replace('-', '_')}_{family.suffix}"
 
 
+def zone_set_name(slug: str, family: Family) -> str:
+    """nft set name for a zone.
+
+    A different prefix from groups, and not merely for readability: zone sets
+    carry ``flags interval`` because a zone holds routed prefixes as well as
+    peer addresses, and nft cannot mix the two shapes in one set. Sharing the
+    ``g_`` namespace would also let a group and a zone of the same slug collapse
+    onto one set.
+    """
+    return f"z_{slug.replace('-', '_')}_{family.suffix}"
+
+
 def quarantine_set_name(family: Family) -> str:
     return f"fg_quarantine_{family.suffix}"
 
@@ -133,13 +147,22 @@ def _check_cidr(value: str, label: str, errors: list[str]) -> None:
 
 
 def _validate_endpoint(
-    endpoint: Endpoint, label: str, known_groups: frozenset[str], errors: list[str]
+    endpoint: Endpoint,
+    label: str,
+    known_groups: frozenset[str],
+    known_zones: frozenset[str],
+    errors: list[str],
 ) -> None:
     if endpoint.kind is EndpointKind.GROUP:
         if not endpoint.group_slug:
             errors.append(f"{label}: group endpoint without a slug")
         elif endpoint.group_slug not in known_groups:
             errors.append(f"{label}: unknown group {endpoint.group_slug!r}")
+    elif endpoint.kind is EndpointKind.ZONE:
+        if not endpoint.zone_slug:
+            errors.append(f"{label}: zone endpoint without a slug")
+        elif endpoint.zone_slug not in known_zones:
+            errors.append(f"{label}: unknown zone {endpoint.zone_slug!r}")
     elif endpoint.kind is EndpointKind.CIDR:
         if not endpoint.cidr:
             errors.append(f"{label}: cidr endpoint without a value")
@@ -210,6 +233,87 @@ def validate_spec(spec: RulesetSpec) -> None:
             )
 
     known_groups = frozenset(seen_slugs)
+
+    seen_zones: set[str] = set()
+    zone_set_names: dict[str, str] = {}
+    for zone in spec.zones:
+        if not SLUG_RE.match(zone.slug):
+            errors.append(
+                f"zone {zone.slug!r}: slug must match {SLUG_RE.pattern} "
+                "(lowercase, max 24 chars)"
+            )
+        if zone.slug in seen_zones:
+            errors.append(f"zone {zone.slug!r}: duplicate slug")
+        seen_zones.add(zone.slug)
+
+        normalised = zone_set_name(zone.slug, Family.V4)
+        clash = zone_set_names.get(normalised)
+        if clash is not None and clash != zone.slug:
+            errors.append(
+                f"zone {zone.slug!r}: collides with zone {clash!r} on nft set name "
+                f"{normalised!r} (hyphens and underscores are equivalent there)"
+            )
+        zone_set_names[normalised] = zone.slug
+
+        if zone.internet_exit and not gw.wan_interface:
+            errors.append(
+                f"zone {zone.slug!r}: internet_exit requires gateway.wan_interface to be set"
+            )
+
+        seen_cidrs: set[str] = set()
+        for route in zone.routes:
+            rlabel = f"zone {zone.slug!r} route {route.cidr!r}"
+            try:
+                network = ipaddress.ip_network(route.cidr, strict=False)
+            except ValueError as exc:
+                errors.append(f"{rlabel}: invalid CIDR ({exc})")
+                continue
+            if network.prefixlen == 0:
+                # A default route inside a zone would have the agent install
+                # 0.0.0.0/0 dev wg0 on the gateway, replacing its own default
+                # route and cutting every remote session including the one that
+                # asked for this. Policy routing is the correct mechanism and it
+                # is not what a route in a zone means.
+                errors.append(
+                    f"{rlabel}: a zone route may not be a default route -- it would "
+                    "replace the gateway's own default route"
+                )
+            if str(network) in seen_cidrs:
+                errors.append(f"{rlabel}: duplicate route in this zone")
+            seen_cidrs.add(str(network))
+
+    known_zones = frozenset(seen_zones)
+
+    # A CIDR may be carried by at most one peer, across every zone. WireGuard
+    # resolves an address to a peer through AllowedIPs, and two peers claiming
+    # the same prefix is not a tie it reports -- ``wg`` silently moves the entry
+    # to whichever peer was configured last, so the route would work until an
+    # unrelated change reordered them.
+    carriers: dict[str, str] = {}
+    for zone in spec.zones:
+        for route in zone.routes:
+            if route.via_peer_id is None:
+                continue
+            try:
+                cidr = str(ipaddress.ip_network(route.cidr, strict=False))
+            except ValueError:
+                continue  # already reported above
+            previous = carriers.get(cidr)
+            if previous is not None and previous != route.via_peer_id:
+                errors.append(
+                    f"route {cidr} is carried by two different peers "
+                    f"({previous} and {route.via_peer_id}); WireGuard would give it "
+                    "to whichever was configured last"
+                )
+            carriers[cidr] = route.via_peer_id
+
+    # A slug identifies exactly one thing. Groups and zones live in one table
+    # with a unique slug, so this can only be reached by a spec built by hand --
+    # and an ACL rule naming "servers" must never be ambiguous about which
+    # "servers" it means.
+    for shared in sorted(known_groups & known_zones):
+        errors.append(f"slug {shared!r} is used by both a group and a zone")
+
     seen_peer_ids: set[str] = set()
     seen_addresses: dict[str, str] = {}
     for peer in spec.peers:
@@ -220,6 +324,8 @@ def validate_spec(spec: RulesetSpec) -> None:
         for slug in peer.group_slugs:
             if slug not in known_groups:
                 errors.append(f"{label}: member of unknown group {slug!r}")
+        if peer.zone_slug is not None and peer.zone_slug not in known_zones:
+            errors.append(f"{label}: assigned to unknown zone {peer.zone_slug!r}")
         for family in FAMILIES:
             for address in peer.addresses(family):
                 try:
@@ -241,6 +347,10 @@ def validate_spec(spec: RulesetSpec) -> None:
         if peer.state.is_active and not (peer.tunnel_ip or peer.tunnel_ip6):
             errors.append(f"{label}: active peer without any tunnel address")
 
+    for cidr, carrier in sorted(carriers.items()):
+        if carrier not in seen_peer_ids:
+            errors.append(f"route {cidr}: carried by unknown peer {carrier!r}")
+
     seen_rule_ids: set[str] = set()
     for rule in spec.rules:
         label = f"rule {rule.id!r}"
@@ -249,8 +359,8 @@ def validate_spec(spec: RulesetSpec) -> None:
         if rule.id in seen_rule_ids:
             errors.append(f"{label}: duplicate id")
         seen_rule_ids.add(rule.id)
-        _validate_endpoint(rule.src, f"{label}.src", known_groups, errors)
-        _validate_endpoint(rule.dst, f"{label}.dst", known_groups, errors)
+        _validate_endpoint(rule.src, f"{label}.src", known_groups, known_zones, errors)
+        _validate_endpoint(rule.dst, f"{label}.dst", known_groups, known_zones, errors)
         _validate_ports(rule, label, errors)
 
     if errors:
@@ -320,6 +430,10 @@ def _endpoint_match(
         if endpoint.group_slug is None:
             raise RulesetValidationError(["group endpoint without a slug"])
         return [f"{family.addr_kw} {direction}addr @{group_set_name(endpoint.group_slug, family)}"]
+    if endpoint.kind is EndpointKind.ZONE:
+        if endpoint.zone_slug is None:
+            raise RulesetValidationError(["zone endpoint without a slug"])
+        return [f"{family.addr_kw} {direction}addr @{zone_set_name(endpoint.zone_slug, family)}"]
     if endpoint.cidr is None:
         raise RulesetValidationError(["cidr endpoint without a value"])
     network = ipaddress.ip_network(endpoint.cidr, strict=False)
@@ -382,6 +496,23 @@ def _group_members(spec: RulesetSpec, slug: str, family: Family) -> list[str]:
     return _sorted_addresses(addresses)
 
 
+def _zone_members(spec: RulesetSpec, zone: ZoneSpec, family: Family) -> list[str]:
+    """A zone's set: its active peers as host addresses, plus its routed networks.
+
+    Both in one set is the point. "Who may reach the finance zone" has to mean
+    the devices *and* the networks behind them, or every routed subnet would
+    need its own ACL rule alongside the zone's.
+    """
+    addresses = [
+        address
+        for peer in spec.peers
+        if peer.state.is_active and peer.zone_slug == zone.slug
+        for address in peer.addresses(family)
+    ]
+    elements = [str(ipaddress.ip_network(a)) for a in _sorted_addresses(addresses)]
+    return elements + _sorted_networks(zone.route_cidrs(family))
+
+
 def _confined_members(spec: RulesetSpec, family: Family) -> list[str]:
     addresses: list[str] = []
     for peer in spec.peers:
@@ -430,6 +561,20 @@ def _render_sets(spec: RulesetSpec) -> Iterator[str]:
                 _group_members(spec, group.slug, family),
                 interval=False,
                 description=f"members of group {group.slug} ({family.value})",
+            )
+            yield ""
+
+    for zone in sorted(spec.zones, key=lambda z: z.slug):
+        for family in FAMILIES:
+            yield from _render_set(
+                zone_set_name(zone.slug, family),
+                family,
+                _zone_members(spec, zone, family),
+                interval=True,
+                description=(
+                    f"zone {zone.slug}: member peers and routed networks "
+                    f"({family.value})"
+                ),
             )
             yield ""
 
@@ -560,16 +705,39 @@ def _render_forward_chain(spec: RulesetSpec) -> Iterator[str]:
         yield f"{INDENT * 2}# (no ACL rules defined)"
     yield ""
 
-    exit_groups = [g for g in sorted(spec.groups, key=lambda g: g.slug) if g.internet_exit]
-    if exit_groups:
+    intra_zones = [z for z in sorted(spec.zones, key=lambda z: z.slug) if z.intra_zone]
+    if intra_zones:
+        yield f"{INDENT * 2}# --- intra-zone traffic (opt-in, per zone) ---"
+        yield f"{INDENT * 2}# After the ACL rules on purpose: an explicit drop above still"
+        yield f"{INDENT * 2}# carves a subset out of a zone that talks to itself."
+        for zone in intra_zones:
+            for family in FAMILIES:
+                name = zone_set_name(zone.slug, family)
+                yield (
+                    f"{INDENT * 2}{family.addr_kw} saddr @{name} "
+                    f"{family.addr_kw} daddr @{name} counter accept "
+                    f'comment "fg:intra-zone:{zone.slug}"'
+                )
+        yield ""
+
+    exit_sources = [
+        (g.slug, group_set_name)
+        for g in sorted(spec.groups, key=lambda g: g.slug)
+        if g.internet_exit
+    ] + [
+        (z.slug, zone_set_name)
+        for z in sorted(spec.zones, key=lambda z: z.slug)
+        if z.internet_exit
+    ]
+    if exit_sources:
         yield f"{INDENT * 2}# --- internet exit (never a shortcut into internal networks) ---"
-        for group in exit_groups:
+        for slug, naming in exit_sources:
             for family in FAMILIES:
                 yield (
-                    f"{INDENT * 2}{family.addr_kw} saddr @{group_set_name(group.slug, family)} "
+                    f"{INDENT * 2}{family.addr_kw} saddr @{naming(slug, family)} "
                     f"{family.addr_kw} daddr != @{internal_set_name(family)} "
                     f'oifname "{gw.wan_interface}" counter accept '
-                    f'comment "fg:internet-exit:{group.slug}"'
+                    f'comment "fg:internet-exit:{slug}"'
                 )
         yield ""
 
@@ -584,18 +752,26 @@ def _render_forward_chain(spec: RulesetSpec) -> Iterator[str]:
 
 def _render_nat_chain(spec: RulesetSpec) -> Iterator[str]:
     gw = spec.gateway
-    exit_groups = [g for g in sorted(spec.groups, key=lambda g: g.slug) if g.internet_exit]
-    if not exit_groups or not gw.wan_interface:
+    exit_sources = [
+        (g.slug, group_set_name)
+        for g in sorted(spec.groups, key=lambda g: g.slug)
+        if g.internet_exit
+    ] + [
+        (z.slug, zone_set_name)
+        for z in sorted(spec.zones, key=lambda z: z.slug)
+        if z.internet_exit
+    ]
+    if not exit_sources or not gw.wan_interface:
         return
 
     yield f"{INDENT}chain postrouting {{"
     yield f"{INDENT * 2}type nat hook postrouting priority srcnat; policy accept;"
-    for group in exit_groups:
+    for slug, naming in exit_sources:
         for family in FAMILIES:
             yield (
-                f"{INDENT * 2}{family.addr_kw} saddr @{group_set_name(group.slug, family)} "
+                f"{INDENT * 2}{family.addr_kw} saddr @{naming(slug, family)} "
                 f'oifname "{gw.wan_interface}" counter masquerade '
-                f'comment "fg:nat:{group.slug}"'
+                f'comment "fg:nat:{slug}"'
             )
     yield f"{INDENT}}}"
 

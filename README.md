@@ -26,8 +26,23 @@ Two kinds of peers, two enrollment flows:
 | Session expiry | **never** — access is stable until the key is revoked | re-auth every N hours (shortest lifetime among its groups) |
 
 Both kinds get a fixed tunnel IP. Group membership drives ACL policies
-(`source group → dest group/CIDR/port`), which compile into an nftables ruleset
-that is validated with `nft -c -f` and applied atomically.
+(`source group → dest group/zone/CIDR/port`), which compile into an nftables
+ruleset that is validated with `nft -c -f` and applied atomically.
+
+### Groups, zones and names
+
+A **group** is what a device does; a **zone** is where it sits. A peer holds any
+number of groups and sits in exactly one zone, and a zone can own routes to
+networks behind its peers — so one ACL rule naming `office` covers the devices
+*and* the `192.168.10.0/24` behind them. Zone routes are programmed in both
+halves that WireGuard needs: the CIDR in the carrying peer's `AllowedIPs`, and a
+kernel route into the tunnel.
+
+Optionally, the gateway also runs a **resolver for the tunnel**: every peer gets
+a name in a zone you choose (`laptop.fox.internal`), the gateway answers to
+`gw.fox.internal`, and hand-authored records name services that live off the
+tunnel. Same shape as the firewall rules — rendered from the database, applied by
+the agent, checked with `dnsmasq --test` before the daemon ever sees it.
 
 ### How a peer proves who it is
 
@@ -383,6 +398,14 @@ These are enforced in code and covered by tests, not just documented:
   comparing digests.
 - **No MITM.** Quarantine blocks everything except the portal; there is no
   transparent HTTPS interception and no DNS hijack.
+- **A name service cannot break the firewall.** A hand-authored DNS record that
+  will not render is logged and skipped; the ruleset in the same agent response
+  still reaches the kernel. Access control is never taken down by a typo in a
+  CNAME.
+- **A zone route can never cut your own access.** Default routes are refused, so
+  are prefixes covering an address the gateway already answers on, and a route
+  the agent did not install is never replaced. Failing to read the local address
+  list refuses every route rather than guessing.
 - **No injection.** Group slugs, interface names and rule ids are validated
   against strict regexes and comments are sanitised before reaching the script.
 - **Revocation is final.** `revoked` is a terminal state: no admin `PATCH`, no
@@ -449,11 +472,18 @@ These are enforced in code and covered by tests, not just documented:
   matrix, ACL rules, policy import with dry-run diff, audit log, the kill switch,
   and full create/edit/delete for all of them. Plus the captive portal UI — a
   static bundle served by the API, so peer identification survives.
-- **Phase 5 (kept unblocked, not built).** Network zones with their own
-  routes/exit nodes — `groups.kind` already distinguishes `group` from `zone`
-  and `groups.parent_id` allows nesting; an integrated reverse proxy; a CrowdSec
-  bouncer. ACL endpoints are modelled as `(kind, group, cidr)`, so adding a
-  `zone` endpoint kind is one enum value rather than a rewrite.
+- **Phase 5 — network zones and internal DNS, done.** Zones as segments with
+  their own routed networks and exit nodes, zone-to-zone ACL rules, one zone per
+  peer alongside its groups, and a kernel-route reconciler in the agent written
+  as four refusals so a zone route can never cut the gateway's own access.
+  Plus a dnsmasq instance Foxguard owns end to end: names for every peer, an
+  admin-authored record table, forwarding or split DNS, and a reload path that
+  adds a device without dropping an in-flight query. The schema absorbed both
+  without a rewrite, as Phase 1 intended — zones are `groups.kind = 'zone'` and
+  the `zone` ACL endpoint cost one enum value.
+- **Phase 5, still open.** An integrated reverse proxy in front of internal web
+  services (never in front of the portal — see `docs/architecture.md` §5), and a
+  CrowdSec bouncer on the gateway.
 
 ## License
 

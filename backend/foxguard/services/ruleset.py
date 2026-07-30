@@ -14,15 +14,17 @@ from sqlalchemy import select, update
 from sqlalchemy.orm import Session, selectinload
 
 from ..config import Settings
-from ..models import AclRule, Group, Peer, RulesetStatus, RulesetVersion
+from ..models import AclRule, Group, GroupKind, Peer, RulesetStatus, RulesetVersion
 from ..nftables import (
     Endpoint,
     EndpointKind,
     GroupSpec,
     PeerSpec,
+    RouteSpec,
     RulesetSpec,
     RulesetValidationError,
     RuleSpec,
+    ZoneSpec,
     generate_ruleset,
     ruleset_digest,
 )
@@ -43,11 +45,17 @@ def _endpoint(kind: EndpointKind, group: Group | None, cidr: str | None) -> Endp
     # is ON DELETE CASCADE and the table has CHECK constraints so this cannot
     # normally happen -- but raise rather than assert, because an assert is
     # stripped under `python -O` and would let a malformed rule through.
-    if kind is EndpointKind.GROUP:
+    if kind in (EndpointKind.GROUP, EndpointKind.ZONE):
         if group is None:
             raise RulesetValidationError(
-                ["ACL rule has src/dst kind 'group' but no group row"]
+                [f"ACL rule has src/dst kind {kind.value!r} but no groups row"]
             )
+        # The row's own kind decides which set the rule matches against, not the
+        # endpoint kind. They can only disagree if a group was converted into a
+        # zone behind a rule's back, and rendering against the wrong set would
+        # silently point the rule at a different population.
+        if group.kind is GroupKind.ZONE:
+            return Endpoint.zone(group.slug)
         return Endpoint.group(group.slug)
     if kind is EndpointKind.CIDR:
         if cidr is None:
@@ -60,10 +68,20 @@ def _endpoint(kind: EndpointKind, group: Group | None, cidr: str | None) -> Endp
 
 def build_spec(session: Session, settings: Settings) -> RulesetSpec:
     """Build the full dataplane spec from current database state."""
-    groups = session.execute(select(Group).order_by(Group.slug)).scalars().all()
+    rows = (
+        session.execute(
+            select(Group).options(selectinload(Group.routes)).order_by(Group.slug)
+        )
+        .scalars()
+        .all()
+    )
+    groups = [row for row in rows if row.kind is not GroupKind.ZONE]
+    zones = [row for row in rows if row.kind is GroupKind.ZONE]
     peers = (
         session.execute(
-            select(Peer).options(selectinload(Peer.groups)).order_by(Peer.created_at, Peer.id)
+            select(Peer)
+            .options(selectinload(Peer.groups))
+            .order_by(Peer.created_at, Peer.id)
         )
         .scalars()
         .all()
@@ -82,6 +100,25 @@ def build_spec(session: Session, settings: Settings) -> RulesetSpec:
             GroupSpec(slug=group.slug, internet_exit=group.internet_exit)
             for group in groups
         ),
+        zones=tuple(
+            ZoneSpec(
+                slug=zone.slug,
+                intra_zone=zone.intra_zone,
+                internet_exit=zone.internet_exit,
+                routes=tuple(
+                    RouteSpec(
+                        cidr=route.cidr,
+                        via_peer_id=str(route.via_peer_id) if route.via_peer_id else None,
+                        comment=route.description,
+                    )
+                    # Sorted so the rendered set is byte-stable regardless of
+                    # the order rows were inserted in.
+                    for route in sorted(zone.routes, key=lambda r: r.cidr)
+                    if route.enabled
+                ),
+            )
+            for zone in zones
+        ),
         peers=tuple(
             PeerSpec(
                 id=str(peer.id),
@@ -90,7 +127,14 @@ def build_spec(session: Session, settings: Settings) -> RulesetSpec:
                 peer_type=peer.peer_type,
                 tunnel_ip=str(peer.tunnel_ip) if peer.tunnel_ip else None,
                 tunnel_ip6=str(peer.tunnel_ip6) if peer.tunnel_ip6 else None,
-                group_slugs=tuple(sorted(group.slug for group in peer.groups)),
+                group_slugs=tuple(
+                    sorted(
+                        group.slug
+                        for group in peer.groups
+                        if group.kind is not GroupKind.ZONE
+                    )
+                ),
+                zone_slug=peer.zone.slug if peer.zone else None,
             )
             for peer in peers
         ),
