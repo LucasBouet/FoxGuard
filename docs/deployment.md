@@ -665,6 +665,44 @@ existing client config points at a server that can no longer decrypt them, and
 you would have to redistribute all of them. That file matters as much as the
 database.
 
+## Uninstalling
+
+```sh
+sudo ./deploy/foxguard-uninstall.sh --dry-run       # print the plan, change nothing
+sudo ./deploy/foxguard-uninstall.sh                 # the default removal
+```
+
+The default stops and disables the three units, deletes `inet foxguard` from
+nftables, and removes `/opt/foxguard`, `/etc/foxguard`, `/var/lib/foxguard`, the
+unit files and the service user. It leaves the database, the WireGuard interface
+and every apt package alone, because none of those is unambiguously Foxguard's
+to delete.
+
+Three flags go further, each opt-in for its own reason:
+
+| Flag | What it adds | Why it is not the default |
+| --- | --- | --- |
+| `--remove-database` | drops the `foxguard` database and role | takes the audit log with it; a gzipped `pg_dump` lands in `/root` first, and an empty dump aborts the drop |
+| `--remove-wireguard` | `wg-quick@wg0` down, interface deleted, keys removed | if you reached the box through that tunnel, this is the command that ends your session |
+| `--remove-packages` | purges the apt packages the installer added | naming ten packages routinely removes several hundred — `nodejs` drags the whole `node-*` tree — and purging `postgresql` destroys **every** database on the machine, not only Foxguard's |
+
+`--remove-packages` simulates with `apt-get -s purge` first, prints the count and
+the head of the list, refuses outright if apt reports essential packages, and
+asks again before purging. `python3`, `curl` and `iproute2` are never touched
+even though the installer pulls them in: apt's own tooling depends on python3
+and `iproute2` is how the box configures its networking, so removing either to
+tidy up after Foxguard costs more than it cleans.
+
+No step can abort the run. A failure — a `DROP DATABASE` with a session still
+attached, a `daemon-reload` on an unreachable systemd — is collected and named in
+the summary, and the exit code is 1. Re-running is safe: every step checks
+whether its target is still there.
+
+What it deliberately does not do: revoke anything. Client `.conf` files on other
+machines keep working as WireGuard configs and become dead keys pointing at a
+gateway that no longer answers. If the point is to cut access rather than to
+remove the software, use the kill switch first — see [The kill switch](#the-kill-switch).
+
 ## Recovering from a mistake
 
 **Locked out through the tunnel.** Get in over the console or from the LAN and:

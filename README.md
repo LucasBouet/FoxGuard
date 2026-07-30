@@ -346,6 +346,18 @@ peers, accounts and their secrets live solely in the database:
 sudo ./deploy/foxguard-backup.sh --dest /mnt/nas/foxguard --keep 30
 ```
 
+To remove it again:
+
+```sh
+sudo ./deploy/foxguard-uninstall.sh --dry-run   # print the plan, change nothing
+sudo ./deploy/foxguard-uninstall.sh             # services, ruleset, files
+```
+
+The default leaves the database, the tunnel and every apt package in place;
+`--remove-database`, `--remove-wireguard` and `--remove-packages` go further and
+each explains what it takes with it before doing so. See
+[Uninstalling](docs/deployment.md#uninstalling).
+
 ## Safety properties
 
 These are enforced in code and covered by tests, not just documented:

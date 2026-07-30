@@ -90,6 +90,7 @@ step_peer() {
   say "2. Re-register the bootstrap peer"
 
   local name=${PEER_NAME:-foxguard-admin} peers old owner ip priv pub
+  local wgif=${FOXGUARD_WG_INTERFACE:-wg0} serverpub port endpoint out
   peers=$(curl -sf "${AUTH[@]}" "$API/api/v1/peers") || die "cannot reach the API at $API"
   old=$(jq -r   --arg n "$name" '.[]|select(.name==$n)|.id'            <<<"$peers")
   owner=$(jq -r --arg n "$name" '.[]|select(.name==$n)|.owner_user_id' <<<"$peers")
@@ -100,6 +101,18 @@ step_peer() {
     warn "re-run as: PEER_NAME=<name> bash fix.sh peer"
     return 0
   fi
+
+  # Read everything the client config needs BEFORE deleting anything. Past this
+  # point the old peer is gone and the new private key exists only in this
+  # shell, so nothing between the delete and the write may be allowed to abort.
+  # Hence the fallbacks: a missing value becomes a placeholder, never an exit.
+  serverpub=$(cat "/etc/wireguard/${wgif}.public" 2>/dev/null \
+              || wg show "$wgif" public-key 2>/dev/null \
+              || echo "<run: wg show $wgif public-key>")
+  port=$(wg show "$wgif" listen-port 2>/dev/null || echo "")
+  port=${port:-${FOXGUARD_WG_LISTEN_PORT:-51820}}
+  endpoint=${WG_ENDPOINT:-<your-public-address>:$port}
+  out="/root/$name.conf"
 
   jq -r --arg n "$name" '.[]|select(.name==$n)|"  current: \(.name)  \(.peer_type)  \(.state)  \(.tunnel_ip)"' <<<"$peers"
   ask "Delete it and register a new one with a fresh keypair?" || { warn "skipped"; return 0; }
@@ -115,16 +128,39 @@ step_peer() {
   systemctl restart foxguard-agent
   ok "agent restarted"
 
+  # The whole file, not just the changed lines: the installer prints the client
+  # config once and stores it nowhere, so anyone running this has probably lost
+  # it. Everything here is readable from the gateway except the endpoint host --
+  # that is whatever your router forwards udp/$port to, and nothing on this box
+  # knows it.
+  ( umask 077; cat > "$out" <<EOF
+[Interface]
+PrivateKey = $priv
+Address = $ip/32
+
+[Peer]
+PublicKey = $serverpub
+Endpoint = $endpoint
+AllowedIPs = ${FOXGUARD_WG_POOL_V4}
+PersistentKeepalive = 25
+EOF
+  )
+  ok "wrote $out (mode 0600)"
+
+  printf '\n'
+  sed 's/^/    /' "$out"
   cat <<EOF
 
-  ${B}In the .conf on your client, change ONLY these two lines:${N}
+  Copy it to the device that connects, e.g. from your laptop:
 
-    Address    = $ip/32
-    PrivateKey = $priv
-
-  Leave Endpoint, PublicKey and AllowedIPs alone -- they were already correct.
+    scp root@<this-box>:$out .
 
 EOF
+  if [[ $endpoint == \<* ]]; then
+    warn "fill in the endpoint host yourself: whatever your router forwards udp/$port to."
+    warn "or re-run as: WG_ENDPOINT=vpn.example.com:$port bash fix.sh peer"
+  fi
+  warn "the private key was generated here, so delete $out once the device has it."
 }
 
 # --------------------------------------------------------------------------- #
