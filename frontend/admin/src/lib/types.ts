@@ -277,3 +277,30 @@ export interface TotpProvision {
   provisioning_uri: string;
   enabled: boolean;
 }
+
+/**
+ * The non-secret half of a WireGuard client configuration.
+ *
+ * `complete` is false when the deployment has not been told its own public key
+ * or endpoint. The generator refuses to produce a file in that state, and shows
+ * the warnings instead — they name the environment variable to set.
+ */
+export type AllowedIpsMode = "tunnel" | "zone" | "routed" | "full";
+
+export interface ClientConfigProfile {
+  peer_id: string;
+  peer_name: string;
+  peer_state: PeerState;
+  fqdn: string | null;
+  addresses: string[];
+  dns: string[];
+  mtu: number | null;
+  server_public_key: string | null;
+  endpoint: string | null;
+  allowed_ips: string[];
+  persistent_keepalive: number;
+  allowed_ips_mode: AllowedIpsMode;
+  excluded_routes: string[];
+  warnings: string[];
+  complete: boolean;
+}

@@ -8,7 +8,9 @@
     "build": "next build",
     "start": "next start -p 3000",
     "lint": "next lint",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "tsc -p tsconfig.tests.json && node --test .test-build/tests/",
+    "test:live": "tsc -p tsconfig.tests.json && FOXGUARD_LIVE_WG=1 node --test .test-build/tests/"
   },
   "dependencies": {
     "next": "^15.5.22",

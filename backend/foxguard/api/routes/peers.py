@@ -10,19 +10,21 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from ...clientconfig import AllowedIpsMode
 from ...config import Settings, get_settings
 from ...db import get_db
 from ...dns import derive_label, fallback_label
 from ...models import Group, GroupKind, Peer, Tag
 from ...nftables import PeerState, PeerType
 from ...schemas import (
+    ClientConfigProfile,
     EnrollmentKeyCreate,
     EnrollmentKeyRead,
     PeerCreate,
     PeerRead,
     PeerUpdate,
 )
-from ...services import audit, enrollment, ipam, peer_state, sessions
+from ...services import audit, clientconfig, enrollment, ipam, peer_state, sessions
 from ..deps import (
     audit_context,
     integrity_conflict,
@@ -317,6 +319,75 @@ def delete_peer(
     )
     regenerate_or_422(session, settings, "peer.delete")
     session.commit()
+
+
+# --------------------------------------------------------------------------- #
+# client configuration
+# --------------------------------------------------------------------------- #
+
+
+@router.get("/{peer_id}/config-profile", response_model=ClientConfigProfile)
+def get_config_profile(
+    peer_id: uuid.UUID,
+    request: Request,
+    session: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+    allowed_ips: AllowedIpsMode | None = Query(
+        default=None, description="Overrides FOXGUARD_CLIENT_CONFIG_ALLOWED_IPS."
+    ),
+    keepalive: int | None = Query(default=None, ge=0, le=65535),
+    mtu: int | None = Query(default=None, ge=576, le=9000),
+    dns: bool | None = Query(
+        default=None, description="False omits the DNS line even when the resolver is on."
+    ),
+) -> ClientConfigProfile:
+    """Everything a client config needs except the private key.
+
+    **No secret is returned and none is accepted.** The browser generates the
+    keypair, sends the public half through ``POST /peers``, and assembles the
+    file locally; this endpoint only tells it what to put around the key. That
+    is also why reading a profile is audited: it is the moment a device becomes
+    provisionable, and the audit log is where "who set this laptop up" is
+    answered.
+    """
+    peer = _get_or_404(session, peer_id)
+    profile = clientconfig.build_profile(
+        session,
+        settings,
+        peer,
+        mode=allowed_ips,
+        keepalive=keepalive,
+        mtu=mtu,
+        include_dns=dns,
+    )
+
+    audit.record(
+        session,
+        action="peer.config_profile.read",
+        object_type="peer",
+        object_id=peer.id,
+        **audit_context(request),
+        detail={"allowed_ips_mode": profile.allowed_ips_mode.value},
+    )
+    session.commit()
+
+    return ClientConfigProfile(
+        peer_id=peer.id,
+        peer_name=profile.peer_name,
+        peer_state=peer.state,
+        fqdn=profile.fqdn,
+        addresses=list(profile.addresses),
+        dns=list(profile.dns),
+        mtu=profile.mtu,
+        server_public_key=profile.server_public_key,
+        endpoint=profile.endpoint,
+        allowed_ips=list(profile.allowed_ips),
+        persistent_keepalive=profile.persistent_keepalive,
+        allowed_ips_mode=profile.allowed_ips_mode,
+        excluded_routes=list(profile.excluded_routes),
+        warnings=list(profile.warnings),
+        complete=profile.complete,
+    )
 
 
 # --------------------------------------------------------------------------- #

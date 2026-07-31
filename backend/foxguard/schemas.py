@@ -19,6 +19,7 @@ from pydantic import (
     model_validator,
 )
 
+from .clientconfig import AllowedIpsMode
 from .dns import RecordKind, ResolverMode
 from .models import ActorType, AuthMethod, GroupKind, RulesetStatus
 from .nftables import Action, EndpointKind, PeerState, PeerType, Protocol
@@ -857,6 +858,40 @@ class RulesetVersionRead(ApiModel):
     applied_at: datetime | None
     error: str | None
     generated_by: str | None
+
+
+class ClientConfigProfile(ApiModel):
+    """The non-secret half of a WireGuard client configuration.
+
+    Structured rather than a rendered ``.conf`` on purpose. The file is
+    assembled in the browser, where the private key was generated and where it
+    stays; an endpoint that returned finished text would invite a future caller
+    to POST the private key up so the server could "just do it", and that is the
+    one thing this design exists to make impossible.
+    """
+
+    peer_id: uuid.UUID
+    peer_name: str
+    peer_state: PeerState
+    #: Name inside the internal zone, when the resolver is on. Informational --
+    #: the config does not contain it.
+    fqdn: str | None = None
+
+    addresses: list[str]
+    dns: list[str]
+    mtu: int | None = None
+
+    server_public_key: str | None = None
+    endpoint: str | None = None
+    allowed_ips: list[str]
+    persistent_keepalive: int
+
+    allowed_ips_mode: AllowedIpsMode
+    excluded_routes: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    #: False when something the operator has to configure is missing. The
+    #: dashboard offers no download in that state.
+    complete: bool
 
 
 class AgentWireGuardPeer(ApiModel):

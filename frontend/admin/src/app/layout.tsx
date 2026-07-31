@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 
+import { NavBar } from "@/components/nav-bar";
 import { SessionBar } from "@/components/session-bar";
 import { tryGet } from "@/lib/api";
 import type { AdminWhoAmI } from "@/lib/types";
@@ -13,19 +14,6 @@ export const metadata: Metadata = {
   title: "Foxguard admin",
   description: "Peers, groups, policies and the state of the dataplane.",
 };
-
-const NAV = [
-  { href: "/", label: "Overview" },
-  { href: "/peers", label: "Peers" },
-  { href: "/users", label: "Accounts" },
-  { href: "/groups", label: "Groups & matrix" },
-  { href: "/zones", label: "Zones" },
-  { href: "/rules", label: "Rules" },
-  { href: "/dns", label: "DNS" },
-  { href: "/sessions", label: "Sessions" },
-  { href: "/policies", label: "Policies" },
-  { href: "/audit", label: "Audit log" },
-];
 
 export default async function RootLayout({ children }: { children: React.ReactNode }) {
   // Resolved here rather than per page so the header can always say who the
@@ -46,25 +34,7 @@ export default async function RootLayout({ children }: { children: React.ReactNo
             <div className="flex flex-wrap items-center gap-4">
               <SessionBar who={who} />
             </div>
-            <nav className="flex w-full flex-wrap items-center gap-1">
-              {NAV.map((item) => (
-                <Link
-                  key={item.href}
-                  href={item.href}
-                  className="rounded-md px-3 py-1.5 text-sm text-ink-secondary hover:bg-page hover:text-ink"
-                >
-                  {item.label}
-                </Link>
-              ))}
-              {/* Kept visually apart from ordinary navigation: it is the one
-                  action that can take the whole fleet off the network. */}
-              <Link
-                href="/kill-switch"
-                className="ml-2 rounded-md border border-hairline px-3 py-1.5 text-sm font-medium text-ink hover:bg-page"
-              >
-                Kill switch
-              </Link>
-            </nav>
+            <NavBar />
           </header>
           <main className="py-6">{children}</main>
         </div>

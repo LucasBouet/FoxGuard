@@ -530,6 +530,14 @@ else
   fi
 fi
 
+# The gateway's own public key, for the config generator. Either source is
+# fine: --bootstrap-wireguard writes the .public file, and an interface that
+# was already there answers `wg show`. Neither existing is not an error -- the
+# dashboard says which variable is missing and the operator fills it in.
+GW_PUBKEY=$(cat "/etc/wireguard/${WG_IF}.public" 2>/dev/null \
+  || wg show "$WG_IF" public-key 2>/dev/null || true)
+GW_PUBKEY=${GW_PUBKEY//[$'\t\r\n ']/}
+
 [[ -f $CONFDIR/backend.env ]] && cp -a "$CONFDIR/backend.env" "$CONFDIR/backend.env.bak"
 
 umask 077
@@ -552,6 +560,15 @@ FOXGUARD_WG_INTERFACE=$WG_IF
 FOXGUARD_WG_POOL_V4=$POOL
 $( [[ -n $STAGING_POOL ]] && echo "FOXGUARD_WG_STAGING_POOL_V4=$STAGING_POOL" )
 FOXGUARD_WG_GATEWAY_IP=$TUNNEL_IP
+FOXGUARD_WG_LISTEN_PORT=$LISTEN_PORT
+
+# What the dashboard's config generator puts in a client file. Without both of
+# these it can still be used, but it reports every configuration as incomplete
+# rather than handing out one that cannot connect.
+$( [[ -n $GW_PUBKEY ]] && echo "FOXGUARD_WG_PUBLIC_KEY=$GW_PUBKEY" || echo "# FOXGUARD_WG_PUBLIC_KEY=  # wg show $WG_IF public-key" )
+$( [[ -n $ENDPOINT ]] && echo "FOXGUARD_WG_ENDPOINT_HOST=$ENDPOINT" || echo "# FOXGUARD_WG_ENDPOINT_HOST=  # what your router forwards udp/$LISTEN_PORT to" )
+FOXGUARD_CLIENT_CONFIG_ALLOWED_IPS=routed
+FOXGUARD_CLIENT_CONFIG_KEEPALIVE=25
 
 $( [[ -n $WAN_IF ]] && echo "FOXGUARD_WAN_INTERFACE=$WAN_IF" )
 FOXGUARD_PORTAL_PORT=$API_PORT

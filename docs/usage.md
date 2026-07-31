@@ -9,6 +9,11 @@ your own gateway address throughout.
 
 ---
 
+The dashboard's screens are grouped: **Devices** (peers, zones, the config
+generator), **Access** (groups, rules, policies), **Identity** (accounts,
+sessions), **Network** (DNS), plus Overview, the audit log and the kill switch.
+Paths below are written that way — *Devices → Peers* means the Devices menu.
+
 ## Reaching the dashboard
 
 The gateway has no desktop, and both the dashboard and the portal are bound to
@@ -92,7 +97,7 @@ reference groups, and rules reference groups.
 Groups are the unit everything else hangs off. Two or three is a good start;
 resist modelling your whole network on day one.
 
-Dashboard → **Groups & matrix** → *New group*.
+Dashboard → **Access → Groups & matrix** → *New group*.
 
 ```sh
 AUTH='Authorization: Bearer <admin token>'; J='Content-Type: application/json'
@@ -112,7 +117,21 @@ already running.
 
 An account first — the device is bound to it and only that account can unlock it.
 
-Dashboard → **Accounts** → *New account*, then **Peers** → *Register a peer*.
+Dashboard → **Identity → Accounts** → *New account*, then
+**Devices → Config generator**.
+
+The generator does the whole thing in one screen: it makes the keypair **in your
+browser**, registers the device with the public half, and hands you a finished
+`.conf` — file, clipboard, or QR code for a phone. The private key never reaches
+the gateway, which is what lets Foxguard say it stores none.
+
+Fill in *Register a new one*, pick the owner and the groups, press **Generate
+configuration**, and give the operator the file. There is nothing else to do:
+the address, the endpoint, the resolver and `AllowedIPs` are all filled in from
+the control plane.
+
+<details>
+<summary>The same thing by hand, if you would rather</summary>
 
 The keypair is generated **on the device**, and only the public key is sent:
 
@@ -150,11 +169,13 @@ gets you to the gateway and other peers; add each internal network you want to
 reach through it. Leaving it at the pool is the usual reason "the rule is there
 but nothing works".
 
+</details>
+
 ### 3. A service
 
 Server peers enroll with a key instead of signing in.
 
-Dashboard → **Peers** → *Register a peer* (type **server**), then *Manage* →
+Dashboard → **Devices → Peers** → *Register a peer* (type **server**), then *Manage* →
 *Generate key*. The key is shown once.
 
 ```sh
@@ -185,7 +206,7 @@ without you remembering to revoke it.
 
 Until now nothing can talk to anything.
 
-Dashboard → **Rules** → *New rule*.
+Dashboard → **Access → Rules** → *New rule*.
 
 ```sh
 curl -s -X POST $API/acl-rules -H "$AUTH" -H "$J" -d '{
@@ -218,10 +239,11 @@ Dashboard → **Overview** should say the dataplane is in sync.
 
 ### Onboarding a person
 
-1. **Accounts** → create their account. Give it TOTP if it is an admin.
-2. **Peers** → register their device: type *user*, owner = their account, the
+1. **Identity → Accounts** → create their account. Give it TOTP if it is an admin.
+2. **Devices → Peers** → register their device: type *user*, owner = their account, the
    groups they need.
-3. Send them the client config. Generate the keypair on their device.
+3. **Devices → Config generator** → send them the file it produces. The keypair
+   is made in your browser; nothing you send them was ever on the gateway.
 4. They connect, open `http://10.88.0.1:8080/`, and sign in.
 
 They land in quarantine first — that is normal, and the portal is the only thing
@@ -234,7 +256,7 @@ portal and no expiry.
 
 ### Giving a device a name
 
-Every peer already has one: **Peers** → *Manage* shows its DNS name, derived
+Every peer already has one: **Devices → Peers** → *Manage* shows its DNS name, derived
 from the device name at registration and editable there. Turn the resolver on
 first (`FOXGUARD_DNS_ENABLED=true`) and add this to the client config:
 
@@ -242,7 +264,8 @@ first (`FOXGUARD_DNS_ENABLED=true`) and add this to the client config:
 DNS = 10.88.0.1, fox.internal
 ```
 
-`ssh laptop.fox.internal` then works from anywhere on the tunnel. **DNS** in the
+`ssh laptop.fox.internal` then works from anywhere on the tunnel. **Network → DNS**
+in the
 dashboard shows the whole zone as the gateway will serve it, plus a place to add
 aliases (`portal` → `gw`) and A records for things that live off the tunnel
 (`nas` → `192.168.1.50`).
@@ -254,14 +277,14 @@ worse than an error.
 ### Reaching a network behind a peer
 
 A branch office, a lab subnet, a NAS network — anything that is not the peer
-itself. **Zones** → create a zone, then add a route to it:
+itself. **Devices → Zones** → create a zone, then add a route to it:
 
 | Field | Meaning |
 | --- | --- |
 | Network | `192.168.10.0/24` — the network you want to reach |
 | Carried by | the peer that routes it. Empty means the gateway reaches it itself |
 
-Put the peers that should live in that segment into the zone (**Peers** →
+Put the peers that should live in that segment into the zone (**Devices → Peers** →
 *Manage* → Zone), and write one ACL rule with a **zone** endpoint. The rule
 covers the peers *and* the network behind them — that is the difference from a
 group.
@@ -281,6 +304,41 @@ If a route stops working, `deploy/foxguard-healthcheck.sh` says which half is
 missing: no route at all, a route pointing at the wrong interface, or a route
 into the tunnel that no peer carries.
 
+### Handing someone a configuration
+
+**Devices → Config generator**. Pick an existing device or register a new one,
+and press *Generate configuration*.
+
+**The private key is made in your browser and stays there.** It goes into the
+file directly; the gateway is only ever told the public half, which is all it
+needs. Nothing about the key is stored, logged, or recoverable — lose the file
+and the device needs a new keypair. If the operator already has a private key,
+paste it instead and the public half is derived locally.
+
+Take the file away by download, clipboard, or QR code. The QR is the whole
+file, so treat the screen as you would the file.
+
+`AllowedIPs` is the setting worth understanding, because on the client it is a
+*routing table*: every prefix listed stops being reachable locally.
+
+| Mode | What the device routes into the tunnel |
+| --- | --- |
+| Tunnel only | the WireGuard pools. The gateway and other peers, nothing more |
+| Its own zone | the pools plus the networks routed inside this device's zone |
+| Every routed network | the pools plus every routed network in the fleet (default) |
+| Full tunnel | `0.0.0.0/0`. Needs a group with internet exit, or the device has no internet at all |
+
+The gateway's ACLs still decide what actually passes; this only decides what the
+device offers to send. **A device that carries a network for a zone never
+receives that network back in its own configuration** — routing its own LAN into
+the tunnel would cut it off from the network it exists to serve. The generator
+says so when it happens.
+
+Two settings have to be filled in before any of this produces a working file:
+`FOXGUARD_WG_PUBLIC_KEY` and `FOXGUARD_WG_ENDPOINT_HOST`. The installer writes
+both when it can. If it could not, the generator refuses to hand out a file and
+names the variable that is missing.
+
 ### Cutting access
 
 | Situation | What to do |
@@ -296,7 +354,7 @@ ones.
 
 ### Seeing who is on
 
-**Sessions** shows administrators signed in to the dashboard and devices
+**Identity → Sessions** shows administrators signed in to the dashboard and devices
 currently authenticated, with time remaining. Server peers never appear — they
 hold no session.
 
@@ -340,7 +398,7 @@ curl -s -X POST $API/policies/import -H "$AUTH" -H "$J" \
 `prune: true` makes it a full sync — groups and rules absent from the document
 are deleted. Without it, import only creates and updates.
 
-The dashboard does the same thing under **Policies**, and refuses to apply
+The dashboard does the same thing under **Access → Policies**, and refuses to apply
 anything you have not previewed.
 
 **This is not a backup.** It covers groups and rules only; peers, accounts and
@@ -361,9 +419,12 @@ their secrets live solely in the database. See "Backup and restore" in
 | Changes have no effect | **Overview** — is the dataplane in sync? Is the agent running? |
 | Nobody can reach anything | `nft list table inet foxguard`, then `journalctl -u foxguard-agent` |
 | Names do not resolve | Is `DNS = <gateway>, <zone>` in the client config? Then `systemctl status foxguard-dns` |
-| One name stopped resolving | **DNS** → "Not currently served". An alias is dropped when its target is revoked |
+| One name stopped resolving | **Network → DNS** → "Not currently served". An alias is dropped when its target is revoked |
 | A zone's network is unreachable | `deploy/foxguard-healthcheck.sh` → **Zone routes**: it says which half is missing |
 | A zone route will not save | It is refused for a reason — a default route, or one covering an address the gateway already answers on |
+| The generator says "incomplete" | `FOXGUARD_WG_PUBLIC_KEY` or `FOXGUARD_WG_ENDPOINT_HOST` is unset in `/etc/foxguard/backend.env` |
+| A generated config will not import | The file name is the interface name: at most 15 characters of `[a-zA-Z0-9_=+.-]`. The generator already trims it — check nothing renamed the file |
+| The routing peer lost its own LAN | Its `AllowedIPs` contains the network it carries. Regenerate its config; the generator excludes it |
 
 Every allowed and denied decision carries a counter and a `fg:<ref>:<name>`
 comment in the live ruleset, so you can map a hit count back to the rule that

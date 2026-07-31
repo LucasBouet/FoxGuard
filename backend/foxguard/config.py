@@ -16,6 +16,7 @@ from typing import Annotated, Any
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+from .clientconfig import AllowedIpsMode, join_endpoint
 from .dns.model import NAME_RE, DnsSpec, ResolverMode
 from .nftables.model import GatewayInputPolicy, GatewaySpec
 
@@ -140,6 +141,25 @@ class Settings(BaseSettings):
     #: each entry must be a single ``name`` or ``name=value`` line.
     dns_extra_options: Annotated[list[str], NoDecode] = Field(default_factory=list)
 
+    # --- client configuration (Phase 6) ------------------------------------
+    #: What a generated client config puts in ``AllowedIPs``. See
+    #: :class:`~foxguard.clientconfig.AllowedIpsMode`.
+    client_config_allowed_ips: AllowedIpsMode = AllowedIpsMode.ROUTED
+    #: Appended to every generated config whatever the mode. The escape hatch
+    #: for a network Foxguard does not model as a zone route.
+    client_config_extra_allowed_ips: Annotated[list[str], NoDecode] = Field(
+        default_factory=list
+    )
+    #: 0 disables the line. 25 is the value that keeps a NAT binding alive
+    #: without being noticeable; a device on a public address does not need it.
+    client_config_keepalive: int = Field(default=25, ge=0, le=65535)
+    #: Left unset, no MTU line is written and wg-quick works it out. Set it when
+    #: the path is doing PMTU badly -- 1420 is the usual answer over Ethernet.
+    client_config_mtu: int | None = Field(default=None, ge=576, le=9000)
+    #: Whether generated configs point the device at the internal resolver.
+    #: Ignored when the resolver is off.
+    client_config_dns: bool = True
+
     # --- sessions (Phase 3) ------------------------------------------------
     default_session_lifetime_seconds: int = 8 * 3600
     enrollment_key_bytes: int = 32
@@ -192,11 +212,30 @@ class Settings(BaseSettings):
         "dns_upstreams",
         "dns_listen_addresses",
         "dns_extra_options",
+        "client_config_extra_allowed_ips",
         mode="before",
     )
     @classmethod
     def _parse_internal_cidrs(cls, value: Any) -> Any:
         return _split_list(value)
+
+    @field_validator("client_config_extra_allowed_ips")
+    @classmethod
+    def _validate_extra_allowed_ips(cls, value: list[str]) -> list[str]:
+        """Caught at startup rather than at the moment someone needs a config.
+
+        These end up in a file a device is about to depend on; ``wg-quick``
+        rejects the whole interface for one bad prefix, and the person holding
+        the broken file is not the person who set the variable.
+        """
+        for cidr in value:
+            try:
+                ipaddress.ip_network(cidr, strict=False)
+            except ValueError as exc:
+                raise ValueError(
+                    f"FOXGUARD_CLIENT_CONFIG_EXTRA_ALLOWED_IPS: {cidr!r} is not a network"
+                ) from exc
+        return value
 
     @field_validator("dns_zone")
     @classmethod
@@ -328,6 +367,41 @@ class Settings(BaseSettings):
             return self.wg_gateway_ip
         network = ipaddress.ip_network(self.wg_pool_v4, strict=False)
         return str(next(network.hosts()))
+
+    @property
+    def client_endpoint(self) -> str | None:
+        """``host:port`` a generated config dials, or None if nobody said.
+
+        There is deliberately no guess here. The gateway's own addresses are
+        tunnel and LAN addresses; the one thing a client needs is the *public*
+        address its packets can reach, and only the operator knows what their
+        router forwards udp/``wg_listen_port`` to.
+        """
+        if not self.wg_endpoint_host:
+            return None
+        return join_endpoint(self.wg_endpoint_host, self.wg_listen_port)
+
+    @property
+    def client_dns(self) -> tuple[str, ...]:
+        """What a generated config puts on its ``DNS =`` line.
+
+        A resolver address plus the zone as a search domain, which is what makes
+        ``ssh nas`` work without making the gateway authoritative for bare
+        labels globally -- the short-name expansion is the client's job, and
+        this is where it gets told.
+
+        Listen addresses outside the tunnel pools are dropped: the resolver may
+        legitimately bind several, but a client that cannot route to one would
+        stall every lookup until it timed out.
+        """
+        if not (self.dns_enabled and self.client_config_dns):
+            return ()
+        reachable = tuple(
+            address for address in self.dns_listen if self.is_tunnel_address(address)
+        )
+        if not reachable:
+            reachable = (self.gateway_ip,)
+        return (*reachable, self.dns_zone)
 
     @property
     def oidc_enabled(self) -> bool:

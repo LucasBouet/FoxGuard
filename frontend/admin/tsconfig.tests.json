@@ -1,0 +1,32 @@
+{
+  // The dashboard is ESM and bundled by Next; these tests are not. Node 20 has
+  // no type stripping, so the only way to run TypeScript here is to emit it
+  // first -- with the project's own compiler, so the tests exercise the same
+  // code the browser gets rather than a hand-kept copy.
+  //
+  // Only the pure modules are listed. `lib/api.ts` imports "server-only" and
+  // `lib/actions.ts` is a server-action module; both are meaningless outside
+  // Next and would fail to compile here. That exclusion is not an accident --
+  // it is the boundary this feature depends on, and `no-storage.test.ts`
+  // asserts the generator stays on this side of it.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "lib": ["es2022"],
+    "types": ["node"],
+    "noEmit": false,
+    "incremental": false,
+    "outDir": ".test-build",
+    "rootDir": ".",
+    "jsx": "react-jsx",
+    "plugins": []
+  },
+  "include": [
+    "src/lib/wireguard.ts",
+    "src/lib/wg-config.ts",
+    "src/lib/qr.ts",
+    "src/lib/nav.ts",
+    "tests/**/*.ts"
+  ]
+}

@@ -2081,3 +2081,121 @@ def test_a_revoked_peer_loses_its_name(api, tag):
 
     api.patch(f"/api/v1/peers/{peer['id']}", json={"state": "revoked"})
     assert f"gone-{tag}." not in api.get("/api/v1/dns").json()["hosts"]
+
+
+# --------------------------------------------------------------------------- #
+# client configuration profiles
+# --------------------------------------------------------------------------- #
+
+
+def test_a_profile_carries_everything_but_the_key(api, tag):
+    peer = _create_peer(api, tag)
+    profile = api.get(f"/api/v1/peers/{peer['id']}/config-profile").json()
+
+    assert profile["addresses"] == [f"{peer['tunnel_ip']}/32"]
+    assert profile["server_public_key"]
+    assert profile["endpoint"]
+    assert profile["complete"] is True
+    assert any(address.startswith("127.30.") for address in profile["allowed_ips"])
+
+
+def test_a_profile_never_returns_key_material(api, tag):
+    """The endpoint that provisions a device is the one place a well-meaning
+    change would add ``private_key`` to the response. Nothing in the body may
+    look like a secret -- not the peer's, and not the gateway's."""
+    peer = _create_peer(api, tag)
+    body = api.get(f"/api/v1/peers/{peer['id']}/config-profile").text.lower()
+    for forbidden in ("private", "privatekey", "secret", "presharedkey"):
+        assert forbidden not in body, f"the profile mentions {forbidden}"
+
+
+def test_the_routing_peer_does_not_route_its_own_network(api, tag):
+    """A device carrying a network must not pull that network into the tunnel:
+    it would lose the LAN it exists to serve, and the tunnel would still come
+    up, so nothing would point at the config."""
+    zone = _zone(api, tag)
+    router = _create_peer(api, f"{tag}-r", zone_slug=zone["slug"])
+    laptop = _create_peer(api, f"{tag}-l", zone_slug=zone["slug"])
+    api.post(
+        f"/api/v1/zones/{zone['id']}/routes",
+        json={"cidr": _net(tag), "via_peer_id": router["id"]},
+    )
+
+    carrier = api.get(f"/api/v1/peers/{router['id']}/config-profile").json()
+    assert _net(tag) not in carrier["allowed_ips"]
+    assert carrier["excluded_routes"] == [_net(tag)]
+    assert any("carries those networks" in w for w in carrier["warnings"])
+
+    other = api.get(f"/api/v1/peers/{laptop['id']}/config-profile").json()
+    assert _net(tag) in other["allowed_ips"]
+    assert other["excluded_routes"] == []
+
+
+def test_the_allowed_ips_mode_can_be_chosen_per_request(api, tag):
+    zone = _zone(api, tag)
+    peer = _create_peer(api, tag, zone_slug=zone["slug"])
+    api.post(f"/api/v1/zones/{zone['id']}/routes", json={"cidr": _net(tag)})
+
+    def profile(**params):
+        return api.get(
+            f"/api/v1/peers/{peer['id']}/config-profile", params=params
+        ).json()
+
+    assert _net(tag) not in profile(allowed_ips="tunnel")["allowed_ips"]
+    assert _net(tag) in profile(allowed_ips="zone")["allowed_ips"]
+    assert _net(tag) in profile(allowed_ips="routed")["allowed_ips"]
+    assert profile(allowed_ips="full")["allowed_ips"] == ["0.0.0.0/0"]
+
+
+def test_full_tunnel_warns_when_nothing_grants_an_exit(api, tag):
+    peer = _create_peer(api, tag)
+    profile = api.get(
+        f"/api/v1/peers/{peer['id']}/config-profile", params={"allowed_ips": "full"}
+    ).json()
+    assert any("no internet at all" in w for w in profile["warnings"])
+
+    exit_group = _group(api, tag, slug_prefix="ex", internet_exit=True)
+    api.patch(
+        f"/api/v1/peers/{peer['id']}", json={"group_slugs": [exit_group["slug"]]}
+    )
+    profile = api.get(
+        f"/api/v1/peers/{peer['id']}/config-profile", params={"allowed_ips": "full"}
+    ).json()
+    assert not any("no internet at all" in w for w in profile["warnings"])
+
+
+def test_the_dns_line_can_be_declined(api, tag):
+    peer = _create_peer(api, tag)
+    with_dns = api.get(f"/api/v1/peers/{peer['id']}/config-profile").json()
+    without = api.get(
+        f"/api/v1/peers/{peer['id']}/config-profile", params={"dns": "false"}
+    ).json()
+    assert without["dns"] == []
+    # The suite runs with the resolver off, so `with_dns` is empty too; what is
+    # asserted is that declining never *adds* anything.
+    assert len(without["dns"]) <= len(with_dns["dns"])
+
+
+def test_an_unknown_peer_has_no_profile(api):
+    response = api.get(f"/api/v1/peers/{uuid.uuid4()}/config-profile")
+    assert response.status_code == 404
+
+
+def test_a_nonsense_mode_is_refused(api, tag):
+    peer = _create_peer(api, tag)
+    response = api.get(
+        f"/api/v1/peers/{peer['id']}/config-profile", params={"allowed_ips": "sideways"}
+    )
+    assert response.status_code == 422
+
+
+def test_reading_a_profile_is_audited(api, tag):
+    """It is the moment a device becomes provisionable, so "who set this laptop
+    up" has to be answerable later."""
+    peer = _create_peer(api, tag)
+    api.get(f"/api/v1/peers/{peer['id']}/config-profile")
+
+    entries = api.get(
+        "/api/v1/audit-log", params={"action": "peer.config_profile.read"}
+    ).json()
+    assert any(entry["object_id"] == peer["id"] for entry in entries)

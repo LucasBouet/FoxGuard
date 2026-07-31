@@ -772,6 +772,82 @@ Doing it in the main table is exactly failure mode 1. Internet exit through the
 
 ---
 
+## 18. Client configurations are assembled in the browser
+
+Foxguard stores no private keys. That is easy to say and hard to keep: the
+moment a dashboard can produce a ready-to-use `.conf`, the obvious
+implementation is to generate the keypair server-side and hand the file down,
+and the private key is then in a request log, a response buffer, and whatever
+sat between.
+
+So the split is structural rather than procedural. `GET
+/api/v1/peers/{id}/config-profile` returns **structured data, never rendered
+text**: addresses, resolver, endpoint, `AllowedIPs`, keepalive, MTU. The browser
+generates the keypair (`lib/wireguard.ts`, X25519 in about two hundred lines of
+TypeScript), assembles the file (`lib/wg-config.ts`), and draws the QR code
+(`lib/qr.ts`) — the last one because every hosted QR service works by being sent
+the thing you want encoded, which here is the key itself.
+
+An endpoint that returned finished text would be one code review away from
+accepting a private key so the server could "just do it". Returning data makes
+that a redesign instead of a parameter.
+
+### The three modules cannot reach anything
+
+`wireguard.ts`, `wg-config.ts` and `qr.ts` have **no imports at all** — not
+even each other. `tests/no-storage.test.ts` asserts it against the compiled
+output, along with the absence of `localStorage`, `fetch`, and any storage or
+transport API in the generator page, and that the generator calls exactly two
+server actions. Both carry public data only.
+
+This is testable in a way "we were careful" is not, which is the point: the
+property has to survive people who did not read this document.
+
+### `AllowedIPs` is a routing table, and one exclusion is not optional
+
+On a gateway `AllowedIPs` is an access-control list. On a client it is a routing
+table: every prefix listed is pulled into the tunnel and stops being reachable
+locally. The two readings coincide until a peer *carries* a network for a zone.
+
+A site router advertising `192.168.10.0/24` must never receive that prefix back
+in its own configuration — it would route its own LAN into the tunnel and lose
+the network it exists to serve. The tunnel still comes up, so nothing points at
+the config. `clientconfig.compute_allowed_ips` removes it in every mode and
+returns what it removed, so the dashboard can say why.
+
+The default route is the exception: `0.0.0.0/0` covers the carried network too,
+but dropping it would silently turn full tunnel into no tunnel, so the operator
+is warned instead.
+
+### No preshared keys
+
+WireGuard's `PresharedKey` is symmetric, so the gateway would have to store one.
+That is the single invariant this whole design exists to keep, so PSKs are not
+offered. A deployment that wants the post-quantum hardening has to provision
+them out of band, on both ends, by hand.
+
+### What is verified, and against what
+
+The claim "a valid config" is about `wg-quick` and the WireGuard clients, not
+about our reading of INI syntax, so nothing here is checked by golden file:
+
+- the X25519 implementation against **`wg pubkey` itself**, over 425 keys per
+  run plus the RFC 7748 vectors, in both directions and including unclamped
+  input;
+- the generated file against **`wg-quick strip`**, and then loaded into a **real
+  WireGuard interface** whose `wg show` must report the public key the browser
+  derived (`make test-wg-live`, needs `CAP_NET_ADMIN`);
+- the QR encoder against **`zbarimg`** for the round trip, and against **segno**
+  for the module matrix, entry by entry across all 160 error-correction table
+  rows. That comparison found a real error — version 8 at level H had five
+  blocks where the standard says six — which every other test passed straight
+  through.
+
+The file name is part of validity: `wg-quick` takes the interface name from it,
+and refuses anything that is not at most 15 characters of `[a-zA-Z0-9_=+.-]`.
+
+---
+
 ## The nftables ruleset
 
 ### Own table only
@@ -995,6 +1071,11 @@ Stated plainly rather than discovered later:
   but it surfaces as a 409 rather than a transparent retry.
 - **The generator ignores `groups.kind`.** Creating a `zone` today behaves
   exactly like a group.
+- **Mask selection in the QR encoder is not byte-identical to segno's.** Penalty
+  rule 3 is stated as a 1:1:3:1:1 *ratio*; segno matches the literal
+  seven-module pattern. Both produce valid codes and occasionally prefer
+  different masks. Rules 1, 2 and 4 agree exactly, and every mask pattern is
+  checked against a real decoder.
 
 ### Closed since Phase 1
 

@@ -192,7 +192,18 @@ FOXGUARD_WAN_INTERFACE=eth0
 FOXGUARD_PORTAL_PORT=8080
 FOXGUARD_INTERNAL_CIDRS=10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
 FOXGUARD_GATEWAY_INPUT_POLICY=open
+
+# For the dashboard's config generator. Without these it reports every
+# configuration as incomplete rather than handing out one that cannot connect.
+FOXGUARD_WG_PUBLIC_KEY=<wg show wg0 public-key>
+FOXGUARD_WG_ENDPOINT_HOST=vpn.example.com:51820
+FOXGUARD_CLIENT_CONFIG_ALLOWED_IPS=routed
 ```
+
+The installer fills both in when it can — it reads the key from the interface it
+bootstrapped, and the endpoint from `--endpoint`. The generator itself never
+needs a private key: it makes the keypair in the operator's browser and the
+gateway is only ever told the public half.
 
 Run the migrations and start the API bound to localhost (or to the tunnel
 address — never to the WAN):

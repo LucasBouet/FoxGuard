@@ -15,8 +15,10 @@ import { ApiError, api } from "./api";
 import { clearSessionToken, setSessionToken } from "./session";
 import type {
   AclAction,
+  AllowedIpsMode,
   AclEndpoint,
   AclRule,
+  ClientConfigProfile,
   DnsRecord,
   DnsRecordKind,
   EnrollmentKey,
@@ -526,4 +528,26 @@ export async function deleteRule(id: string): Promise<Result<void>> {
   const result = await run(() => api.delete<void>(`/api/v1/acl-rules/${id}`));
   if (result.ok) refreshEverything();
   return result;
+}
+
+/**
+ * The non-secret half of a client configuration.
+ *
+ * **This is the only server call the generator makes, and it carries no key
+ * material in either direction.** The private key is created in the browser by
+ * `lib/wireguard.ts`, the file is assembled in the browser by `lib/wg-config.ts`,
+ * and neither ever crosses this boundary. Adding a parameter here that took one
+ * would undo the entire feature, so: don't.
+ */
+export async function getConfigProfile(
+  peerId: string,
+  options: { allowedIps?: AllowedIpsMode; dns?: boolean } = {},
+): Promise<Result<ClientConfigProfile>> {
+  const query = new URLSearchParams();
+  if (options.allowedIps) query.set("allowed_ips", options.allowedIps);
+  if (options.dns === false) query.set("dns", "false");
+  const suffix = query.size > 0 ? `?${query}` : "";
+  return run(() =>
+    api.get<ClientConfigProfile>(`/api/v1/peers/${peerId}/config-profile${suffix}`),
+  );
 }

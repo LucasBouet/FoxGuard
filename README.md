@@ -4,13 +4,14 @@ Self-hosted network access control on top of WireGuard: peers, groups, ACL
 policies and an **nftables** dataplane generated from a single source of truth.
 No cloud dependency, no feature gating, no vendor control plane.
 
-> **Status: Phases 1–4 complete.** Database schema + migrations, CRUD API, ACL
+> **Status: Phases 1–6 complete.** Database schema + migrations, CRUD API, ACL
 > import/export, the nftables generator and its test suite, the gateway agent,
 > the enrollment endpoint and the captive portal (local accounts with argon2id,
 > optional TOTP, OIDC, rate limiting, the peer state machine), session expiry
-> with per-group lifetimes, and the admin dashboard with its kill switch. What
-> is left is Phase 5's roadmap items and the portal's own UI (see
-> [Roadmap](#roadmap)).
+> with per-group lifetimes, the admin dashboard with its kill switch, network
+> zones with routed networks, an internal resolver, and a client-config
+> generator that never lets a private key reach the server. What is left is the
+> reverse proxy and the bouncer (see [Roadmap](#roadmap)).
 
 ---
 
@@ -43,6 +44,20 @@ a name in a zone you choose (`laptop.fox.internal`), the gateway answers to
 `gw.fox.internal`, and hand-authored records name services that live off the
 tunnel. Same shape as the firewall rules — rendered from the database, applied by
 the agent, checked with `dnsmasq --test` before the daemon ever sees it.
+
+### Client configurations, without a stored private key
+
+The dashboard builds a ready-to-use `.conf` — download, clipboard, or QR code
+for a phone — and **the private key never reaches the gateway**. The keypair is
+generated in the browser, the file is assembled there, and the API only ever
+returns the non-secret half: addresses, endpoint, resolver, `AllowedIPs`. The QR
+encoder is in the page for the same reason; every hosted one works by being sent
+the thing you want encoded.
+
+`AllowedIPs` is filled in from the control plane, with one rule that is easy to
+get wrong by hand: a peer that *carries* a network for a zone never receives that
+network back in its own configuration, because routing its own LAN into the
+tunnel would cut it off from the network it exists to serve.
 
 ### How a peer proves who it is
 
@@ -117,6 +132,9 @@ Foxguard/
 ├── agent/              # gateway agent (nftables + wg syncconf) + systemd unit
 ├── frontend/
 │   ├── admin/          # Next.js dashboard; the admin token stays server-side
+│   │   ├── src/lib/    #   wireguard.ts / wg-config.ts / qr.ts run in the
+│   │   │               #   browser and import nothing — that is the invariant
+│   │   └── tests/      #   run with `node --test` against the real wg + zbar
 │   └── portal/         # static bundle; runs in the browser, served by the API
 ├── deploy/             # installer + health check, both with their own safeguards
 ├── examples/           # example ACL document for the import endpoint
@@ -197,10 +215,21 @@ make test          # 260+ tests: generator, applier, IPAM, config, WireGuard syn
 make test-all      # adds the PostgreSQL-backed tests (schema, policy round trip,
                    # expiry sweep, the advisory lock)
 make test-api      # adds end-to-end tests against a running API (starts one for you)
+make test-frontend # the dashboard's own: X25519 against `wg pubkey`, the config
+                   # file against `wg-quick strip`, the QR encoder against
+                   # `zbarimg` and `segno`, and the no-storage invariant
 ```
 
-Everything above passes on a clean checkout: 269 / 302 / 9 (agent) / 68 (API) at
-the time of writing. Tiers 2 and 3 skip themselves unless
+Two more need privileges or a daemon, and say so when they skip:
+
+```sh
+make test-dns-live    # the rendered zone against a real dnsmasq
+make test-routes-live # the reconciler against a real kernel routing table
+make test-wg-live     # a generated config loaded into a real WireGuard interface
+```
+
+Everything above passes on a clean checkout: 393 / 524 / 45 (agent) / 137 (API)
+/ 46 (dashboard) at the time of writing. Tiers 2 and 3 skip themselves unless
 `FOXGUARD_TEST_DATABASE_URL` / `FOXGUARD_TEST_API_URL` are set, so `make test`
 works on any machine.
 
@@ -210,6 +239,14 @@ Two live bugs were found there and nowhere else — a transaction committed afte
 the response was sent (making every write invisible to the next read), and
 `INET` columns coming back from psycopg as `ipaddress` objects that a
 `str`-annotated response model rejected with a 500.
+
+The frontend tier is there for the same reason. The config generator's claim is
+"a configuration that works", and the only things that can settle that are the
+tools that have to read it: `wg pubkey` for the key derivation (425 keys a run,
+both directions), `wg-quick strip` and a real interface for the file, `zbarimg`
+for the QR code. Comparing the QR module matrix against `segno` found an error
+in the error-correction tables — version 8 at level H — that every other check
+passed straight through, because the symbol still scanned at every other size.
 
 It also tests the two things that cannot be faked convincingly:
 
@@ -481,9 +518,18 @@ These are enforced in code and covered by tests, not just documented:
   adds a device without dropping an in-flight query. The schema absorbed both
   without a rewrite, as Phase 1 intended — zones are `groups.kind = 'zone'` and
   the `zone` ACL endpoint cost one enum value.
-- **Phase 5, still open.** An integrated reverse proxy in front of internal web
-  services (never in front of the portal — see `docs/architecture.md` §5), and a
-  CrowdSec bouncer on the gateway.
+- **Phase 6 — client configurations, done.** A generator in the dashboard that
+  produces a finished `.conf` — file, clipboard or QR code — with the keypair
+  made in the browser and the private key never sent to the gateway. The API
+  returns structured data rather than rendered text, precisely so that a later
+  change cannot turn it into "POST the key and let the server build the file".
+  `AllowedIPs` is filled in from the control plane, minus the networks the
+  device itself carries. Verified against `wg pubkey`, `wg-quick strip`, a real
+  WireGuard interface, `zbarimg` and `segno`. The admin navigation was regrouped
+  into menus at the same time, so the next screen is one entry in `lib/nav.ts`.
+- **Still open.** An integrated reverse proxy in front of internal web services
+  (never in front of the portal — see `docs/architecture.md` §5), and a CrowdSec
+  bouncer on the gateway.
 
 ## License
 

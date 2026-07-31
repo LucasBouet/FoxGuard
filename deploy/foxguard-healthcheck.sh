@@ -363,6 +363,33 @@ else
 fi
 
 # --------------------------------------------------------------------------- #
+section "Client configurations"
+
+# The dashboard builds client configs in the operator's browser, but it cannot
+# invent the two things only this box knows: its own public key and the address
+# the world reaches it on. Without them the generator refuses to hand out a
+# file -- correctly, but the operator finds out at the moment they needed one.
+WG_PUB_LIVE=$(wg show "${FOXGUARD_WG_INTERFACE:-wg0}" public-key 2>/dev/null || true)
+
+if [[ -n ${FOXGUARD_WG_PUBLIC_KEY:-} ]]; then
+  if [[ -n $WG_PUB_LIVE && $FOXGUARD_WG_PUBLIC_KEY != "$WG_PUB_LIVE" ]]; then
+    # Worse than unset: every config generated from it is well formed and
+    # cannot complete a handshake, which looks like a network problem.
+    bad "FOXGUARD_WG_PUBLIC_KEY does not match ${FOXGUARD_WG_INTERFACE:-wg0} — generated configs will never connect"
+  else
+    ok "the gateway's public key is configured for generated configs"
+  fi
+else
+  warn "FOXGUARD_WG_PUBLIC_KEY is unset — the config generator cannot produce a working file${WG_PUB_LIVE:+ (it is $WG_PUB_LIVE)}"
+fi
+
+if [[ -n ${FOXGUARD_WG_ENDPOINT_HOST:-} ]]; then
+  ok "generated configs dial ${FOXGUARD_WG_ENDPOINT_HOST}"
+else
+  warn "FOXGUARD_WG_ENDPOINT_HOST is unset — set it to what your router forwards udp/${FOXGUARD_WG_LISTEN_PORT:-51820} to"
+fi
+
+# --------------------------------------------------------------------------- #
 section "Portal exposure"
 
 # The portal identifies peers by source address, so a proxy in front of it or a
