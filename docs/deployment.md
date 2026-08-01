@@ -15,64 +15,122 @@ recoverable, but only if you can still reach the box.
 out. Read it before running it — it is short, and it is installing something
 that decides what your network can reach.
 
+### The whole thing, on a fresh box
+
+Copy-paste, change the four values marked below, run it. This is the complete
+install: WireGuard interface, control plane, portal, dashboard, agent, internal
+DNS, the first administrator and the first device.
+
 ```sh
 git clone <your-repo> /root/foxguard-src
 cd /root/foxguard-src
 
-# Changes nothing. Tells you whether this box can host Foxguard at all.
-sudo ./deploy/foxguard-install.sh --check-only
+# 1. Changes nothing. Tells you whether this box can host Foxguard at all,
+#    and — with the same flags — exactly what the real run would create.
+sudo ./deploy/foxguard-install.sh --check-only \
+  --bootstrap-wireguard --pool 10.88.0.0/24 --wan-interface eth0
 
-# Bring WireGuard up first (section 1), then:
-sudo ./deploy/foxguard-install.sh --wan-interface eth0
-
-# With internal DNS, so devices get names instead of addresses:
-sudo ./deploy/foxguard-install.sh --wan-interface eth0 \
-     --dns --dns-zone fox.internal --dns-upstream 1.1.1.1
-```
-
-### Letting it create the interface too
-
-Normally you bring `wg0` up yourself — it carries your remote access, and the
-installer would rather not be the thing that breaks it. If you would rather it
-did, it is opt-in:
-
-```sh
+# 2. The real thing.
 sudo ./deploy/foxguard-install.sh \
   --bootstrap-wireguard \
-  --bootstrap-peer my-laptop \
+  --listen-port 51820 \
+  --pool 10.88.0.0/24 \
   --endpoint vpn.example.com:51820 \
-  --wan-interface eth0
+  --wan-interface eth0 \
+  --admin-user ada \
+  --bootstrap-peer ada-laptop \
+  --dns \
+  --dns-zone fox.internal \
+  --dns-upstream 1.1.1.1 \
+  --dns-upstream 9.9.9.9
 ```
 
-`--bootstrap-wireguard` writes `/etc/wireguard/wg0.conf` with an `[Interface]`
-block and **no peers** — those belong to Foxguard — then enables
-`wg-quick@wg0`. It is create-if-absent: an interface that already exists is
-used as it is, and it **refuses outright** if a config file is already there
-rather than overwrite the thing holding your only way in.
+Change these four:
 
-`--bootstrap-peer` solves the awkward first step. A device added by hand to
-`wg0.conf` is removed on the agent's first sync, because the control plane does
-not know about it — so instead this registers the device properly, bound to the
-administrator account, and prints a ready client config once.
+| Flag | What to put there | How to find it |
+| --- | --- | --- |
+| `--endpoint` | the public address peers dial | whatever your router forwards `udp/51820` to |
+| `--wan-interface` | the interface facing the internet | `ip route get 1.1.1.1` |
+| `--admin-user` | your own login | anything; the password is generated and shown once |
+| `--bootstrap-peer` | the device you are reading this from | a name, ≤ 15 characters of `[a-zA-Z0-9_=+.-]` |
 
-That client's private key is generated on the gateway. For the laptop you are
-setting up from that is a fair trade; for everything after, generate the keypair
-on the device and register only the public key. The peer form in the dashboard
-says so too.
+Everything else is a sensible default. `--pool` and `--listen-port` are written
+out only because they are the two you are most likely to want different.
 
-You still have to forward `udp/51820` to this box on your router — the installer
-says so but cannot do it.
+**Nothing reaches nftables.** The installer leaves the agent stopped and in dry
+run on purpose, and finishes by printing the three commands that take you live —
+section 3 below is the same thing with the reasoning.
+
+Three flags are worth understanding rather than copying:
+
+- **`--bootstrap-wireguard`** creates `wg0` and its `wg-quick` unit. Leave it
+  off if you brought the interface up yourself, which is the normal case on a
+  box you already reach through a tunnel. It refuses rather than overwrite an
+  existing config.
+- **`--endpoint`** is what makes the dashboard's config generator work: it is
+  written to `FOXGUARD_WG_ENDPOINT_HOST`, and without it every generated
+  configuration is reported as incomplete rather than handed out unable to
+  connect. It is valid on its own — you do not need `--bootstrap-wireguard` to
+  use it.
+- **`--bootstrap-peer`** solves the first device only. Its private key is
+  generated *on the gateway* and shown once, which is a fair trade for the
+  laptop you are setting up from and a bad habit for anything after. Every
+  device after it comes from **Devices → Config generator** in the dashboard,
+  which makes the keypair in your browser and never sends the private half here.
+
+### Smaller variants
+
+```sh
+# Preflight only, against the interface you already have.
+sudo ./deploy/foxguard-install.sh --check-only
+
+# The common case: wg0 is already up (section 1), no internal DNS.
+sudo ./deploy/foxguard-install.sh \
+  --wan-interface eth0 --endpoint vpn.example.com:51820
+
+# Unattended (CI, a rebuild from a known-good config): --yes skips every prompt.
+sudo ./deploy/foxguard-install.sh --yes \
+  --wan-interface eth0 --endpoint vpn.example.com:51820 \
+  --dns --dns-upstream 1.1.1.1
+```
+
+Re-running is safe at any time: existing secrets are reused rather than
+rotated, so the agent does not lose its token during an upgrade.
+
+`sudo ./deploy/foxguard-install.sh --help` lists every flag.
+
+### What it actually does
 
 It detects the tunnel address and peer pool from your live WireGuard interface,
 generates the secrets, writes `0600` config, applies the migrations, builds both
 frontends, installs the systemd units, and creates the first administrator —
 printing that password once.
 
-**It deliberately leaves the agent stopped and in dry run.** Nothing reaches
-nftables until you have read the rules and flipped the flag yourself; the script
-finishes by telling you exactly how. Re-running it is safe — existing secrets
-are reused rather than rotated, so the agent does not lose its token during an
-upgrade.
+`--bootstrap-wireguard` writes `/etc/wireguard/wg0.conf` with an `[Interface]`
+block and **no peers** — those belong to Foxguard — then enables `wg-quick@wg0`.
+It is create-if-absent: an interface that already exists is used as it is, and
+it **refuses outright** if a config file is already there rather than overwrite
+the thing holding your only way in.
+
+`--bootstrap-peer` exists because a device added by hand to `wg0.conf` is
+removed on the agent's first sync — the control plane does not know about it. So
+instead it registers the device properly, bound to the administrator account,
+and prints a ready client config once.
+
+You still have to forward `udp/51820` to this box on your router — the installer
+says so but cannot do it.
+
+### What it does not do
+
+**It leaves the agent stopped and in dry run.** Nothing reaches nftables until
+you have read the rules and flipped the flag yourself; the script finishes by
+telling you exactly how, and section 3 below is the same thing with the
+reasoning. Getting this wrong is how you lose remote access to the machine, so
+it is not automated and will not be.
+
+It also does not open the UDP port on your router, and it does not decide your
+policy: a fresh install has no groups, no rules, and therefore no traffic
+allowed between peers. `docs/usage.md` is the first hour after this one.
 
 Afterwards, and any time later:
 

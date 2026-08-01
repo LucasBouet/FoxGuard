@@ -120,6 +120,14 @@ Options:
   --skip-frontend        Do not build the portal or dashboard
   --check-only           Run the preflight checks and exit
 
+Client configurations (the dashboard builds them; the keypair is made in the
+operator's browser and no private key ever reaches this box):
+  --endpoint HOST[:PORT] Public address peers dial — what your router forwards
+                         udp/$LISTEN_PORT to. Without it the generator reports
+                         every configuration as incomplete rather than handing
+                         out one that cannot connect. Valid on its own; it does
+                         not require --bootstrap-wireguard.
+
 Internal DNS (opt-in — a resolver on the gateway, for the tunnel only):
   --dns                  Install dnsmasq and serve names for peers and zones
   --dns-zone NAME        Zone every device lives in (default: $DNS_ZONE)
@@ -138,8 +146,9 @@ WireGuard bootstrap (opt-in — normally you bring the interface up yourself):
   --bootstrap-peer NAME  Also register a first device and print a ready client
                          config. Its private key is generated here and shown
                          once — acceptable for the laptop you set this up from,
-                         not the habit for everything else.
-  --endpoint HOST[:PORT] Public address peers dial, for the printed config.
+                         not the habit for everything else. Every device after
+                         it should come from the dashboard's config generator,
+                         which never puts a private key on this machine.
 EOF
 }
 

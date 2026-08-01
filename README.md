@@ -290,26 +290,50 @@ at the first thing that would have bitten you later.
 ### 2. Install
 
 ```sh
-sudo ./deploy/foxguard-install.sh --wan-interface eth0
+sudo ./deploy/foxguard-install.sh \
+  --wan-interface eth0 \
+  --endpoint vpn.example.com:51820
 ```
 
 Packages, service user, PostgreSQL (UTF8 — see the note below), secrets in
 `0600` config, migrations, both frontends, three systemd units, and the first
 administrator whose password is printed once.
 
-<details>
-<summary>Let it create WireGuard too</summary>
+`--endpoint` is what your router forwards `udp/51820` to. It is not cosmetic:
+without it the dashboard's config generator reports every client configuration
+as incomplete rather than handing out one that cannot connect.
 
-Normally `wg0` is yours — it carries your remote access and the installer would
-rather not be what breaks it. If you would rather it did:
+<details>
+<summary>Everything at once, on a box with nothing on it yet</summary>
+
+Interface included, internal DNS included, first administrator and first device
+included. Change the endpoint, the WAN interface, and the two names.
 
 ```sh
 sudo ./deploy/foxguard-install.sh \
   --bootstrap-wireguard \
-  --bootstrap-peer my-laptop \
+  --listen-port 51820 \
+  --pool 10.88.0.0/24 \
   --endpoint vpn.example.com:51820 \
-  --wan-interface eth0
+  --wan-interface eth0 \
+  --admin-user ada \
+  --bootstrap-peer ada-laptop \
+  --dns \
+  --dns-zone fox.internal \
+  --dns-upstream 1.1.1.1 \
+  --dns-upstream 9.9.9.9
 ```
+
+Run it with `--check-only` first and the same flags: it prints exactly what it
+would create and changes nothing. `docs/deployment.md` §0 explains each flag.
+
+</details>
+
+<details>
+<summary>What the bootstrap flags actually do</summary>
+
+Normally `wg0` is yours — it carries your remote access and the installer would
+rather not be what breaks it, so creating it is opt-in.
 
 `--bootstrap-wireguard` writes an `[Interface]`-only config and enables
 `wg-quick@wg0`. It is create-if-absent: an existing interface is used as it is,
@@ -319,7 +343,9 @@ and it refuses outright rather than overwrite an existing config file.
 `wg0.conf` is removed on the agent's first sync — the control plane does not
 know it — so this registers it properly and prints a ready client config once.
 Its private key is generated on the gateway: fair for the laptop you are setting
-up from, a bad habit for everything after.
+up from, a bad habit for everything after. Every device after it comes from
+**Devices → Config generator** in the dashboard, which makes the keypair in your
+browser and never puts a private key on the gateway.
 
 You still have to forward `udp/51820` on your router.
 </details>
