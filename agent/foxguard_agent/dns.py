@@ -78,6 +78,18 @@ class DnsApplier:
     def _run(self, argv: Sequence[str]):
         return self._runner.run(argv, timeout=self._timeout)
 
+    def _service_active(self) -> bool:
+        """Is the resolver actually running?
+
+        ``systemctl is-active`` exits non-zero for anything that is not active,
+        so the exit code alone is the answer; the word is compared too because
+        ``activating`` also exits non-zero and is not a reason to restart a unit
+        that is already on its way up.
+        """
+        result = self._run([self._systemctl, "is-active", self._service])
+        state = result.stdout.strip()
+        return result.ok or state in {"active", "activating", "reloading"}
+
     @staticmethod
     def _read(path: Path) -> str | None:
         try:
@@ -138,7 +150,8 @@ class DnsApplier:
     def apply(self, hosts: str, conf: str) -> str:
         """Install the artefacts and make the daemon serve them.
 
-        Returns what it did: ``"unchanged"``, ``"reloaded"`` or ``"restarted"``.
+        Returns what it did: ``"unchanged"``, ``"started"``, ``"reloaded"`` or
+        ``"restarted"``.
         """
         previous_hosts = self._read(self._hosts)
         previous_conf = self._read(self._conf)
@@ -146,7 +159,28 @@ class DnsApplier:
         hosts_changed = previous_hosts != hosts
         conf_changed = previous_conf != conf
         if not hosts_changed and not conf_changed:
-            return "unchanged"
+            # The files being right is not the same as the zone being served.
+            #
+            # ``foxguard-dns`` is deliberately not enabled at boot: before a
+            # zone exists its ExecStartPre fails, and systemd would restart it
+            # in a loop. The agent starts it instead. So after a reboot the
+            # rendered files are already on disk and identical, and comparing
+            # only files concludes there is nothing to do -- leaving the fleet
+            # with no name resolution until somebody happens to add a peer.
+            #
+            # Checking the unit is what makes this converge on the desired
+            # state rather than on the last change, which is how every other
+            # part of the agent behaves.
+            if self._service_active():
+                return "unchanged"
+            result = self._run([self._systemctl, "restart", self._service])
+            if not result.ok:
+                raise DnsReloadError(
+                    f"the zone is current but {self._service} is not running, "
+                    "and it would not start: "
+                    + (result.stderr.strip() or result.stdout.strip() or "no output")
+                )
+            return "started"
 
         if conf_changed:
             self._write(self._conf, conf)

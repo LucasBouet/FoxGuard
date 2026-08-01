@@ -478,6 +478,18 @@ python3 -m venv "$PREFIX/venv" 2>/dev/null || true
 "$PREFIX/venv/bin/pip" install -q -e "$SRC/backend" -e "$SRC/agent"
 ok "Python packages installed"
 
+# Repair, not just prevent. The block above keeps a *fresh* prefix readable, but
+# an existing one may have been laid down by an older installer that chowned it
+# to the service user, or by a pip run under a restrictive umask. Either way the
+# agent dies on its own executable with EACCES -- as root, which is the part
+# that sends people looking in the wrong place for hours.
+#
+# Only read and traverse bits are added, and no ownership is touched: the
+# dashboard's .next cache has to stay writable by $SERVICE_USER. Nothing secret
+# lives under $PREFIX; the credentials are in $CONFDIR at 0600.
+chmod -R a+rX "$PREFIX"
+ok "$PREFIX readable by the agent (root without CAP_DAC_OVERRIDE)"
+
 # --------------------------------------------------------------------------- #
 # secrets and configuration
 # --------------------------------------------------------------------------- #

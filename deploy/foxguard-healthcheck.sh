@@ -53,6 +53,21 @@ for unit in foxguard-api foxguard-agent foxguard-dashboard; do
   else
     [[ $unit == foxguard-dashboard ]] && warn "$unit is not running (optional)" \
                                       || bad "$unit is not running"
+
+    # Why it is not running, for the one cause nobody guesses. The agent runs as
+    # root, but its unit hardens the capability bounding set down to
+    # CAP_NET_ADMIN/CAP_NET_RAW -- which drops CAP_DAC_OVERRIDE, so root stops
+    # being allowed to ignore file permissions. An install prefix owned by the
+    # service user with no "other" bits then stops the agent dead on its own
+    # executable, with EACCES, as root. `nobody` stands in for that: if it
+    # cannot read the binary, neither can the agent.
+    BIN=$(systemctl cat "$unit" 2>/dev/null | sed -n 's/^ExecStart=\([^ ]*\).*/\1/p' | head -1)
+    if [[ -n ${BIN:-} && -e $BIN ]] && ! runuser -u nobody -- test -r "$BIN" 2>/dev/null; then
+      # The prefix, not just the venv: the packages are installed editable, so
+      # the agent also imports from $PREFIX/src.
+      PREFIX_DIR=$(dirname "$(dirname "$(dirname "$BIN")")")
+      bad "  ...because $BIN is not readable without CAP_DAC_OVERRIDE — run: chmod -R a+rX $PREFIX_DIR"
+    fi
   fi
 done
 

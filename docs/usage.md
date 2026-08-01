@@ -417,6 +417,7 @@ their secrets live solely in the database. See "Backup and restore" in
 | Dropped off after a while | Session expired. Normal for user peers; check the group's lifetime |
 | A machine keeps dropping off | It is registered as a *user* peer. It should be a *server* peer |
 | Changes have no effect | **Overview** — is the dataplane in sync? Is the agent running? |
+| A device is in the dashboard but not in `wg show` | The agent is down. `systemctl status foxguard-agent`; if it says `Permission denied` on its own executable, `chmod -R a+rX /opt/foxguard` — see `docs/deployment.md` §0 |
 | Nobody can reach anything | `nft list table inet foxguard`, then `journalctl -u foxguard-agent` |
 | Names do not resolve | Is `DNS = <gateway>, <zone>` in the client config? Then `systemctl status foxguard-dns` |
 | One name stopped resolving | **Network → DNS** → "Not currently served". An alias is dropped when its target is revoked |

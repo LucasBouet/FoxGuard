@@ -29,6 +29,10 @@ class FakeRunner:
         self.calls: list[list[str]] = []
         self.test_ok = True
         self.systemctl_ok = True
+        #: Whether the unit is running. `systemctl is-active` answers from this,
+        #: which is how a reboot is modelled: the files survive, the daemon does
+        #: not.
+        self.active = True
 
     def run(self, argv, *, timeout: float = 30.0) -> CommandResult:
         argv = list(argv)
@@ -39,7 +43,14 @@ class FakeRunner:
                 if self.test_ok
                 else CommandResult(1, "", "bad option at line 2")
             )
+        if "is-active" in argv:
+            return (
+                CommandResult(0, "active\n", "")
+                if self.active
+                else CommandResult(3, "inactive\n", "")
+            )
         if self.systemctl_ok:
+            self.active = True
             return CommandResult(0, "", "")
         return CommandResult(1, "", "Job failed")
 
@@ -96,12 +107,44 @@ def test_a_changed_configuration_needs_a_restart(applier):
     assert runner.systemctl_verbs == ["restart"]
 
 
-def test_an_unchanged_zone_touches_nothing(applier):
+def test_an_unchanged_zone_does_not_disturb_a_running_daemon(applier):
     app, runner, _ = applier
     app.apply(HOSTS_A, CONF_A)
     runner.calls.clear()
     assert app.apply(HOSTS_A, CONF_A) == "unchanged"
-    assert runner.calls == []
+    # It asks whether the daemon is up, and does nothing else. A reload here
+    # would flush the cache of a resolver serving a zone that has not changed.
+    assert runner.systemctl_verbs == ["is-active"]
+
+
+def test_a_dead_daemon_is_started_even_though_the_zone_is_unchanged(applier):
+    """The reboot case, and the reason `unchanged` cannot mean `do nothing`.
+
+    `foxguard-dns` is deliberately not enabled at boot: until a zone exists its
+    ExecStartPre fails and systemd would restart it in a loop. The agent starts
+    it instead. But after a reboot the rendered files are already on disk and
+    identical, so an applier that compares only files concludes there is nothing
+    to do -- and name resolution stays down for the whole fleet until somebody
+    happens to add a peer.
+    """
+    app, runner, _ = applier
+    app.apply(HOSTS_A, CONF_A)
+
+    runner.calls.clear()
+    runner.active = False  # rebooted: files intact, daemon gone
+
+    assert app.apply(HOSTS_A, CONF_A) == "started"
+    assert runner.systemctl_verbs == ["is-active", "restart"]
+    assert runner.active is True
+
+
+def test_a_daemon_that_will_not_start_is_reported(applier):
+    app, runner, _ = applier
+    app.apply(HOSTS_A, CONF_A)
+    runner.active = False
+    runner.systemctl_ok = False
+    with pytest.raises(DnsReloadError, match="foxguard-dns"):
+        app.apply(HOSTS_A, CONF_A)
 
 
 # --------------------------------------------------------------------------- #

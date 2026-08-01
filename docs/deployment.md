@@ -132,6 +132,39 @@ It also does not open the UDP port on your router, and it does not decide your
 policy: a fresh install has no groups, no rules, and therefore no traffic
 allowed between peers. `docs/usage.md` is the first hour after this one.
 
+### The agent will not start: `Permission denied` on its own executable
+
+```
+foxguard-agent[20594]: /opt/foxguard/venv/bin/python3: can't open file
+  '/opt/foxguard/venv/bin/foxguard-agent': [Errno 13] Permission denied
+```
+
+Running as **root**, which is why this one costs an afternoon.
+
+The unit hardens root by setting `CapabilityBoundingSet=CAP_NET_ADMIN
+CAP_NET_RAW`. That drops `CAP_DAC_OVERRIDE` along with everything else, and
+`CAP_DAC_OVERRIDE` is precisely the capability that lets root ignore file
+permissions. Without it, root facing a file owned by the service user with no
+"other" bits is just "other".
+
+```sh
+chmod -R a+rX /opt/foxguard
+systemctl restart foxguard-agent
+```
+
+Ownership is deliberately not touched: the dashboard's `.next` cache has to stay
+writable by `foxguard`. Nothing secret lives under the prefix — the credentials
+are in `/etc/foxguard` at `0600`.
+
+The installer now does this on every run, so re-running it repairs a box in this
+state, and `foxguard-healthcheck.sh` names the cause instead of only reporting
+that the agent is down.
+
+**While the agent is down, nothing reaches the dataplane**: no nftables rules,
+no WireGuard peers, no DNS zone. A device registered in the dashboard appears in
+the database and never on the interface, which looks like the control plane
+losing it.
+
 ### If you lost the "shown once" output
 
 The installer prints the administrator's password and the bootstrap device's
@@ -684,6 +717,32 @@ poll, writes `/etc/foxguard/dns/{hosts,dnsmasq.conf}` and starts
 (`laptop.fox.internal`), the gateway answers to `gw.fox.internal`, and
 `/api/v1/dns/records` adds aliases and A records for services that live off the
 tunnel.
+
+#### You never start `foxguard-dns` yourself
+
+The installer installs the unit and **does not enable it**, which is
+deliberate. Its `ExecStartPre` runs `dnsmasq --test` on a configuration file
+that does not exist until a zone has been rendered, so a unit enabled at boot on
+a fresh install fails, and `Restart=on-failure` turns that into a loop.
+
+The agent owns the daemon instead. It writes the artefacts and then reloads or
+restarts the unit, which is also what starts it the first time. Two consequences
+worth knowing:
+
+- **Nothing happens while the agent is in dry run.** It validates the zone with
+  `dnsmasq --test` and logs `dry run: DNS zone <digest> validated, not applied`.
+  No file is written and no daemon is started. Take the agent out of dry run
+  (section 5) and the resolver comes up on the next poll.
+- **After a reboot the agent starts it again**, even though the rendered files
+  on disk are unchanged. That is not free behaviour — the applier checks
+  `systemctl is-active` before concluding there is nothing to do, precisely
+  because "the files are right" and "the zone is being served" are different
+  statements. `make test-dns-applier-live` drives a real dnsmasq through that
+  case.
+
+If you would rather systemd owned it, `systemctl enable foxguard-dns` is safe
+*once a zone exists* — the agent's behaviour does not change, it simply finds
+the unit already active and leaves it alone.
 
 **Clients have to be told.** Add the resolver and a search domain to the peer's
 config, or names resolve nowhere:
