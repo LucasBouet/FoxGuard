@@ -788,45 +788,18 @@ EOF
 fi
 
 # --------------------------------------------------------------------------- #
-# what happens next
+# shown once
+#
+# Printed *before* the next-steps banner, not after it. Everything below is
+# unrecoverable -- the password is stored only as an argon2 hash and the client
+# private key is not stored at all -- while the instructions that follow are in
+# docs/deployment.md and can be read again at any time. An install that dies
+# between the two must lose the replaceable half, not this one.
+#
+# It has happened: `$B1.` in the banner below is the variable `B1`, which under
+# `set -u` killed the script after the administrator and the first device had
+# been created and before either secret reached the screen.
 # --------------------------------------------------------------------------- #
-
-cat <<EOF
-
-$B────────────────────────────────────────────────────────────────$N
-$G Installed.$N The dataplane is $B not$N live yet — that is deliberate.
-
-$B1. Read the ruleset Foxguard wants to apply$N
-
-   curl -s http://$TUNNEL_IP:$API_PORT/api/v1/ruleset/preview \\
-     -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r .content
-
-   Three things to confirm before going further:
-     • 'iifname != "$WG_IF" accept' is the FIRST rule of chain input
-       — this is what keeps your SSH alive.
-     • both base chains say 'policy accept'.
-     • the only delete statement is 'delete table inet foxguard'.
-
-$B2. Watch the agent validate it without applying anything$N
-
-   systemctl start foxguard-agent && journalctl -u foxguard-agent -f
-   # expect: "dry run: ruleset <digest> validated, not applied"
-
-$B3. Go live — keep a Proxmox console open$N
-
-   sed -i 's/^FOXGUARD_AGENT_DRY_RUN=true/FOXGUARD_AGENT_DRY_RUN=false/' $CONFDIR/agent.env
-   systemctl restart foxguard-agent
-   nft list table inet foxguard      # ours
-   nft list ruleset | grep -c table  # your other tables are still there
-
-   If it goes wrong: systemctl stop foxguard-agent && nft delete table inet foxguard
-   The tunnel keeps working — removing the filter table does not touch WireGuard.
-
-$B4. Verify$N
-
-   $SRC/deploy/foxguard-healthcheck.sh
-
-EOF
 
 if [[ -n $ADMIN_PASS || -n $CLIENT_CONF ]]; then
   printf '%s────────────────────────────────────────────────────────────────%s\n' "$B" "$N"
@@ -867,3 +840,44 @@ fi
 if [[ -n $ADMIN_PASS || -n $CLIENT_CONF ]]; then
   printf '%s────────────────────────────────────────────────────────────────%s\n\n' "$B" "$N"
 fi
+
+# --------------------------------------------------------------------------- #
+# what happens next
+# --------------------------------------------------------------------------- #
+
+cat <<EOF
+
+$B────────────────────────────────────────────────────────────────$N
+$G Installed.$N The dataplane is $B not$N live yet — that is deliberate.
+
+${B}1. Read the ruleset Foxguard wants to apply$N
+
+   curl -s http://$TUNNEL_IP:$API_PORT/api/v1/ruleset/preview \\
+     -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r .content
+
+   Three things to confirm before going further:
+     • 'iifname != "$WG_IF" accept' is the FIRST rule of chain input
+       — this is what keeps your SSH alive.
+     • both base chains say 'policy accept'.
+     • the only delete statement is 'delete table inet foxguard'.
+
+${B}2. Watch the agent validate it without applying anything$N
+
+   systemctl start foxguard-agent && journalctl -u foxguard-agent -f
+   # expect: "dry run: ruleset <digest> validated, not applied"
+
+${B}3. Go live — keep a Proxmox console open$N
+
+   sed -i 's/^FOXGUARD_AGENT_DRY_RUN=true/FOXGUARD_AGENT_DRY_RUN=false/' $CONFDIR/agent.env
+   systemctl restart foxguard-agent
+   nft list table inet foxguard      # ours
+   nft list ruleset | grep -c table  # your other tables are still there
+
+   If it goes wrong: systemctl stop foxguard-agent && nft delete table inet foxguard
+   The tunnel keeps working — removing the filter table does not touch WireGuard.
+
+${B}4. Verify$N
+
+   $SRC/deploy/foxguard-healthcheck.sh
+
+EOF

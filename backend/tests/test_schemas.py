@@ -72,3 +72,21 @@ def test_audit_entry_serialises_to_json():
     """The failure mode was at JSON serialisation time, so assert on that."""
     model = AuditLogRead(**_audit_payload(source_ip=ipaddress.IPv4Address("10.0.0.1")))
     assert model.model_dump(mode="json")["source_ip"] == "10.0.0.1"
+
+
+def test_a_peer_public_key_cannot_be_swapped_in_place():
+    """It used to answer 200 and change nothing.
+
+    Re-keying is the first thing an operator reaches for when a device's private
+    key is lost, and unknown fields are dropped by default -- so the request
+    succeeded, the key stayed, and the device still could not connect. A peer's
+    identity *is* its key pair: the address, the DNS name, the memberships and
+    the audit trail all hang off a key fixed at registration.
+    """
+    import pydantic
+
+    from foxguard.schemas import PeerUpdate
+
+    assert PeerUpdate(name="ok").name == "ok"
+    with pytest.raises(pydantic.ValidationError, match="cannot be changed"):
+        PeerUpdate(wg_public_key="ox3iCjdNGr7iHRvp1E+jSVNIUNt/5iaw86e15HOo0Vw=")

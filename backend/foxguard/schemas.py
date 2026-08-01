@@ -312,6 +312,27 @@ class PeerUpdate(ApiModel):
     dns_label: DnsLabel | None = None
     zone_slug: Slug | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def _refuse_rekeying(cls, data: Any) -> Any:
+        """A key cannot be swapped on a live peer, and saying so beats ignoring it.
+
+        Unknown fields are dropped by default, so this used to answer 200 and
+        change nothing -- and re-keying is precisely what an operator reaches
+        for when a device's private key is lost. Identity here *is* the key
+        pair: the address, the DNS name, the group and zone membership and the
+        audit trail all hang off a peer whose public key was fixed when it was
+        registered. Replacing it in place would leave every one of those
+        pointing at a device that can no longer prove it is the same one.
+        """
+        if isinstance(data, dict) and "wg_public_key" in data:
+            raise ValueError(
+                "a peer's public key cannot be changed: delete this peer and "
+                "register it again with the new key (the dashboard's config "
+                "generator does both, and makes the keypair in your browser)"
+            )
+        return data
+
 
 class PeerRead(PeerBase):
     id: uuid.UUID

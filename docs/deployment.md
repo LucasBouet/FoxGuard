@@ -132,6 +132,40 @@ It also does not open the UDP port on your router, and it does not decide your
 policy: a fresh install has no groups, no rules, and therefore no traffic
 allowed between peers. `docs/usage.md` is the first hour after this one.
 
+### If you lost the "shown once" output
+
+The installer prints the administrator's password and the bootstrap device's
+config exactly once, because neither is stored anywhere it could read them back:
+the password is kept as an argon2 hash, and the client's private key is not kept
+at all. If the terminal scrolled away, the session dropped, or the script died
+after creating them, both are gone — the install itself is fine.
+
+Neither is a reinstall. The shared token in `/etc/foxguard/backend.env` is a
+working admin credential, so:
+
+```sh
+API=http://10.88.0.1:8080/api/v1
+AUTH="Authorization: Bearer $(grep FOXGUARD_ADMIN_API_TOKEN /etc/foxguard/backend.env | cut -d= -f2)"
+
+# 1. The account exists; only the plaintext is lost. Set a new password
+#    (12 characters minimum). This also revokes any session issued against
+#    the old one.
+ID=$(curl -s "$API/users" -H "$AUTH" | jq -r '.[] | select(.username=="ada") | .id')
+curl -s -X PATCH "$API/users/$ID" -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"password":"a new long password"}'
+
+# 2. The bootstrap device's private key is unrecoverable, and a peer's public
+#    key cannot be swapped in place — its address, name, memberships and audit
+#    trail all hang off the key it was registered with. Delete it and make a
+#    new one from the dashboard, which generates the keypair in your browser.
+curl -s -X DELETE "$API/peers/$(curl -s "$API/peers" -H "$AUTH" \
+  | jq -r '.[] | select(.name=="ada-laptop") | .id')" -H "$AUTH"
+```
+
+Then sign in at `http://10.88.0.1:3000` and use **Devices → Config generator**
+for the device. That path never puts a private key on the gateway, which is why
+losing this output stops being possible after the first device.
+
 Afterwards, and any time later:
 
 ```sh
