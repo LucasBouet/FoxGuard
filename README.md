@@ -276,6 +276,21 @@ A Debian/Ubuntu LXC or VM, ideally behind your existing router. Everything below
 assumes you can still reach the box **without** the tunnel — a console or SSH
 from the LAN. Keep that open until the last step.
 
+**If you would rather be asked than remember flags:**
+
+```sh
+sudo ./deploy/foxguard-setup.sh
+```
+
+It walks through everything below as questions — with a detected default, an
+example and a sentence about what each one changes — runs the preflight, shows
+you the exact `foxguard-install.sh` command it built, and only then installs.
+`--dry-run` stops after printing the command. It is a front end to the same
+installer, not a second one, so nothing can drift between them.
+
+The rest of this section is the scripted form, which is what you want for a
+rebuild or for CI.
+
 ### 1. Check the box can host it — changes nothing
 
 ```sh

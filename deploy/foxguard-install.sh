@@ -24,6 +24,9 @@
 #   ./foxguard-install.sh                       # interactive install
 #   ./foxguard-install.sh --yes --wan-interface eth0
 #
+# If you would rather be asked than remember flags, ./foxguard-setup.sh walks
+# through the same options as questions and then calls this script.
+#
 set -euo pipefail
 
 # --------------------------------------------------------------------------- #

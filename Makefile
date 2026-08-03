@@ -162,3 +162,7 @@ test-proxy-live: ## Drive a real HAProxy through the agent's applier (needs hapr
 .PHONY: proxy
 proxy: ## Print the HAProxy configuration the control plane would render
 	cd $(BACKEND) && python -c "from foxguard.config import get_settings; from foxguard.db import SessionLocal; from foxguard.services import proxy; c, f = proxy.render(SessionLocal(), get_settings()); print(c); print('--- pattern files ---'); [print(f'== {n} ==\n{b}') for n, b in sorted(f.items())]"
+
+.PHONY: setup
+setup: ## Guided install: the same options as foxguard-install.sh, asked as questions
+	sudo ./deploy/foxguard-setup.sh

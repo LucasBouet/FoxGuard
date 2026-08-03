@@ -907,6 +907,33 @@ something grants it.
 you would rather manage the routing table yourself. The `AllowedIPs` half still
 happens, so an `ip route add <cidr> dev wg0` by hand completes the path.
 
+## 5z. The guided alternative
+
+Everything in sections 5a to 5h is reachable by answering questions instead:
+
+```sh
+sudo ./deploy/foxguard-setup.sh
+```
+
+It detects what it can (your WireGuard interface and its addresses, the
+internet-facing interface, the address peers would dial), explains what each
+answer changes, validates as you go rather than failing three screens later, and
+shows you the exact `foxguard-install.sh` command it built before running
+anything. `--dry-run` stops after printing that command.
+
+It is a front end, not a second installer — there is one implementation of the
+install, so the two cannot drift, and the command it prints is something you can
+keep for next time.
+
+Two things it does that are easy to get wrong by hand:
+
+* **Naming an interface that does not exist offers to create it.** By flag, that
+  is a separate `--bootstrap-wireguard` you have to remember; forgetting it gets
+  you a preflight failure several answers later.
+* **The Cloudflare token is read without echo** and printed as `<redacted>` in
+  the command it shows you, so it never reaches your scrollback or your shell
+  history.
+
 ## 5g. Reverse proxy (optional)
 
 Publishes services that live behind peers: HTTP terminated, or TCP passed
