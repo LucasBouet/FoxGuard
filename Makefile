@@ -114,6 +114,10 @@ test-frontend: ## Run the dashboard's own tests (key derivation, config file, QR
 test-wg-live: ## Load a generated config into a real WireGuard interface (needs sudo + CAP_NET_ADMIN)
 	cd frontend/admin && npm run test:live
 
+.PHONY: test-install-config
+test-install-config: ## Check the installer's client config against the dashboard's, byte for byte
+	./deploy/tests/test-client-config.sh
+
 .PHONY: golden
 golden: ## Regenerate the nftables golden baseline (review the diff!)
 	cd $(BACKEND) && FOXGUARD_UPDATE_GOLDEN=1 pytest tests/test_nft_generator.py -k golden

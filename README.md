@@ -342,10 +342,12 @@ and it refuses outright rather than overwrite an existing config file.
 `--bootstrap-peer` handles the awkward first device. One added by hand to
 `wg0.conf` is removed on the agent's first sync — the control plane does not
 know it — so this registers it properly and prints a ready client config once.
-Its private key is generated on the gateway: fair for the laptop you are setting
-up from, a bad habit for everything after. Every device after it comes from
-**Devices → Config generator** in the dashboard, which makes the keypair in your
-browser and never puts a private key on the gateway.
+The file comes from the same `GET /peers/{id}/config-profile` the dashboard
+uses, so it has the resolver, the search domain and every zone route in it, not
+just the pool. Its private key is generated on the gateway: fair for the laptop
+you are setting up from, a bad habit for everything after. Every device after it
+comes from **Devices → Config generator** in the dashboard, which makes the
+keypair in your browser and never puts a private key on the gateway.
 
 You still have to forward `udp/51820` on your router.
 </details>

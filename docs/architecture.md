@@ -792,6 +792,24 @@ An endpoint that returned finished text would be one code review away from
 accepting a private key so the server could "just do it". Returning data makes
 that a redesign instead of a parameter.
 
+### The installer is the second caller, not a second design
+
+`--bootstrap-peer` has a private key on the gateway — it generated one there, on
+purpose, for the one device that cannot yet reach a dashboard. That is the only
+difference. It calls the same `config-profile` endpoint and renders the same
+file, so the first device is not the one provisioned with half a configuration:
+no `DNS` line on a deployment that runs a resolver, no zone routes in
+`AllowedIPs`, a file name no client will import.
+
+Rendering it twice — `lib/wg-config.ts` for the browser, jq for the shell — is
+the price of the endpoint returning data instead of text, and it is cheaper than
+the alternative. `deploy/tests/test-client-config.sh` renders every case through
+both and compares them byte for byte, with comments off, so the two cannot drift
+apart quietly. The one deliberate difference is failure: the browser throws on
+an incomplete profile because it can offer the button again once the setting is
+fixed, while the installer substitutes a visible placeholder because it runs
+once, on a terminal that is about to scroll away.
+
 ### The three modules cannot reach anything
 
 `wireguard.ts`, `wg-config.ts` and `qr.ts` have **no imports at all** — not

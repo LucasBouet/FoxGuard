@@ -96,6 +96,81 @@ confirm() {
 }
 
 # --------------------------------------------------------------------------- #
+# client configuration
+#
+# The dashboard's generator is the reference implementation. It asks
+# GET /peers/{id}/config-profile what belongs around the key -- addresses,
+# resolver, AllowedIPs, MTU, keepalive -- and assembles the file in the browser.
+# This script asks the same endpoint the same question, so --bootstrap-peer
+# hands out the same configuration the dashboard would, rather than the subset
+# somebody once typed into a heredoc here. That subset is how a device ends up
+# with no DNS line on a deployment that runs a resolver, and with the pool on
+# its AllowedIPs but none of the zone routes.
+#
+# Rendering the file a second time, in jq, is duplication and it is deliberate.
+# The API returns structured data and never finished text -- that is what makes
+# it impossible for a future caller to POST a private key up and ask the server
+# to "just do it" -- so the cost is one renderer wherever a config is actually
+# assembled. deploy/tests/test-client-config.sh pins this one to the browser's
+# (frontend/admin/src/lib/wg-config.ts) so the two cannot drift apart quietly.
+# --------------------------------------------------------------------------- #
+
+render_client_config() { # render_client_config <profile-json> <private-key> <endpoint-fallback>
+  # Placeholders, where the dashboard refuses outright: it can offer a button
+  # again once the operator fixes the setting, while this runs once and a
+  # nearly-complete file with an obvious gap in it beats no file at all on a
+  # terminal that is about to scroll away.
+  jq -r --arg key "$2" --arg fallback "$3" '
+    def kv($k; $v): "\($k) = \($v)";
+    [
+      "# \(.peer_name)" + (if .fqdn then " (\(.fqdn))" else "" end),
+      "# Written by foxguard-install.sh. This private key was generated on the",
+      "# gateway; every config the dashboard makes generates it in the browser",
+      "# instead, and never sends it anywhere.",
+      "[Interface]",
+      kv("PrivateKey"; $key),
+      kv("Address"; (.addresses | join(", ")))
+    ]
+    + (if (.dns | length) > 0 then [kv("DNS"; (.dns | join(", ")))] else [] end)
+    + (if .mtu then [kv("MTU"; (.mtu | tostring))] else [] end)
+    + [
+      "",
+      "[Peer]",
+      kv("PublicKey"; (.server_public_key // "<gateway-public-key>")),
+      kv("Endpoint"; (.endpoint // $fallback)),
+      kv("AllowedIPs"; (.allowed_ips | join(", ")))
+    ]
+    + (if .persistent_keepalive > 0
+       then [kv("PersistentKeepalive"; (.persistent_keepalive | tostring))]
+       else [] end)
+    | join("\n")
+  ' <<<"$1"
+}
+
+config_file_name() { # config_file_name <profile-json>
+  # wg-quick takes the interface name from the file name: at most 15 characters
+  # of [a-zA-Z0-9_=+.-], and it refuses anything else outright. The mobile apps
+  # enforce the same rule on import, so "Ada's MacBook (2019).conf" is a file
+  # every client rejects while its owner concludes the config is broken.
+  local source cleaned
+  source=$(jq -r '((.fqdn // "" | split(".") | .[0]) // "") as $label
+                  | if $label == "" then .peer_name else $label end' <<<"$1")
+  cleaned=$(printf '%s' "$source" | iconv -f utf-8 -t ascii//TRANSLIT 2>/dev/null \
+            || printf '%s' "$source")
+  cleaned=$(printf '%s' "$cleaned" \
+            | sed -e 's/[^a-zA-Z0-9_=+.-]/-/g' -e 's/-\{2,\}/-/g' -e 's/^[-.]*//')
+  cleaned=${cleaned:0:15}
+  cleaned=$(printf '%s' "$cleaned" | sed -e 's/[-.]*$//')
+  printf '%s.conf' "${cleaned:-foxguard}"
+}
+
+# Sourcing this file with FOXGUARD_INSTALL_SOURCE_ONLY=1 defines the two
+# functions above and stops before anything is parsed, checked or installed. It
+# is how deploy/tests/test-client-config.sh gets at the renderer, and it is the
+# only reason this early return exists.
+[[ -n ${FOXGUARD_INSTALL_SOURCE_ONLY:-} ]] && return 0
+
+# --------------------------------------------------------------------------- #
 # arguments
 # --------------------------------------------------------------------------- #
 
@@ -144,10 +219,13 @@ WireGuard bootstrap (opt-in — normally you bring the interface up yourself):
                          Refuses if the interface or its config already exists.
   --listen-port PORT     UDP port for the new interface (default: $LISTEN_PORT)
   --bootstrap-peer NAME  Also register a first device and print a ready client
-                         config. Its private key is generated here and shown
-                         once — acceptable for the laptop you set this up from,
-                         not the habit for everything else. Every device after
-                         it should come from the dashboard's config generator,
+                         config — built from the same API the dashboard's
+                         generator uses, so it carries the resolver, the search
+                         domain and the zone routes rather than the pool alone.
+                         Its private key is generated here and shown once —
+                         acceptable for the laptop you set this up from, not
+                         the habit for everything else. Every device after it
+                         should come from the dashboard's config generator,
                          which never puts a private key on this machine.
 EOF
 }
@@ -460,7 +538,15 @@ ok "service user $SERVICE_USER"
 # Nothing secret lives here: credentials are in $CONFDIR at 0600. The API and
 # the dashboard run as $SERVICE_USER and only need to read.
 install -d -m 0755 "$PREFIX"
-install -d -m 0750 "$CONFDIR"
+# 0751, not 0750: dnsmasq drops privileges at startup and re-reads its hosts
+# file *as the unprivileged user*, so every directory on the way to
+# $CONFDIR/dns must be traversable by "other". Without the x bit the daemon
+# starts, serves the forward path, and answers NXDOMAIN for the whole zone --
+# with one line in its log and nothing wrong anywhere else.
+#
+# Traversable is not readable: there is no o+r, so nothing can list this
+# directory, and the credentials in it are 0600 root besides.
+install -d -m 0751 "$CONFDIR"
 install -d -m 0750 "$STATEDIR"
 
 if [[ $(readlink -f "$SRC") != $(readlink -f "$PREFIX/src") ]]; then
@@ -760,6 +846,8 @@ fi
 # --------------------------------------------------------------------------- #
 
 CLIENT_CONF=""
+CLIENT_FILE=""
+CLIENT_WARNINGS=""
 if [[ -n $BOOTSTRAP_PEER ]]; then
   step "First device"
 
@@ -777,12 +865,35 @@ if [[ -n $BOOTSTRAP_PEER ]]; then
       -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
       -d "{\"name\":\"$BOOTSTRAP_PEER\",\"peer_type\":\"user\",\"wg_public_key\":\"$CLIENT_PUB\",\"owner_user_id\":\"$ADMIN_ID\",\"tags\":[\"bootstrap\"]}" || true)
     PEER_IP=$(printf '%s' "$PEER_JSON" | jq -r '.tunnel_ip // empty' 2>/dev/null || true)
+    PEER_ID=$(printf '%s' "$PEER_JSON" | jq -r '.id // empty' 2>/dev/null || true)
   fi
 
   if [[ -n ${PEER_IP:-} ]]; then
     ok "registered '$BOOTSTRAP_PEER' at $PEER_IP, owned by $ADMIN_USER"
-    SERVER_PUB=$(cat "/etc/wireguard/${WG_IF}.public" 2>/dev/null || wg show "$WG_IF" public-key)
-    CLIENT_CONF=$(cat <<EOF
+
+    # The same call the dashboard makes, so this device gets the same file:
+    # resolver, search domain, MTU and every zone route, not just the pool.
+    PROFILE=$(curl -sf -H "Authorization: Bearer $ADMIN_TOKEN" \
+      "http://$TUNNEL_IP:$API_PORT/api/v1/peers/$PEER_ID/config-profile" 2>/dev/null || true)
+
+    if [[ -n $PROFILE ]] && printf '%s' "$PROFILE" | jq -e '.addresses' >/dev/null 2>&1; then
+      CLIENT_CONF=$(render_client_config "$PROFILE" "$CLIENT_PRIV" \
+                    "<your-public-address>:$LISTEN_PORT")
+      CLIENT_FILE=$(config_file_name "$PROFILE")
+      # Reported rather than filtered: 'split mode refuses everything outside
+      # the zone' and 'this network is left out because you carry it' are both
+      # things the operator can only act on before the file scrolls away.
+      CLIENT_WARNINGS=$(printf '%s' "$PROFILE" | jq -r '.warnings[]?' 2>/dev/null || true)
+      ok "built its configuration from the API, the way the dashboard does"
+    else
+      # The API answered a moment ago, for the registration above, so this is
+      # unlikely -- but a device that cannot reach the gateway is also the
+      # device that cannot open the dashboard to try again.
+      warn "could not read the config profile — falling back to a minimal file"
+      SERVER_PUB=$(cat "/etc/wireguard/${WG_IF}.public" 2>/dev/null || wg show "$WG_IF" public-key)
+      CLIENT_CONF=$(cat <<EOF
+# Minimal fallback: no resolver, no zone routes. Replace it with a config from
+# the dashboard's generator (Devices → the device → Configuration).
 [Interface]
 PrivateKey = $CLIENT_PRIV
 Address = $PEER_IP/32
@@ -794,6 +905,8 @@ AllowedIPs = $POOL
 PersistentKeepalive = 25
 EOF
 )
+      CLIENT_FILE="foxguard.conf"
+    fi
   else
     warn "could not register the device — add it from the dashboard instead"
   fi
@@ -834,14 +947,25 @@ fi
 if [[ -n $CLIENT_CONF ]]; then
   cat <<EOF
 
- $B Client config for '$BOOTSTRAP_PEER' $N — save as $BOOTSTRAP_PEER.conf
+ $B Client config for '$BOOTSTRAP_PEER' $N — save as ${CLIENT_FILE:-foxguard.conf}
 
 $CLIENT_CONF
 
+ The file name matters: wg-quick takes the interface name from it, and
+ every client refuses more than 15 characters of [a-zA-Z0-9_=+.-].
+$( [[ -n $CLIENT_WARNINGS ]] && printf '\n%s\n' "$(printf '%s\n' "$CLIENT_WARNINGS" | sed 's/^/ ! /')" )
  Its private key was generated on this gateway, which is a fair trade for
  the laptop you are setting up from and a bad habit for everything else:
  generate the keypair on the device and register only the public key.
 $( [[ -z $ENDPOINT ]] && echo " Replace <your-public-address> with what your router forwards udp/$LISTEN_PORT to." )
+$( [[ $DNS_ENABLED -eq 1 ]] && cat <<DNSNOTE
+
+ The DNS line points at the resolver on this gateway, and the resolver is
+ started by the agent — which is still stopped and in dry run. Until you
+ finish the steps below, a device that connects with this file resolves
+ nothing at all; comment the line out if you need it working sooner.
+DNSNOTE
+)
 
  This device lands in quarantine, as every user peer does. Connect the
  tunnel, open http://$TUNNEL_IP:$API_PORT/ and sign in as $ADMIN_USER to

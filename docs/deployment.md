@@ -77,6 +77,10 @@ Three flags are worth understanding rather than copying:
   laptop you are setting up from and a bad habit for anything after. Every
   device after it comes from **Devices → Config generator** in the dashboard,
   which makes the keypair in your browser and never sends the private half here.
+  The *file* is the same either way: the installer asks
+  `GET /peers/{id}/config-profile` the same question the dashboard asks, so the
+  first device gets the resolver, the search domain, the MTU and every zone
+  route — not the pool alone.
 
 ### Smaller variants
 
@@ -116,6 +120,29 @@ the thing holding your only way in.
 removed on the agent's first sync — the control plane does not know about it. So
 instead it registers the device properly, bound to the administrator account,
 and prints a ready client config once.
+
+That config is built from `GET /peers/{id}/config-profile`, the same endpoint
+the dashboard's generator calls, so it carries everything the dashboard would
+put there:
+
+| Line | Comes from |
+| --- | --- |
+| `Address` | the address IPAM just allocated |
+| `DNS` | `--dns`: the resolver's tunnel address, plus the zone as a search domain |
+| `MTU` | `FOXGUARD_CLIENT_CONFIG_MTU`, omitted when unset |
+| `AllowedIPs` | the pools plus every enabled zone route (`FOXGUARD_CLIENT_CONFIG_ALLOWED_IPS`, default `routed`) |
+| `PersistentKeepalive` | `FOXGUARD_CLIENT_CONFIG_KEEPALIVE`, omitted at 0 |
+
+The suggested file name is derived the same way too — `wg-quick` takes the
+interface name from the file name and refuses more than 15 characters of
+`[a-zA-Z0-9_=+.-]`, so `Ada's MacBook Pro (2019)` is offered as
+`Ada-s-MacBook-P.conf`.
+
+One thing to know if you connect immediately: with `--dns`, that `DNS =` line
+points at a resolver **the agent has not started yet** — it is still stopped and
+in dry run at that point (section 3). A device that connects before you finish
+resolves nothing at all. Comment the line out if you need the tunnel working
+first, or just do section 3 before connecting.
 
 You still have to forward `udp/51820` to this box on your router — the installer
 says so but cannot do it.
@@ -717,6 +744,79 @@ poll, writes `/etc/foxguard/dns/{hosts,dnsmasq.conf}` and starts
 (`laptop.fox.internal`), the gateway answers to `gw.fox.internal`, and
 `/api/v1/dns/records` adds aliases and A records for services that live off the
 tunnel.
+
+#### The zone resolves nowhere, but forwarding works
+
+One line in the journal, and nothing else wrong:
+
+```
+dnsmasq: failed to load names from /etc/foxguard/dns/hosts: Permission denied
+```
+
+dnsmasq drops privileges at startup and re-reads `addn-hosts` **as the
+unprivileged user**. The hosts file is written 0644 for exactly that reason —
+but every directory on the way to it has to be traversable too, and
+`/etc/foxguard` holding credentials is a natural place to put 0750.
+
+The daemon starts, binds, forwards upstream, and answers nothing for the zone.
+
+```sh
+chmod 0751 /etc/foxguard
+systemctl restart foxguard-dns
+```
+
+Traversable is not readable: with no `o+r` nothing can list the directory, and
+the credentials inside are `0600` root regardless. The installer now creates it
+this way; check it with
+
+```sh
+runuser -u nobody -- cat /etc/foxguard/dns/hosts >/dev/null && echo ok
+```
+
+#### `setting capabilities failed: Operation not permitted`
+
+```
+dnsmasq[40852]: setting capabilities failed: Operation not permitted
+dnsmasq[40852]: FAILED to start up
+foxguard-dns.service: Main process exited, code=exited, status=5/NOTINSTALLED
+```
+
+dnsmasq drops to an unprivileged user at startup and calls `capset()` to keep
+`CAP_SETUID` across the change. Several of the hardening directives in the unit
+— `ProtectKernelTunables=` and `ProtectKernelModules=` among them — make systemd
+hand the process a **permitted set narrower than its bounding set**, and
+`CAP_SETUID` is one of the ones that goes. `capset()` cannot raise it back, and
+dnsmasq treats that as fatal.
+
+Measured on a live Debian 13 container rather than reasoned about:
+
+| | `CapPrm` | `CapBnd` |
+| --- | --- | --- |
+| without `ProtectKernelTunables=` | `…14c0` | `…14c0` |
+| with it | **`…1440`** | `…14c0` |
+
+`0x14c0 − 0x1440 = 0x80`, which is bit 7: `CAP_SETUID`.
+
+The fix is to list it as **ambient**, so it is in the permitted set from the
+start. The shipped unit does. If yours predates that:
+
+```sh
+systemctl edit foxguard-dns
+```
+
+```ini
+[Service]
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_SETUID
+```
+
+```sh
+systemctl daemon-reload && systemctl restart foxguard-dns
+```
+
+dnsmasq drops it along with everything else the moment it has changed user, so
+the daemon still ends up with an empty effective set. Removing the hardening
+directives instead does **not** work — several of them cause the same thing, so
+dropping one only moves the failure.
 
 #### You never start `foxguard-dns` yourself
 

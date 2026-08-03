@@ -22,8 +22,23 @@ Restart=on-failure
 RestartSec=2
 
 User=root
+# CAP_SETUID has to be *ambient*, not merely inside the bounding set.
+#
+# dnsmasq drops to an unprivileged user at startup and calls capset() to keep
+# what it needs while doing so. Several of the hardening directives below --
+# ProtectKernelTunables and ProtectKernelModules among them -- make systemd hand
+# the process a *permitted* set narrower than the bounding set, and CAP_SETUID
+# is one of the ones that goes. capset() then cannot raise it, dnsmasq treats
+# that as fatal, and the unit dies with "setting capabilities failed:
+# Operation not permitted" / "FAILED to start up", status 5.
+#
+# Measured on a live Debian 13 / systemd container, not reasoned about:
+# without it CapPrm is 0x1440 against a CapBnd of 0x14c0 -- the missing 0x80 is
+# exactly CAP_SETUID. Listing it here puts it back in permitted; dnsmasq drops
+# it along with everything else the moment it has changed user, so the daemon
+# still ends up with an empty effective set.
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_SETUID CAP_SETGID CAP_NET_ADMIN
-AmbientCapabilities=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_SETUID
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
