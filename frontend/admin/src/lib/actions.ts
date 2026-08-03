@@ -32,6 +32,13 @@ import type {
   User,
   Zone,
   ZoneRoute,
+  Service,
+  ServiceAccountCreated,
+  ServiceAuthKind,
+  ServiceExposure,
+  ServiceKind,
+  ServiceScope,
+  ServiceTokenCreated,
 } from "./types";
 import type { AdminLoginResponse, AdminWhoAmI } from "./types";
 
@@ -550,4 +557,153 @@ export async function getConfigProfile(
   return run(() =>
     api.get<ClientConfigProfile>(`/api/v1/peers/${peerId}/config-profile${suffix}`),
   );
+}
+
+// --------------------------------------------------------------------------- //
+// published services (Phase 7)
+// --------------------------------------------------------------------------- //
+
+/**
+ * Create a service *and* the way in, in one request.
+ *
+ * Not a convenience: a listener with no authenticator that applies to it is
+ * refused by the control plane, so a two-step creation could never succeed --
+ * the first step would always come back 422.
+ */
+export async function createService(input: {
+  slug: string;
+  name: string;
+  description?: string;
+  kind: ServiceKind;
+  exposure: ServiceExposure;
+  upstream_peer_id: string | null;
+  upstream_host: string;
+  upstream_port: number;
+  upstream_tls: boolean;
+  upstream_tls_verify: boolean;
+  authenticators: { kind: ServiceAuthKind; scope: ServiceScope; realm?: string }[];
+  access: { kind: string; group_id?: string | null; cidr?: string | null; action: string }[];
+}): Promise<Result<Service>> {
+  const result = await run(() => api.post<Service>("/api/v1/services", input));
+  if (result.ok) refreshEverything();
+  return result;
+}
+
+export async function updateService(
+  id: string,
+  patch: Partial<{ name: string; description: string; enabled: boolean }>,
+): Promise<Result<Service>> {
+  const result = await run(() => api.patch<Service>(`/api/v1/services/${id}`, patch));
+  if (result.ok) refreshEverything();
+  return result;
+}
+
+export async function deleteService(id: string): Promise<Result<void>> {
+  const result = await run(() => api.delete<void>(`/api/v1/services/${id}`));
+  if (result.ok) refreshEverything();
+  return result;
+}
+
+export async function addServiceAuth(
+  serviceId: string,
+  input: { kind: ServiceAuthKind; scope: ServiceScope; realm?: string },
+): Promise<Result<Service>> {
+  const result = await run(() =>
+    api.post<Service>(`/api/v1/services/${serviceId}/auth`, input),
+  );
+  if (result.ok) refreshEverything();
+  return result;
+}
+
+export async function removeServiceAuth(
+  serviceId: string,
+  authId: string,
+): Promise<Result<Service>> {
+  const result = await run(() =>
+    api.delete<Service>(`/api/v1/services/${serviceId}/auth/${authId}`),
+  );
+  if (result.ok) refreshEverything();
+  return result;
+}
+
+export async function addServiceAccess(
+  serviceId: string,
+  input: { kind: string; group_id?: string | null; cidr?: string | null; action: string },
+): Promise<Result<Service>> {
+  const result = await run(() =>
+    api.post<Service>(`/api/v1/services/${serviceId}/access`, input),
+  );
+  if (result.ok) refreshEverything();
+  return result;
+}
+
+export async function removeServiceAccess(
+  serviceId: string,
+  ruleId: string,
+): Promise<Result<Service>> {
+  const result = await run(() =>
+    api.delete<Service>(`/api/v1/services/${serviceId}/access/${ruleId}`),
+  );
+  if (result.ok) refreshEverything();
+  return result;
+}
+
+/** The plaintext comes back once and is never retrievable again. */
+export async function createServiceToken(
+  serviceId: string,
+  input: { name: string },
+): Promise<Result<ServiceTokenCreated>> {
+  const result = await run(() =>
+    api.post<ServiceTokenCreated>(`/api/v1/services/${serviceId}/tokens`, input),
+  );
+  if (result.ok) refreshEverything();
+  return result;
+}
+
+export async function revokeServiceToken(
+  serviceId: string,
+  tokenId: string,
+): Promise<Result<void>> {
+  const result = await run(() =>
+    api.delete<void>(`/api/v1/services/${serviceId}/tokens/${tokenId}`),
+  );
+  if (result.ok) refreshEverything();
+  return result;
+}
+
+/** The password is generated, not chosen, and shown once. */
+export async function createServiceAccount(
+  serviceId: string,
+  input: { username: string },
+): Promise<Result<ServiceAccountCreated>> {
+  const result = await run(() =>
+    api.post<ServiceAccountCreated>(`/api/v1/services/${serviceId}/accounts`, input),
+  );
+  if (result.ok) refreshEverything();
+  return result;
+}
+
+export async function deleteServiceAccount(
+  serviceId: string,
+  accountId: string,
+): Promise<Result<void>> {
+  const result = await run(() =>
+    api.delete<void>(`/api/v1/services/${serviceId}/accounts/${accountId}`),
+  );
+  if (result.ok) refreshEverything();
+  return result;
+}
+
+/**
+ * End one browser session now.
+ *
+ * The cookie itself stays perfectly valid-looking -- its signature is fine and
+ * it has not expired, which is exactly what makes the proxy fast. What stops it
+ * is the session id landing in a map the proxy consults, pushed on the agent's
+ * next poll without a reload.
+ */
+export async function revokeSsoSession(id: string): Promise<Result<void>> {
+  const result = await run(() => api.delete<void>(`/api/v1/proxy/sso-sessions/${id}`));
+  if (result.ok) refreshEverything();
+  return result;
 }

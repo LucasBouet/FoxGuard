@@ -59,7 +59,14 @@ export const NAV_ENTRIES: NavEntry[] = [
   {
     kind: "group",
     label: "Network",
-    items: [{ href: "/dns", label: "DNS", hint: "The internal zone and its records" }],
+    items: [
+      { href: "/dns", label: "DNS", hint: "The internal zone and its records" },
+      {
+        href: "/services",
+        label: "Services",
+        hint: "What the gateway publishes, and who gets in",
+      },
+    ],
   },
   { kind: "link", href: "/audit", label: "Audit log" },
 ];

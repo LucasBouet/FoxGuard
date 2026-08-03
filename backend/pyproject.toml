@@ -12,12 +12,17 @@ dependencies = [
     "pydantic>=2.8",
     "pydantic-settings>=2.4",
     "argon2-cffi>=23.1",
+    # sha-512-crypt for HAProxy service accounts. Python 3.13 removed the
+    # stdlib `crypt` module (PEP 594) and a `userlist` can verify nothing else.
+    "passlib>=1.7.4",
     "pyotp>=2.9",
     # OIDC id_token verification. joserfc rather than authlib.jose, which its
     # own author deprecated in favour of this; it also makes the accepted
     # signature algorithms an explicit argument rather than a default.
     "joserfc>=1.0",
     "httpx>=0.27",
+    # The SSO sign-in page posts a form; FastAPI needs this to parse one.
+    "python-multipart>=0.0.9",
 ]
 
 [project.scripts]
@@ -61,6 +66,9 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 # assert is the point; random is for shuffling; the credentials in the portal
-# tests are hardcoded on purpose -- that is what makes them fixtures.
-"tests/*" = ["S101", "S311", "S105", "S106"]
+# tests are hardcoded on purpose -- that is what makes them fixtures. The live
+# tests drive real binaries (haproxy, curl, openssl) with arguments they build
+# themselves, which is the whole reason they exist, and HAProxy caps a stats
+# socket path at 97 characters so those live under /tmp rather than tmp_path.
+"tests/*" = ["S101", "S311", "S105", "S106", "S603", "S607", "S108"]
 "alembic/versions/*" = ["E402"]

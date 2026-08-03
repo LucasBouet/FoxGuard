@@ -47,7 +47,7 @@ REMOVE_DATABASE=0
 
 # Agent first: it is what writes the nft table, the DNS zone and the routes, so
 # stopping anything else before it just gives it a chance to put them back.
-UNITS=(foxguard-agent foxguard-dns foxguard-dashboard foxguard-api)
+UNITS=(foxguard-agent foxguard-dns foxguard-proxy foxguard-dashboard foxguard-api)
 
 # What the installer apt-installs and what is safe to purge afterwards.
 #
@@ -57,7 +57,8 @@ UNITS=(foxguard-agent foxguard-dns foxguard-dashboard foxguard-api)
 # up after Foxguard trades a clean uninstall for an unbootable-ish machine.
 # They were almost certainly present before Foxguard anyway.
 REMOVABLE=(nftables wireguard-tools postgresql python3-venv python3-dev
-           libpq-dev build-essential jq nodejs npm dnsmasq-base)
+           libpq-dev build-essential jq nodejs npm dnsmasq-base haproxy
+           certbot python3-certbot-dns-cloudflare socat)
 NEVER_REMOVE=(python3 curl iproute2)
 
 # --------------------------------------------------------------------------- #
@@ -338,6 +339,29 @@ for unit in "${UNITS[@]}"; do
 done
 run systemctl daemon-reload 2>/dev/null || true
 run systemctl reset-failed 2>/dev/null || true
+
+# Certificate private keys before the directory containing them.
+#
+# `rm -rf` unlinks; it does not overwrite. The wildcard key here covers the
+# whole domain, which makes it the highest-value secret on this box, and a
+# recovered one lets somebody impersonate every service the domain names.
+if [[ -d $CONFDIR/proxy/certs ]]; then
+  if command -v shred >/dev/null 2>&1; then
+    while IFS= read -r pem; do
+      attempt "shredded $(basename "$pem")" shred -u "$pem"
+    done < <(find "$CONFDIR/proxy/certs" -type f -name '*.pem' 2>/dev/null)
+  else
+    warn "shred is not available: certificate keys are only unlinked, not overwritten"
+  fi
+fi
+if [[ -e /usr/local/bin/foxguard-cert-deploy ]]; then
+  attempt "removed the certbot deploy hook" rm -f /usr/local/bin/foxguard-cert-deploy
+fi
+# The Let's Encrypt lineage is deliberately left alone: certbot owns
+# /etc/letsencrypt, other things on this box may use the same certificate, and
+# re-issuing after an accidental deletion runs into rate limits.
+[[ -d /etc/letsencrypt/live ]] && \
+  say "  note: /etc/letsencrypt is left as it is -- remove the lineage yourself"
 
 for dir in "$PREFIX" "$STATEDIR" "$CONFDIR"; do
   if [[ -d $dir ]]; then

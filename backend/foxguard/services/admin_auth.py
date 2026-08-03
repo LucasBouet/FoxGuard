@@ -96,12 +96,22 @@ def _verify_hash(token: str, stored: str) -> bool:
 
 
 def authenticate(
-    session: Session, *, username: str, password: str, totp_code: str | None
+    session: Session,
+    *,
+    username: str,
+    password: str,
+    totp_code: str | None,
+    require_admin: bool = True,
 ) -> AuthOutcome:
-    """Check an administrator's credentials. Does not create a session.
+    """Check a person's credentials. Does not create a session.
 
     Every failure costs the same argon2 work as a success, so response timing
     does not reveal which usernames exist or which of them are administrators.
+
+    ``require_admin`` is False for single sign-on, where an ordinary account is
+    exactly the point. It is *not* a relaxation of anything else: what the
+    caller does with a successful outcome differs entirely -- an admin session
+    token opens the admin API, an SSO cookie opens published services.
     """
     user = session.execute(
         select(User).where(User.username == username).limit(1)
@@ -113,7 +123,7 @@ def authenticate(
     if not user.is_active:
         passwords.burn(password)
         return AuthOutcome(reason="account disabled")
-    if not user.is_admin:
+    if require_admin and not user.is_admin:
         # Burn anyway: otherwise a non-admin account answers faster than an
         # admin one, which maps out who the administrators are.
         passwords.burn(password)

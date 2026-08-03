@@ -286,6 +286,12 @@ class GatewaySpec:
     allow_icmp_to_gateway: bool = True
     gateway_input_policy: GatewayInputPolicy = GatewayInputPolicy.OPEN
     log_dropped: bool = True
+    #: Ports the reverse proxy binds on the *tunnel* side. Only meaningful when
+    #: ``gateway_input_policy`` is RESTRICTED, where the chain ends in a drop
+    #: and a listener nobody may reach is a service that silently does not work.
+    #: Peers reach the proxy through the input chain, not the forward chain --
+    #: the proxy terminates the connection on the gateway itself.
+    proxy_ports: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

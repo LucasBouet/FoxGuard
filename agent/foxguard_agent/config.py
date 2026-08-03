@@ -54,6 +54,21 @@ class AgentSettings(BaseSettings):
     #: because the rendered configuration refers to the hosts file by path.
     dns_dir: Path = Path("/etc/foxguard/dns")
 
+    haproxy_path: str = "haproxy"
+    proxy_service: str = "foxguard-proxy"
+    manage_proxy: bool = Field(
+        default=True,
+        description=(
+            "Apply the HAProxy configuration the control plane renders. Has no "
+            "effect unless FOXGUARD_PROXY_ENABLED is on there; turn it off to "
+            "run the proxy from somewhere else."
+        ),
+    )
+    #: Must match FOXGUARD_PROXY_CONF_PATH / FOXGUARD_PROXY_MAPS_DIR on the API:
+    #: the rendered configuration refers to its pattern files by absolute path.
+    proxy_dir: Path = Path("/etc/foxguard/proxy")
+    proxy_runtime_socket: Path = Path("/run/foxguard/haproxy.sock")
+
     state_dir: Path = Path("/var/lib/foxguard")
     #: Render and validate but never apply. Useful for a first dry deployment.
     dry_run: bool = False
@@ -98,6 +113,14 @@ class AgentSettings(BaseSettings):
     @property
     def dns_conf_path(self) -> Path:
         return self.dns_dir / "dnsmasq.conf"
+
+    @property
+    def proxy_conf_path(self) -> Path:
+        return self.proxy_dir / "haproxy.cfg"
+
+    @property
+    def proxy_maps_dir(self) -> Path:
+        return self.proxy_dir / "maps"
 
 
 @functools.lru_cache

@@ -41,6 +41,21 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from .dns.model import RecordKind
 from .nftables.model import Action, EndpointKind, PeerState, PeerType, Protocol
+from .proxy.model import (
+    AuthKind as ServiceAuthKind,
+)
+from .proxy.model import (
+    Exposure as ServiceExposure,
+)
+from .proxy.model import (
+    FilterKind as ServiceFilterKind,
+)
+from .proxy.model import (
+    Scope as ServiceScope,
+)
+from .proxy.model import (
+    ServiceKind,
+)
 
 
 class Base(DeclarativeBase):
@@ -635,3 +650,368 @@ class RulesetVersion(Base):
     applied_at: Mapped[datetime | None] = mapped_column(TimestampColumn)
     error: Mapped[str | None] = mapped_column(Text)
     generated_by: Mapped[str | None] = mapped_column(String(128))
+
+
+# --------------------------------------------------------------------------- #
+# Phase 6: published services (reverse proxy)
+# --------------------------------------------------------------------------- #
+
+
+class Service(Base):
+    """A service published through the gateway's reverse proxy.
+
+    The upstream lives *behind a peer*, which is what makes this different from
+    a generic proxy: ``upstream_host`` must be an address the carrying peer's
+    ``AllowedIPs`` actually covers -- its own tunnel address, or a network in a
+    zone it routes for. The control plane checks that before the row is ever
+    written, because the alternative failure mode is a timeout, which is the
+    least diagnosable thing in the system.
+
+    ``upstream_peer_id`` is nullable for the case where the gateway hosts the
+    thing itself. Deleting the peer cascades the service away rather than
+    leaving it pointing nowhere: a service is published *because* some peer can
+    serve it.
+    """
+
+    __tablename__ = "services"
+    __table_args__ = (
+        CheckConstraint(
+            "slug ~ '^[a-z0-9][a-z0-9_-]{0,23}$'", name="ck_services_slug_format"
+        ),
+        # Plain TCP has no SNI and no Host header, so it has nothing to route on
+        # but the port it arrived at.
+        CheckConstraint(
+            "kind <> 'tcp' OR listen_port IS NOT NULL OR sni_hostname IS NOT NULL",
+            name="ck_services_tcp_needs_target",
+        ),
+        CheckConstraint(
+            "listen_port IS NULL OR (listen_port BETWEEN 1 AND 65535)",
+            name="ck_services_listen_port_range",
+        ),
+        CheckConstraint(
+            "upstream_port BETWEEN 1 AND 65535", name="ck_services_upstream_port_range"
+        ),
+        # An HTTP service is routed by Host, so each door it opens needs a name.
+        CheckConstraint(
+            "kind <> 'http' OR exposure = 'external' OR internal_hostname IS NOT NULL",
+            name="ck_services_internal_hostname",
+        ),
+        CheckConstraint(
+            "kind <> 'http' OR exposure = 'internal' OR external_hostname IS NOT NULL",
+            name="ck_services_external_hostname",
+        ),
+        Index("ix_services_peer", "upstream_peer_id"),
+        Index(
+            "uq_services_listen_port",
+            "listen_port",
+            unique=True,
+            postgresql_where=text("listen_port IS NOT NULL"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    #: Shares one namespace with peer labels, groups and zones -- a name that
+    #: could mean two things makes an access rule ambiguous.
+    slug: Mapped[str] = mapped_column(String(24), unique=True, nullable=False)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+    kind: Mapped[ServiceKind] = mapped_column(
+        _enum(ServiceKind, "service_kind"), nullable=False
+    )
+    exposure: Mapped[ServiceExposure] = mapped_column(
+        _enum(ServiceExposure, "service_exposure"),
+        default=ServiceExposure.INTERNAL,
+        nullable=False,
+    )
+
+    upstream_peer_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("peers.id", ondelete="CASCADE")
+    )
+    upstream_host: Mapped[str] = mapped_column(INET, nullable=False)
+    upstream_port: Mapped[int] = mapped_column(Integer, nullable=False)
+    upstream_tls: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    #: Off by default. These upstreams are appliances with self-signed
+    #: certificates and the hop already runs inside WireGuard.
+    upstream_tls_verify: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
+
+    internal_hostname: Mapped[str | None] = mapped_column(String(255), unique=True)
+    external_hostname: Mapped[str | None] = mapped_column(String(255), unique=True)
+    listen_port: Mapped[int | None] = mapped_column(Integer)
+    sni_hostname: Mapped[str | None] = mapped_column(String(255))
+
+    #: Off by default: an upstream behind a roaming laptop flaps every time the
+    #: lid closes, and an aggressive check turns that into spurious 503s.
+    health_check: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    health_check_interval: Mapped[int] = mapped_column(
+        Integer, default=30, nullable=False
+    )
+
+    extra: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(
+        TimestampColumn, server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TimestampColumn, server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    upstream_peer: Mapped[Peer | None] = relationship(lazy="joined")
+    authenticators: Mapped[list[ServiceAuth]] = relationship(
+        back_populates="service", cascade="all, delete-orphan", lazy="selectin"
+    )
+    filters: Mapped[list[ServiceFilter]] = relationship(
+        back_populates="service", cascade="all, delete-orphan", lazy="selectin"
+    )
+    access: Mapped[list[ServiceAccess]] = relationship(
+        back_populates="service", cascade="all, delete-orphan", lazy="selectin"
+    )
+    tokens: Mapped[list[ServiceToken]] = relationship(
+        back_populates="service", cascade="all, delete-orphan", lazy="selectin"
+    )
+    accounts: Mapped[list[ServiceAccount]] = relationship(
+        back_populates="service", cascade="all, delete-orphan", lazy="selectin"
+    )
+
+
+class ServiceAuth(Base):
+    """One way in. Combined with OR: any one of these is enough.
+
+    ``scope`` exists because the same service legitimately wants different
+    proof on each door -- the tunnel proves identity by itself, the internet
+    proves nothing. ``peer_identity`` scoped anywhere but ``internal`` is
+    refused by the validator rather than silently ignored.
+    """
+
+    __tablename__ = "service_auth"
+    __table_args__ = (
+        UniqueConstraint("service_id", "kind", "scope", name="uq_service_auth_kind"),
+        Index("ix_service_auth_service", "service_id"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    service_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("services.id", ondelete="CASCADE"), nullable=False
+    )
+    kind: Mapped[ServiceAuthKind] = mapped_column(
+        _enum(ServiceAuthKind, "service_auth_kind"), nullable=False
+    )
+    scope: Mapped[ServiceScope] = mapped_column(
+        _enum(ServiceScope, "service_scope"), default=ServiceScope.BOTH, nullable=False
+    )
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    priority: Mapped[int] = mapped_column(Integer, default=100, nullable=False)
+    #: ``basic`` only: the realm shown in the browser prompt.
+    realm: Mapped[str | None] = mapped_column(String(64))
+    config: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(
+        TimestampColumn, server_default=func.now(), nullable=False
+    )
+
+    service: Mapped[Service] = relationship(back_populates="authenticators")
+
+
+class ServiceFilter(Base):
+    """A condition that must pass. Combined with AND.
+
+    Generic ``kind`` + ``values`` on purpose: geo, WAF and CrowdSec arrive in
+    later phases and should not each need a migration. The ones not implemented
+    yet are accepted by the schema and refused by the validator, which is
+    better than a rule that saves and quietly does nothing.
+    """
+
+    __tablename__ = "service_filters"
+    __table_args__ = (
+        CheckConstraint(
+            "kind <> 'rate_limit' OR (rate IS NOT NULL AND period_seconds IS NOT NULL)",
+            name="ck_service_filters_rate_complete",
+        ),
+        Index("ix_service_filters_service", "service_id"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    service_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("services.id", ondelete="CASCADE"), nullable=False
+    )
+    kind: Mapped[ServiceFilterKind] = mapped_column(
+        _enum(ServiceFilterKind, "service_filter_kind"), nullable=False
+    )
+    scope: Mapped[ServiceScope] = mapped_column(
+        _enum(ServiceScope, "service_scope"), default=ServiceScope.BOTH, nullable=False
+    )
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    priority: Mapped[int] = mapped_column(Integer, default=100, nullable=False)
+    #: ``ip_allow`` / ``ip_deny``: addresses and prefixes.
+    values: Mapped[dict] = mapped_column(JSONB, default=list, nullable=False)
+    rate: Mapped[int | None] = mapped_column(Integer)
+    period_seconds: Mapped[int | None] = mapped_column(Integer)
+
+    created_at: Mapped[datetime] = mapped_column(
+        TimestampColumn, server_default=func.now(), nullable=False
+    )
+
+    service: Mapped[Service] = relationship(back_populates="filters")
+
+
+class ServiceAccess(Base):
+    """Who may use a service, in the ACL module's vocabulary.
+
+    Deliberately reuses ``endpoint_kind`` and ``acl_action`` rather than
+    inventing a parallel set: two access-control vocabularies that can disagree
+    is how a segmentation model becomes a lie. There is no ``peer`` kind
+    because there is none in ``endpoint_kind`` -- a single device is named by
+    its ``/32``, exactly as the ACL rules already require.
+
+    Set-backed rules (``group``, ``zone``) are evaluated only on the internal
+    listener. A public source address cannot be a peer, so applying them
+    outside would deny everyone for a reason nobody could read; external
+    authorisation is the authenticators' job plus any ``cidr`` rules.
+    """
+
+    __tablename__ = "service_access"
+    __table_args__ = (
+        CheckConstraint(
+            "(kind NOT IN ('group', 'zone') OR group_id IS NOT NULL) AND "
+            "(kind <> 'cidr' OR cidr IS NOT NULL)",
+            name="ck_service_access_consistent",
+        ),
+        Index("ix_service_access_service", "service_id"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    service_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("services.id", ondelete="CASCADE"), nullable=False
+    )
+    action: Mapped[Action] = mapped_column(
+        _enum(Action, "acl_action"), default=Action.ACCEPT, nullable=False
+    )
+    kind: Mapped[EndpointKind] = mapped_column(
+        _enum(EndpointKind, "endpoint_kind"), nullable=False
+    )
+    group_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("groups.id", ondelete="CASCADE")
+    )
+    cidr: Mapped[str | None] = mapped_column(String(64))
+    priority: Mapped[int] = mapped_column(Integer, default=100, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(
+        TimestampColumn, server_default=func.now(), nullable=False
+    )
+
+    service: Mapped[Service] = relationship(back_populates="access")
+    group: Mapped[Group | None] = relationship(lazy="joined")
+
+
+class ServiceToken(Base):
+    """A bearer token, scoped to one service.
+
+    Stored as a salted SHA-256, not behind a KDF -- the same reasoning as
+    ``admin_sessions`` and enrollment keys, and for the same reason: these are
+    generated high-entropy secrets, so stretching buys nothing. ``prefix`` is
+    the first characters of the plaintext, kept purely so a human can tell two
+    tokens apart in a list.
+    """
+
+    __tablename__ = "service_tokens"
+    __table_args__ = (
+        UniqueConstraint("token_hash", name="uq_service_tokens_hash"),
+        Index("ix_service_tokens_service", "service_id"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    service_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("services.id", ondelete="CASCADE"), nullable=False
+    )
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    prefix: Mapped[str] = mapped_column(String(12), nullable=False)
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL")
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(TimestampColumn)
+    revoked_at: Mapped[datetime | None] = mapped_column(TimestampColumn)
+    created_at: Mapped[datetime] = mapped_column(
+        TimestampColumn, server_default=func.now(), nullable=False
+    )
+
+    service: Mapped[Service] = relationship(back_populates="tokens")
+
+
+class ServiceAccount(Base):
+    """A basic-auth service account.
+
+    ``password_hash`` is a crypt(3) SHA-crypt string, because that is what a
+    HAProxy ``userlist`` can verify. Weaker than the argon2 the ``users`` table
+    uses, and acceptable only because the password here is machine-generated
+    and high-entropy: human passwords stay in the database and never reach the
+    gateway's disk. That is the whole reason this table exists separately from
+    ``users``.
+    """
+
+    __tablename__ = "service_accounts"
+    __table_args__ = (
+        UniqueConstraint("service_id", "username", name="uq_service_accounts_name"),
+        Index("ix_service_accounts_service", "service_id"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    service_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("services.id", ondelete="CASCADE"), nullable=False
+    )
+    username: Mapped[str] = mapped_column(String(64), nullable=False)
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(TimestampColumn)
+    created_at: Mapped[datetime] = mapped_column(
+        TimestampColumn, server_default=func.now(), nullable=False
+    )
+
+    service: Mapped[Service] = relationship(back_populates="accounts")
+
+
+class SsoSession(Base):
+    """A browser session for a *person* reaching a published service.
+
+    Deliberately a third kind of session, not a reuse of either existing one:
+
+    * ``admin_sessions`` grants the admin API. An SSO cookie must never be
+      mistakable for one, or reaching a published web app would hand the holder
+      the kill switch.
+    * ``sessions`` (portal) is not an HTTP session at all -- what a peer gets
+      for authenticating there is *network* access, expressed in nftables. See
+      ``api/routes/portal.py``.
+
+    The cookie itself is a signed JWT the proxy verifies without asking anyone,
+    so this row is not consulted on the request path. It exists for two things
+    the JWT cannot do: telling an administrator who is signed in where, and
+    revocation -- the ``jti`` of a revoked row is pushed into a HAProxy map, and
+    that is what makes "sign this person out now" mean now rather than "within
+    the token lifetime".
+    """
+
+    __tablename__ = "sso_sessions"
+    __table_args__ = (
+        Index("ix_sso_sessions_user", "user_id"),
+        Index("ix_sso_sessions_expires", "expires_at"),
+    )
+
+    #: Also the JWT's ``jti``. One value, so a revocation entry needs no lookup.
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    #: Where the browser was when it signed in. Read from the header the proxy
+    #: sets and the caller cannot forge, never from the TCP peer -- behind the
+    #: proxy that would be the gateway itself, every time.
+    source_ip: Mapped[str | None] = mapped_column(INET)
+    user_agent: Mapped[str | None] = mapped_column(String(255))
+    expires_at: Mapped[datetime] = mapped_column(TimestampColumn, nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(TimestampColumn)
+    created_at: Mapped[datetime] = mapped_column(
+        TimestampColumn, server_default=func.now(), nullable=False
+    )
+
+    user: Mapped[User] = relationship(lazy="joined")

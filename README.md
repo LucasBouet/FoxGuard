@@ -555,9 +555,28 @@ These are enforced in code and covered by tests, not just documented:
   device itself carries. Verified against `wg pubkey`, `wg-quick strip`, a real
   WireGuard interface, `zbarimg` and `segno`. The admin navigation was regrouped
   into menus at the same time, so the next screen is one entry in `lib/nav.ts`.
-- **Still open.** An integrated reverse proxy in front of internal web services
-  (never in front of the portal — see `docs/architecture.md` §5), and a CrowdSec
-  bouncer on the gateway.
+- **Phase 7 — reverse proxy, done.** Services that live behind a peer, published
+  through a HAProxy instance Foxguard owns end to end: HTTP terminated or TCP
+  passed through, an internal door and an external one with *different* policy
+  on each. Inside the tunnel a source address is proof of which key sent the
+  packet, so peer identity costs nothing and is refused on the external door
+  where it would prove nothing. Bearer tokens and generated service accounts
+  cover the outside. Never in front of the portal or the API — they identify
+  their caller by source address and the control plane refuses such a service at
+  creation. Publishing opens a gateway-to-upstream path the ACL model does not
+  cover, so that path is derived and shown rather than left invisible.
+  Certificates are one DNS-01 wildcard, loaded over HAProxy's runtime socket
+  without a reload so a passthrough session survives renewal.
+- **Phase 7c — single sign-on, done.** A Foxguard login page, a signed cookie
+  every published service accepts, and revocation that takes effect immediately
+  rather than whenever the token would have expired. The proxy verifies the
+  cookie natively, so a published service keeps working while the API restarts.
+  The algorithm is pinned rather than read from the token: measured, the
+  idiomatic HAProxy snippet accepts an unsigned `alg:none` forgery.
+- **Still open.** Geo restrictions, and CrowdSec — whose AppSec component is a
+  Coraza WAF, so the bouncer and the WAF are one integration rather than two.
+  Per-user authorization for SSO services needs a user-to-group relation the
+  schema does not have yet.
 
 ## License
 

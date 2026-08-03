@@ -65,6 +65,12 @@ DNS_ENABLED=0
 DNS_ZONE="fox.internal"
 DNS_MODE="forward"
 DNS_UPSTREAMS=""
+PROXY_ENABLED=0
+PROXY_DOMAIN=""
+PROXY_EXTERNAL_BINDS=""
+ACME_EMAIL=""
+ACME_CF_TOKEN=""
+SSO_ENABLED=0
 
 # --------------------------------------------------------------------------- #
 # output
@@ -211,6 +217,24 @@ Internal DNS (opt-in — a resolver on the gateway, for the tunnel only):
                          only works if clients are configured to send just
                          in-zone queries here. Default: $DNS_MODE
   --dns-upstream ADDR    Upstream resolver, repeatable. Forward mode only.
+
+Reverse proxy (opt-in — publishes services that live behind peers):
+  --proxy                Install HAProxy and serve published services
+  --proxy-domain DOMAIN  Real domain services get names under, e.g. example.com.
+                         Required: peer names live on the DNS zone, but a
+                         service needs a name a public CA will sign, and
+                         .internal never can be.
+  --proxy-external IP    WAN address the external listener binds, repeatable.
+                         Omit it and only the tunnel-side listener exists.
+  --acme-email ADDR      Contact address for Let's Encrypt. Enables certbot.
+  --sso                  Single sign-on for published services: a Foxguard
+                         login page, a signed cookie every service accepts, and
+                         revocation that takes effect immediately. Generates the
+                         signing secret.
+  --acme-cf-token TOKEN  Cloudflare API token for the DNS-01 challenge. Use a
+                         token scoped to Zone:DNS:Edit on that one zone, never
+                         the global API key: the wildcard it obtains covers the
+                         whole domain.
   -y, --yes              Do not prompt
   -h, --help             This text
 
@@ -247,6 +271,12 @@ while [[ $# -gt 0 ]]; do
     --dns-zone)        DNS_ZONE=$2; DNS_ENABLED=1; shift 2 ;;
     --dns-mode)        DNS_MODE=$2; DNS_ENABLED=1; shift 2 ;;
     --dns-upstream)    DNS_UPSTREAMS="${DNS_UPSTREAMS:+$DNS_UPSTREAMS,}$2"; DNS_ENABLED=1; shift 2 ;;
+    --proxy)           PROXY_ENABLED=1; shift ;;
+    --proxy-domain)    PROXY_DOMAIN=$2; PROXY_ENABLED=1; shift 2 ;;
+    --proxy-external)  PROXY_EXTERNAL_BINDS="${PROXY_EXTERNAL_BINDS:+$PROXY_EXTERNAL_BINDS,}$2"; PROXY_ENABLED=1; shift 2 ;;
+    --sso)             SSO_ENABLED=1; PROXY_ENABLED=1; shift ;;
+    --acme-email)      ACME_EMAIL=$2; shift 2 ;;
+    --acme-cf-token)   ACME_CF_TOKEN=$2; shift 2 ;;
     --bootstrap-wireguard) BOOTSTRAP_WG=1; shift ;;
     --listen-port)     LISTEN_PORT=$2; shift 2 ;;
     --bootstrap-peer)  BOOTSTRAP_PEER=$2; shift 2 ;;
@@ -439,6 +469,50 @@ if [[ $DNS_ENABLED -eq 1 ]]; then
   [[ $DNS_ZONE == *.local ]] && warn "$DNS_ZONE ends in .local, which is mDNS territory -- expect clients to resolve it inconsistently"
 fi
 
+if [[ $PROXY_ENABLED -eq 1 ]]; then
+  if [[ -z $PROXY_DOMAIN ]]; then
+    fail "--proxy needs --proxy-domain: services need a name a public CA will sign"
+    PREFLIGHT_FAILED=1
+  else
+    ok "proxy domain $PROXY_DOMAIN"
+  fi
+  # The internal zone must not swallow the certificate domain. In split mode
+  # dnsmasq answers NXDOMAIN for anything in-zone it does not know, which
+  # includes _acme-challenge, and certbot's propagation check would fail.
+  if [[ $DNS_ENABLED -eq 1 && $DNS_MODE == split && $PROXY_DOMAIN == *"$DNS_ZONE" ]]; then
+    fail "the DNS zone $DNS_ZONE covers the proxy domain $PROXY_DOMAIN, and in"
+    fail "split mode that makes the resolver answer NXDOMAIN for _acme-challenge"
+    PREFLIGHT_FAILED=1
+  fi
+  # Column 4 of `ss -ltn` is the local address:port. Not 5 -- that is Peer.
+  PROXY_PORTS_FREE=1
+  for port in 80 443; do
+    for addr in ${PROXY_EXTERNAL_BINDS//,/ }; do
+      if ss -ltn 2>/dev/null | awk 'NR>1 {print $4}' | grep -qE "(^|[^0-9.])($addr|0\.0\.0\.0|\[::\]):$port$"; then
+        fail "tcp/$port on $addr is already taken -- stop that service first"
+        PREFLIGHT_FAILED=1
+        PROXY_PORTS_FREE=0
+      fi
+    done
+  done
+  [[ -n $PROXY_EXTERNAL_BINDS && $PROXY_PORTS_FREE -eq 1 ]] && \
+    ok "tcp/80 and tcp/443 free on $PROXY_EXTERNAL_BINDS"
+  if [[ -n $ACME_EMAIL && -z $ACME_CF_TOKEN ]]; then
+    warn "--acme-email without --acme-cf-token: certbot is installed but no"
+    warn "certificate is requested, and the proxy runs on a self-signed one"
+  fi
+  if [[ $SSO_ENABLED -eq 1 && -z $PROXY_DOMAIN ]]; then
+    fail "--sso needs --proxy-domain: the login page lives at auth.<domain>"
+    PREFLIGHT_FAILED=1
+  elif [[ $SSO_ENABLED -eq 1 ]]; then
+    ok "single sign-on, login page at auth.$PROXY_DOMAIN"
+  fi
+  if [[ -n $PROXY_EXTERNAL_BINDS && -z $ACME_EMAIL ]]; then
+    warn "external exposure without ACME: browsers will refuse the self-signed"
+    warn "bootstrap certificate until you obtain a real one"
+  fi
+fi
+
 # IP forwarding: without it the gateway filters traffic it never routes.
 if [[ $(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null) == 1 ]]; then
   ok "IPv4 forwarding is on"
@@ -502,6 +576,12 @@ step "Installing packages"
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
+# Generated once and written to backend.env. Rotating it signs everyone out,
+# which is why it is not derived from anything that might change.
+SSO_SECRET=""
+# shellcheck disable=SC2034  # used inside the backend.env heredoc below
+[[ $SSO_ENABLED -eq 1 ]] && SSO_SECRET=$(openssl rand -base64 48 | tr -d '\n')
+
 PACKAGES=(nftables wireguard-tools iproute2 postgresql python3 python3-venv python3-dev
           libpq-dev build-essential curl jq)
 [[ $SKIP_FRONTEND -eq 0 ]] && PACKAGES+=(nodejs npm)
@@ -509,6 +589,14 @@ PACKAGES=(nftables wireguard-tools iproute2 postgresql python3 python3-venv pyth
 # system unit that would bind :53 itself and fight with the instance Foxguard
 # runs on its own configuration file.
 [[ $DNS_ENABLED -eq 1 ]] && PACKAGES+=(dnsmasq-base)
+# haproxy, plus certbot and the Cloudflare DNS-01 plugin. DNS-01 rather than
+# HTTP-01 because HTTP-01 needs every name to resolve publicly to this box,
+# which would force public records for internal-only services.
+[[ $PROXY_ENABLED -eq 1 ]] && PACKAGES+=(haproxy openssl)
+[[ -n $ACME_EMAIL ]] && PACKAGES+=(certbot python3-certbot-dns-cloudflare)
+# socat: the deploy hook talks to HAProxy's runtime socket to load a renewed
+# certificate without a reload, so a passthrough session is never dropped.
+[[ -n $ACME_CF_TOKEN ]] && PACKAGES+=(socat)
 apt-get install -y -qq "${PACKAGES[@]}"
 ok "packages installed"
 
@@ -696,6 +784,21 @@ FOXGUARD_DNS_CONF_PATH=$CONFDIR/dns/dnsmasq.conf
 DNSEOF
 )
 
+$( [[ $PROXY_ENABLED -eq 1 ]] && cat <<PROXYEOF
+FOXGUARD_PROXY_ENABLED=true
+FOXGUARD_PROXY_DOMAIN=$PROXY_DOMAIN
+# Tunnel address only. This is the one listener on which a source address is an
+# identity, and binding it anywhere else would hand out that identity to
+# packets that prove nothing.
+FOXGUARD_PROXY_INTERNAL_BINDS=$TUNNEL_IP
+FOXGUARD_PROXY_EXTERNAL_BINDS=$PROXY_EXTERNAL_BINDS
+FOXGUARD_PROXY_CONF_PATH=$CONFDIR/proxy/haproxy.cfg
+FOXGUARD_PROXY_MAPS_DIR=$CONFDIR/proxy/maps
+FOXGUARD_PROXY_CERTS_DIR=$CONFDIR/proxy/certs
+$( [[ $SSO_ENABLED -eq 1 ]] && printf 'FOXGUARD_PROXY_SSO_SECRET=%s\n' "$SSO_SECRET" )
+PROXYEOF
+)
+
 FOXGUARD_DEFAULT_SESSION_LIFETIME_SECONDS=28800
 FOXGUARD_SESSION_SWEEP_ENABLED=true
 FOXGUARD_SESSION_SWEEP_INTERVAL_SECONDS=60
@@ -722,6 +825,8 @@ FOXGUARD_AGENT_DRY_RUN=true
 FOXGUARD_AGENT_MANAGE_ROUTES=true
 FOXGUARD_AGENT_MANAGE_DNS=$( [[ $DNS_ENABLED -eq 1 ]] && echo true || echo false )
 FOXGUARD_AGENT_DNS_DIR=$CONFDIR/dns
+FOXGUARD_AGENT_MANAGE_PROXY=$( [[ $PROXY_ENABLED -eq 1 ]] && echo true || echo false )
+FOXGUARD_AGENT_PROXY_DIR=$CONFDIR/proxy
 EOF
 chmod 0600 "$CONFDIR/agent.env"
 
@@ -788,6 +893,68 @@ if [[ $DNS_ENABLED -eq 1 ]]; then
   sed -i "s|/etc/foxguard/dns|$CONFDIR/dns|g; s|wg-quick@wg0.service|wg-quick@$WG_IF.service|" \
       /etc/systemd/system/foxguard-dns.service
   ok "foxguard-dns unit installed (started by the agent once it has a zone)"
+fi
+if [[ $PROXY_ENABLED -eq 1 ]]; then
+  # 0750: unlike dnsmasq, HAProxy reads its configuration, pattern files and
+  # certificates *before* dropping privileges, so nothing here needs to be
+  # world-readable. The private key in certs/ especially.
+  install -d -m 0750 "$CONFDIR/proxy" "$CONFDIR/proxy/maps" "$CONFDIR/proxy/certs"
+  # HAProxy refuses to start with an empty `crt` directory, and the agent cannot
+  # write a certificate. A self-signed one lets the proxy come up before ACME
+  # has ever run; certbot's deploy hook replaces it.
+  if ! compgen -G "$CONFDIR/proxy/certs/*.pem" >/dev/null; then
+    openssl req -x509 -newkey rsa:2048 -nodes -days 90 \
+      -subj "/CN=${PROXY_DOMAIN:-foxguard.invalid}" \
+      -addext "subjectAltName=DNS:${PROXY_DOMAIN:-foxguard.invalid},DNS:*.${PROXY_DOMAIN:-foxguard.invalid}" \
+      -keyout /tmp/fg-boot.key -out /tmp/fg-boot.crt >/dev/null 2>&1
+    cat /tmp/fg-boot.crt /tmp/fg-boot.key > "$CONFDIR/proxy/certs/bootstrap.pem"
+    rm -f /tmp/fg-boot.key /tmp/fg-boot.crt
+    chmod 0640 "$CONFDIR/proxy/certs/bootstrap.pem"
+    warn "a self-signed bootstrap certificate is in place -- browsers will refuse"
+    warn "it until certbot replaces it"
+  fi
+  render_unit "$SRC/agent/systemd/foxguard-proxy.service" /etc/systemd/system/foxguard-proxy.service
+  sed -i "s|/etc/foxguard/proxy|$CONFDIR/proxy|g; s|wg-quick@wg0.service|wg-quick@$WG_IF.service|" \
+      /etc/systemd/system/foxguard-proxy.service
+  ok "foxguard-proxy unit installed (started by the agent once it has a config)"
+
+  if [[ -n $ACME_CF_TOKEN ]]; then
+    install -d -m 0700 "$CONFDIR/proxy"
+    printf 'dns_cloudflare_api_token = %s\n' "$ACME_CF_TOKEN" > "$CONFDIR/proxy/cloudflare.ini"
+    chmod 0600 "$CONFDIR/proxy/cloudflare.ini"
+    # The deploy hook is where the two halves meet: certbot writes fullchain
+    # and privkey separately, HAProxy wants them concatenated in one file, and
+    # the Runtime API loads it without a reload so passthrough sessions survive.
+    cat > /usr/local/bin/foxguard-cert-deploy <<'HOOKEOF'
+#!/bin/bash
+# Installed by foxguard-install.sh. Runs after every certbot renewal.
+set -euo pipefail
+CERTS=__CERTS__
+SOCK=/run/foxguard/haproxy.sock
+for live in /etc/letsencrypt/live/*/; do
+  [[ -f "$live/fullchain.pem" ]] || continue
+  name=$(basename "$live")
+  cat "$live/fullchain.pem" "$live/privkey.pem" > "$CERTS/$name.pem.new"
+  chmod 0640 "$CERTS/$name.pem.new"
+  mv "$CERTS/$name.pem.new" "$CERTS/$name.pem"
+  # Push it live without a reload. The file above is what makes it survive the
+  # next reload -- a runtime commit alone reverts to whatever is on disk.
+  if [[ -S $SOCK ]]; then
+    { printf 'set ssl cert %s <<\n' "$CERTS/$name.pem"; cat "$CERTS/$name.pem"; printf '\n\n'; } | socat stdio "$SOCK" >/dev/null 2>&1 || true
+    printf 'commit ssl cert %s\n' "$CERTS/$name.pem" | socat stdio "$SOCK" >/dev/null 2>&1 || true
+  fi
+done
+HOOKEOF
+    sed -i "s|__CERTS__|$CONFDIR/proxy/certs|" /usr/local/bin/foxguard-cert-deploy
+    chmod 0755 /usr/local/bin/foxguard-cert-deploy
+    ok "certbot deploy hook installed at /usr/local/bin/foxguard-cert-deploy"
+    say "  request the wildcard with:"
+    say "    certbot certonly --dns-cloudflare \\"
+    say "      --dns-cloudflare-credentials $CONFDIR/proxy/cloudflare.ini \\"
+    say "      -d '$PROXY_DOMAIN' -d '*.$PROXY_DOMAIN' \\"
+    say "      --email $ACME_EMAIL --agree-tos --non-interactive \\"
+    say "      --deploy-hook /usr/local/bin/foxguard-cert-deploy"
+  fi
 fi
 [[ $SKIP_FRONTEND -eq 0 ]] && \
   render_unit "$SRC/frontend/admin/systemd/foxguard-dashboard.service" \

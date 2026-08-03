@@ -25,7 +25,7 @@ PrivateTmp=yes
 # agent writes has to be named here. /etc/foxguard/dns is where it renders the
 # resolver's zone; without it DNS reconciliation fails with EROFS on a box where
 # everything else works.
-ReadWritePaths=/var/lib/foxguard /etc/foxguard/dns
+ReadWritePaths=/var/lib/foxguard /etc/foxguard/dns /etc/foxguard/proxy /run/foxguard
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes

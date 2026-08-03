@@ -24,9 +24,10 @@ from types import FrameType
 import httpx
 from foxguard.nftables.applier import NftApplier, NftError
 
-from .client import ControlPlaneClient, DesiredState, DnsState
+from .client import ControlPlaneClient, DesiredState, DnsState, ProxyState
 from .config import AgentSettings, get_agent_settings
 from .dns import DnsApplier, DnsError
+from .proxy import ProxyApplier, ProxyError
 from .routes import RouteApplier, RouteError
 from .wireguard import WireGuardError, WireGuardManager
 
@@ -45,6 +46,7 @@ class Applied:
 
     ruleset: str | None = None
     dns: str | None = None
+    proxy: str | None = None
 
 
 def _stop(signum: int, _frame: FrameType | None) -> None:
@@ -125,12 +127,33 @@ def reconcile_dns(
     return None
 
 
+def reconcile_proxy(
+    proxy: ProxyState, applier: ProxyApplier, *, dry_run: bool
+) -> str | None:
+    """Apply one proxy configuration. Returns an error message, or None."""
+    try:
+        if dry_run:
+            applier.check(proxy.conf, proxy.files)
+            logger.info(
+                "dry run: proxy configuration %s validated, not applied",
+                proxy.digest[:12],
+            )
+        else:
+            action = applier.apply(proxy.conf, proxy.files)
+            logger.info("proxy configuration %s %s", proxy.digest[:12], action)
+    except ProxyError as exc:
+        logger.error("proxy reconciliation failed: %s", exc)
+        return str(exc)
+    return None
+
+
 def run_once(
     client: ControlPlaneClient,
     applier: NftApplier,
     wireguard_for: Callable[[str], WireGuardManager | None],
     router_for: Callable[[str], RouteApplier | None],
     dns_applier: DnsApplier | None,
+    proxy_applier: ProxyApplier | None,
     settings: AgentSettings,
     applied: Applied,
 ) -> Applied:
@@ -169,7 +192,21 @@ def run_once(
         dns_error = reconcile_dns(state.dns, dns_applier, dry_run=settings.dry_run)
         dns_digest = applied.dns if dns_error else state.dns.digest
 
-    if ruleset_changed or dns_changed:
+    proxy_error: str | None = None
+    proxy_digest = applied.proxy
+    proxy_changed = False
+    if (
+        proxy_applier is not None
+        and state.proxy is not None
+        and state.proxy.digest != applied.proxy
+    ):
+        proxy_changed = True
+        proxy_error = reconcile_proxy(
+            state.proxy, proxy_applier, dry_run=settings.dry_run
+        )
+        proxy_digest = applied.proxy if proxy_error else state.proxy.digest
+
+    if ruleset_changed or dns_changed or proxy_changed:
         try:
             client.report(
                 state.digest,
@@ -177,11 +214,13 @@ def run_once(
                 error=ruleset_error,
                 dns_digest=state.dns.digest if state.dns else None,
                 dns_error=dns_error,
+                proxy_digest=state.proxy.digest if state.proxy else None,
+                proxy_error=proxy_error,
             )
         except httpx.HTTPError as exc:
             logger.warning("could not report back to the control plane: %s", exc)
 
-    return Applied(ruleset=ruleset_digest, dns=dns_digest)
+    return Applied(ruleset=ruleset_digest, dns=dns_digest, proxy=proxy_digest)
 
 
 def main() -> int:
@@ -217,6 +256,19 @@ def main() -> int:
         else None
     )
 
+    proxy_applier = (
+        ProxyApplier(
+            conf_path=settings.proxy_conf_path,
+            maps_dir=settings.proxy_maps_dir,
+            runtime_socket=settings.proxy_runtime_socket,
+            haproxy_path=settings.haproxy_path,
+            systemctl_path=settings.systemctl_path,
+            service=settings.proxy_service,
+        )
+        if settings.manage_proxy
+        else None
+    )
+
     applied = Applied()
     managers: dict[str, WireGuardManager] = {}
     routers: dict[str, RouteApplier] = {}
@@ -243,11 +295,12 @@ def main() -> int:
         return routers[interface]
 
     logger.info(
-        "foxguard agent starting (api=%s, dry_run=%s, dns=%s, routes=%s)",
+        "foxguard agent starting (api=%s, dry_run=%s, dns=%s, routes=%s, proxy=%s)",
         settings.api_url,
         settings.dry_run,
         "on" if dns_applier else "off",
         "on" if settings.manage_routes else "off",
+        "on" if proxy_applier else "off",
     )
     while _running:
         try:
@@ -257,6 +310,7 @@ def main() -> int:
                 wireguard_for,
                 router_for,
                 dns_applier,
+                proxy_applier,
                 settings,
                 applied,
             )

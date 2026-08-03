@@ -43,7 +43,7 @@ from ..dns import (
     render_conf,
     render_hosts,
 )
-from ..models import DnsRecord, Peer
+from ..models import DnsRecord, Peer, Service
 from ..nftables import PeerState
 
 logger = logging.getLogger(__name__)
@@ -72,6 +72,25 @@ def qualify(name: str, zone: str) -> str:
     if trimmed == zone or trimmed.endswith(f".{zone}"):
         return trimmed
     return f"{trimmed}.{zone}"
+
+
+def _service_names(session: Session, settings: Settings) -> list[str]:
+    """Internal host names of services that currently have an internal door.
+
+    Imported lazily: ``services.proxy`` imports this module for nothing, but
+    the reverse dependency would be a cycle at import time.
+    """
+    from . import proxy as proxy_service
+
+    services = (
+        session.execute(select(Service).order_by(Service.slug)).scalars().all()
+    )
+    names = []
+    for service in services:
+        doors = proxy_service.doors_for(service, settings)
+        if doors and doors.has_internal and service.internal_hostname:
+            names.append(service.internal_hostname.lower())
+    return names
 
 
 def build_spec(session: Session, settings: Settings) -> DnsSpec:
@@ -109,6 +128,20 @@ def build_spec(session: Session, settings: Settings) -> DnsSpec:
         for address in (peer.tunnel_ip, peer.tunnel_ip6):
             if address:
                 add(str(address), name, peer.peer_type.value)
+
+    # Published services resolve to the *gateway*, not to the peer behind them:
+    # the proxy is the destination. This is what makes split-horizon work -- a
+    # connected peer resolving ``app.example.com`` gets the tunnel address and
+    # never leaves the tunnel, while everyone else gets the public record and
+    # arrives on the WAN listener.
+    #
+    # These names live under ``proxy_domain``, not under ``dns_zone``, so they
+    # are added fully qualified rather than through ``qualify``. Measured
+    # against dnsmasq 2.91: a hosts-file entry outside ``local=/zone/`` is
+    # still answered, in both resolver modes, so the two namespaces coexist.
+    if settings.proxy_enabled:
+        for hostname in _service_names(session, settings):
+            add(settings.gateway_ip, hostname, "published service")
 
     records = (
         session.execute(

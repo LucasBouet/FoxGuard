@@ -8,13 +8,23 @@ Keeping it thin means the generator stays testable in isolation, and that
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session, selectinload
 
 from ..config import Settings
-from ..models import AclRule, Group, GroupKind, Peer, RulesetStatus, RulesetVersion
+from ..models import (
+    AclRule,
+    Group,
+    GroupKind,
+    Peer,
+    RulesetStatus,
+    RulesetVersion,
+    Service,
+    ServiceExposure,
+)
 from ..nftables import (
     Endpoint,
     EndpointKind,
@@ -66,6 +76,26 @@ def _endpoint(kind: EndpointKind, group: Group | None, cidr: str | None) -> Endp
     return Endpoint.any_()
 
 
+def _proxy_ports(session: Session, settings: Settings) -> tuple[int, ...]:
+    """Tunnel-side listener ports, deduplicated and sorted."""
+    ports = {settings.proxy_internal_https_port}
+    rows = (
+        session.execute(
+            select(Service).where(
+                Service.enabled.is_(True),
+                Service.listen_port.is_not(None),
+                Service.exposure.in_(
+                    (ServiceExposure.INTERNAL, ServiceExposure.BOTH)
+                ),
+            )
+        )
+        .scalars()
+        .all()
+    )
+    ports.update(row.listen_port for row in rows if row.listen_port)
+    return tuple(sorted(ports))
+
+
 def build_spec(session: Session, settings: Settings) -> RulesetSpec:
     """Build the full dataplane spec from current database state."""
     rows = (
@@ -94,8 +124,16 @@ def build_spec(session: Session, settings: Settings) -> RulesetSpec:
         .all()
     )
 
+    # Ports the proxy binds on the tunnel side. Needed here rather than in
+    # ``Settings.gateway_spec`` because plain-TCP services each own a port and
+    # that is a database fact. Only consulted when the input policy is
+    # RESTRICTED, where the chain ends in a drop.
+    gateway = settings.gateway_spec()
+    if settings.proxy_enabled:
+        gateway = replace(gateway, proxy_ports=_proxy_ports(session, settings))
+
     return RulesetSpec(
-        gateway=settings.gateway_spec(),
+        gateway=gateway,
         groups=tuple(
             GroupSpec(slug=group.slug, internet_exit=group.internet_exit)
             for group in groups

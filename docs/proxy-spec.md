@@ -4,9 +4,29 @@ Everything needed to build the reverse proxy without re-deriving the design.
 Written to be read cold by someone (or some session) with no memory of the
 conversation that produced it.
 
-Nothing here is built yet. Sections marked **DECIDED** are settled and should
-not be reopened without a reason; sections marked **OPEN** need an answer before
-the code that depends on them is written.
+> **Built.** This document is the plan; `docs/architecture.md` §19 is the record
+> of what exists and why. Batch 1 shipped in full. Three things changed while
+> building it, each because running the code said so:
+>
+> * **A service and its policy are created in one request.** §5.2's rule refuses
+>   a listener with no applicable authenticator — which made a two-step creation
+>   impossible, because the first step would always be refused. Found by the e2e
+>   suite on its first run. `ServiceCreate` now carries `authenticators`,
+>   `filters` and `access`.
+> * **sha-512-crypt rounds are pinned at 5000, not passlib's default.** HAProxy
+>   re-verifies on every request; measured, 656000 rounds costs 267 ms per
+>   request — a 3 req/s ceiling. Python 3.13 also removed the stdlib `crypt`
+>   module, so `passlib` is a new dependency.
+> * **Bearer tokens are stored unsalted**, which §5.5 did not say. They have to
+>   be: HAProxy computes `sha2(256)` over the presented token and looks it up in
+>   a map, and there is no way to hand it a salt.
+>
+> §18's open questions are still open, except the first: TLS-wrapped TCP
+> passthrough does not share `:443`. Each passthrough service gets its own port.
+
+Sections marked **DECIDED** are settled and should not be reopened without a
+reason; sections marked **OPEN** need an answer before the code that depends on
+them is written.
 
 ---
 
@@ -627,23 +647,34 @@ What Phase 5 established about this container: `CAP_NET_ADMIN` yes,
 `CAP_SYS_ADMIN` no, so the wireguard module and `nft` work but network
 namespaces do not. That shapes what can be proved here.
 
-### 16.1 Measure before writing code
+### 16.1 Measured before writing code — RESULTS
 
-These determine the design and must not be assumed:
+All seven were run against real HAProxy 3.0.11 and dnsmasq 2.91 in the dev
+container before any code was written. Two extra findings fell out.
 
-1. Does `systemctl reload haproxy` on Debian 13 keep an in-flight connection
-   alive? Measure with a long-lived TCP connection open across the reload, and
-   compare PIDs.
-2. Does `haproxy -c` fail when a referenced map or ACL file is missing? This
-   decides the write ordering in the applier.
-3. **Does a Runtime API map update survive a reload?** Expected: no. If
-   confirmed, the applier must always write the file as well.
-4. Same question for `commit ssl cert`.
-5. Does `http-request auth` accept `$6$` sha-512-crypt on this build?
-6. Does dnsmasq still answer hosts-file entries for names outside `local=/zone/`
-   in `split` mode? This is what makes split-horizon work with the existing DNS
-   feature, and §3.9 depends on the answer.
-7. Is `jwt_verify` present in HAProxy 3.0.11 (needed for phase C).
+| # | Question | Result |
+| --- | --- | --- |
+| M1 | Does a reload keep an in-flight connection alive? | **Yes.** A 6-second response with the reload fired at t+2s completed with 200, and a new request during the drain also got 200. Master PID unchanged, workers rotated. |
+| M2 | Does `haproxy -c` fail on a missing map/ACL file? | **Yes** — `failed to open pattern file`. Maps must be written *before* validation. |
+| M3 | Does a Runtime API map update survive a reload? | **No.** `add map` took effect immediately (200) and was gone after reload (403), while the on-disk entry survived. |
+| M4 | Does `commit ssl cert` survive a reload? | **No.** Same shape: live immediately, reverts to the on-disk certificate on reload. |
+| M5 | Does a `userlist` accept `$6$` sha-512-crypt? | **Yes** — 401 / 200 / 401 for no, good and wrong credentials. |
+| M6 | Does dnsmasq answer hosts entries outside `local=/zone/` in `split` mode? | **Yes.** `app.example.com` answered NOERROR from the hosts file while `local=/fox.internal/` was in force; an *unknown* out-of-zone name got REFUSED and an unknown in-zone name got NXDOMAIN. Split-horizon therefore works in both resolver modes. |
+| M7 | Is `jwt_verify` present in 3.0.11? | **Yes.** |
+
+**M3 and M4 together give the applier's central rule:** every runtime update must
+be accompanied by a write of the same change to disk, or the next reload
+silently reverts it. Never one without the other.
+
+**Extra finding 1 — `hex` outputs UPPERCASE.** `req.hdr(authorization),…,sha2(256),hex`
+yields `F52FBD…`, while `hashlib.sha256().hexdigest()` and `sha256sum` yield
+`f52fbd…`. Without `,lower` appended to the converter chain, no bearer token
+would ever have matched, and the failure mode is a silent 403. The rendered map
+keeps the project's normal lowercase-hex convention and the config lowercases.
+
+**Extra finding 2 — the stats socket path is capped at 97 characters.**
+`socket path '…' too long (max 97)` is a hard parse error.
+`/run/foxguard/haproxy.sock` is comfortably inside it; long test paths are not.
 
 ### 16.2 Testable here, against real software
 

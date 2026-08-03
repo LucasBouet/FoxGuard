@@ -29,6 +29,19 @@ class DnsState:
 
 
 @dataclass(frozen=True, slots=True)
+class ProxyState:
+    digest: str
+    conf: str
+    conf_path: str
+    maps_dir: str
+    certs_dir: str
+    runtime_socket: str
+    #: Pattern files the configuration references, keyed by base name. They
+    #: travel with it because ``haproxy -c`` resolves ``-f`` at parse time.
+    files: dict[str, str]
+
+
+@dataclass(frozen=True, slots=True)
 class DesiredState:
     digest: str
     ruleset: str
@@ -39,6 +52,9 @@ class DesiredState:
     #: ``None`` when DNS is off, or when the control plane could not render a
     #: valid zone. Both mean "leave the resolver alone".
     dns: DnsState | None = None
+    #: ``None`` when the proxy is off, or when the control plane could not
+    #: render a valid configuration. Both mean "leave the proxy alone".
+    proxy: ProxyState | None = None
 
 
 class ControlPlaneClient:
@@ -58,6 +74,7 @@ class ControlPlaneClient:
         # .get, not [], for dns: an agent may poll a control plane that predates
         # this field, and the agent is the component that gets upgraded last.
         dns = payload.get("dns")
+        proxy = payload.get("proxy")
         return DesiredState(
             digest=payload["digest"],
             ruleset=payload["ruleset"],
@@ -74,6 +91,7 @@ class ControlPlaneClient:
                 for route in payload.get("routes", [])
             ),
             dns=DnsState(**dns) if dns else None,
+            proxy=ProxyState(**proxy) if proxy else None,
         )
 
     def report(
@@ -84,6 +102,8 @@ class ControlPlaneClient:
         error: str | None = None,
         dns_digest: str | None = None,
         dns_error: str | None = None,
+        proxy_digest: str | None = None,
+        proxy_error: str | None = None,
     ) -> None:
         response = self._client.post(
             "/api/v1/agent/report",
@@ -93,6 +113,8 @@ class ControlPlaneClient:
                 "error": error,
                 "dns_digest": dns_digest,
                 "dns_error": dns_error,
+                "proxy_digest": proxy_digest,
+                "proxy_error": proxy_error,
             },
         )
         response.raise_for_status()

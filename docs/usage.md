@@ -360,6 +360,61 @@ hold no session.
 
 ---
 
+## Publishing a service
+
+A service lives behind a peer and the gateway fronts it. Two shapes:
+
+* **HTTP** — the proxy terminates TLS, so it can check a token, inject who the
+  caller is, and later run a WAF. `grafana.example.com` reaches a dashboard on
+  a NAS without that NAS being exposed to anything.
+* **TCP passthrough** — the bytes go through untouched. SSH, RDP, Postgres. The
+  proxy cannot see inside, so it cannot check anything above layer 4.
+
+**Services > New.** Pick the peer, the address and port behind it, and how it is
+reached. If the address is on a network the peer routes for (a zone route),
+Foxguard checks that before saving — publishing `192.168.10.50` when nothing
+routes there fails as a timeout otherwise, which is the least diagnosable thing
+in the system.
+
+**Who gets in is per door.** Inside the tunnel, the source address is proof of
+which device sent the packet, so "peer identity" plus a group is usually enough
+and costs nothing. From the internet, that proves nothing at all, so pick a
+bearer token or a service account. The form will not let you save peer identity
+on the external door.
+
+**One name, both doors.** With the internal resolver on, a connected laptop
+typing `grafana.example.com` resolves it to the tunnel and never leaves it;
+anyone else reaches your public address. Same URL, different path, different
+policy.
+
+**Tokens and passwords are shown once.** Copy them then. Foxguard stores a hash
+and cannot show you the value again — revoke and issue a new one instead.
+
+**Publishing opens a path your ACLs do not cover.** The proxy connects from the
+gateway, which no zone or group rule constrains. The service page lists that
+path, and so does the healthcheck. It is scoped to exactly the address and port
+you declared, but it is worth seeing.
+
+### Letting people sign in
+
+Tick **Foxguard sign-in** as the way in and the service stops asking for a token
+and starts asking for a person. Someone who is not signed in is sent to
+`auth.<your domain>`, uses the account they already have (password, and TOTP if
+they have it), and comes back. One sign-in covers every service — the cookie is
+scoped to the whole domain.
+
+The upstream is told who it is talking to in `X-Foxguard-User`. Anything the
+caller sent under that name is thrown away first, so it cannot be lied to.
+
+**Signing someone out is immediate.** Services > SSO sessions lists who is
+signed in and from where; revoking one takes effect on the agent's next poll,
+without restarting anything. That matters because the cookie itself stays
+perfectly valid-looking — it is the revocation list that stops it.
+
+One limitation worth knowing now: an SSO service admits **any active Foxguard
+account**. Groups belong to devices, not to people, so there is nothing finer to
+filter on yet.
+
 ## What your users see
 
 One page, at the portal address. It tells them which device this is, and offers
@@ -436,3 +491,13 @@ nft -j list table inet foxguard | jq '.nftables[] | select(.rule.comment)'
 ```
 
 And every state change is in **Audit log**, attributed to whoever made it.
+| A service will not save | The message says which check failed. Most often: the upstream is on a network no peer routes to, or the external door has no authenticator that works there |
+| A service returns 503 | The device hosting it is not reachable. The error page names it. Check the peer is `active` — a quarantined or disabled one is not served |
+| A bearer token returns 403 | It was revoked, or you are hitting the internal door where the token is not one of the authenticators. Check the scope on the service page |
+| A browser refuses the certificate | The bootstrap certificate is self-signed. Run the `certbot certonly` command the installer printed; renewals load themselves after that |
+| Renewals stopped working | `FOXGUARD_DNS_MODE=split` with a zone covering the proxy domain answers NXDOMAIN for `_acme-challenge`. The healthcheck says so explicitly |
+| A TCP service has no port | Plain TCP cannot share one. Foxguard allocates from 20000–20999; widen the range if it is full |
+| The proxy will not start | `haproxy -c -f /etc/foxguard/proxy/haproxy.cfg` says why. An empty `certs/` directory is the usual cause |
+| Sign-in loops back to the login page | The cookie is being set on a different domain than the service. `FOXGUARD_PROXY_DOMAIN` must be the parent of both |
+| "that destination is not a published service" | The service the browser came from is not published, or its peer is down. Only published names are accepted, otherwise the login page would be an open redirect |
+| Someone is still in after being revoked | The agent has not polled yet. It pushes the revocation list without a reload, so this is one poll interval at most |

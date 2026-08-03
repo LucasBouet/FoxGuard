@@ -19,6 +19,7 @@ from ...models import ActorType, Peer, RulesetStatus, RulesetVersion, ZoneRoute
 from ...nftables import PeerState, ruleset_digest
 from ...schemas import (
     AgentDnsState,
+    AgentProxyState,
     AgentReport,
     AgentRoute,
     AgentStateResponse,
@@ -26,6 +27,7 @@ from ...schemas import (
 )
 from ...services import audit
 from ...services import dns as dns_service
+from ...services import proxy as proxy_service
 from ...services import ruleset as ruleset_service
 from ..deps import client_ip, require_agent
 
@@ -116,6 +118,23 @@ def get_state(
         else None
     )
 
+    # Same contract as the DNS block above, for the same reason: a
+    # hand-authored proxy rule must not be able to stop firewall rules.
+    proxied = proxy_service.render_or_none(session, settings)
+    proxy_state = (
+        AgentProxyState(
+            digest=proxied[2],
+            conf=proxied[0],
+            files=proxied[1],
+            conf_path=settings.proxy_conf_path,
+            maps_dir=settings.proxy_maps_dir,
+            certs_dir=settings.proxy_certs_dir,
+            runtime_socket=settings.proxy_runtime_socket,
+        )
+        if proxied
+        else None
+    )
+
     return AgentStateResponse(
         digest=ruleset_digest(content),
         ruleset=content,
@@ -127,6 +146,7 @@ def get_state(
             if route.via_peer_id in present
         ],
         dns=dns_state,
+        proxy=proxy_state,
     )
 
 

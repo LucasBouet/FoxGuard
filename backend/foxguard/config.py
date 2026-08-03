@@ -19,6 +19,7 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from .clientconfig import AllowedIpsMode, join_endpoint
 from .dns.model import NAME_RE, DnsSpec, ResolverMode
 from .nftables.model import GatewayInputPolicy, GatewaySpec
+from .proxy.model import ProxySpec
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +142,75 @@ class Settings(BaseSettings):
     #: each entry must be a single ``name`` or ``name=value`` line.
     dns_extra_options: Annotated[list[str], NoDecode] = Field(default_factory=list)
 
+    # --- reverse proxy (Phase 6) -------------------------------------------
+    #: Off by default, like the resolver: turning it on makes the gateway
+    #: terminate traffic from strangers, which an existing deployment did not
+    #: ask for.
+    proxy_enabled: bool = False
+    #: The real domain services live under. Peer names stay on ``dns_zone``
+    #: (``laptop.fox.internal``); services need a name a public CA will sign,
+    #: which ``.internal`` can never be. Two namespaces, no collision.
+    proxy_domain: str | None = None
+    #: Tunnel addresses the internal listener binds. Defaults to the gateway's
+    #: own tunnel address. This is the *only* listener on which a source
+    #: address is an identity.
+    proxy_internal_binds: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    #: WAN addresses the external listener binds. Empty means no external
+    #: exposure is possible, and a service asking for it is refused.
+    proxy_external_binds: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    proxy_internal_https_port: int = Field(default=443, ge=1, le=65535)
+    proxy_external_https_port: int = Field(default=443, ge=1, le=65535)
+    #: Plain HTTP on the WAN exists only to redirect. ACME uses DNS-01, so
+    #: nothing is ever served here.
+    proxy_external_http_port: int = Field(default=80, ge=1, le=65535)
+    #: Range plain-TCP services are allocated a dedicated port from. Plain TCP
+    #: has neither SNI nor a Host header, so it cannot share one.
+    proxy_tcp_port_start: int = Field(default=20000, ge=1, le=65535)
+    proxy_tcp_port_end: int = Field(default=20999, ge=1, le=65535)
+
+    proxy_conf_path: str = "/etc/foxguard/proxy/haproxy.cfg"
+    proxy_certs_dir: str = "/etc/foxguard/proxy/certs"
+    proxy_maps_dir: str = "/etc/foxguard/proxy/maps"
+    #: HAProxy caps a stats socket path at 97 characters -- measured, it is a
+    #: fatal parse error rather than a warning.
+    proxy_runtime_socket: str = "/run/foxguard/haproxy.sock"
+
+    proxy_hsts_max_age: int = Field(default=31536000, ge=0)
+    #: Hands every upstream the names of every group the caller belongs to.
+    #: Off by default because that is more than most upstreams need to know.
+    proxy_send_group_header: bool = False
+    #: The kill switch stops internal services by default and leaves external
+    #: ones serving. Worth knowing: it disables *peers*, so an upstream behind
+    #: a disabled peer stops answering either way -- this only really changes
+    #: behaviour for services the gateway hosts itself.
+    proxy_killswitch_stops_internal: bool = True
+    proxy_killswitch_stops_external: bool = False
+
+    proxy_connect_timeout_seconds: int = Field(default=5, ge=1)
+    proxy_client_timeout_seconds: int = Field(default=60, ge=1)
+    proxy_server_timeout_seconds: int = Field(default=60, ge=1)
+    #: Long on purpose: a passthrough session is often a shell someone is
+    #: typing in, and a short tunnel timeout would drop it mid-command.
+    proxy_tunnel_timeout_seconds: int = Field(default=3600, ge=1)
+    #: Raw HAProxy stanzas, appended verbatim. Same escape hatch as
+    #: ``dns_extra_options`` and the same rule: one line each.
+    proxy_extra_options: Annotated[list[str], NoDecode] = Field(default_factory=list)
+
+    # --- single sign-on for published services (Phase 7c) -------------------
+    #: Signs the session cookie. The proxy verifies with the same value, so it
+    #: is rendered into the HAProxy configuration -- which is why that file is
+    #: 0640 root:haproxy and why rotating this signs everybody out.
+    proxy_sso_secret: SecretStr | None = None
+    proxy_sso_cookie_name: str = "fg_sso"
+    #: How long a browser session lasts. Short by default: the proxy verifies
+    #: the token on its own, so an unrevoked one stays good until it expires,
+    #: and the revocation list is the only thing that shortens it.
+    proxy_sso_lifetime_seconds: int = Field(default=8 * 3600, ge=60)
+    #: Host name the login page answers on. Defaults to ``auth.<proxy_domain>``.
+    #: This vhost is the ONLY place the proxy is ever put in front of the
+    #: Foxguard API, and only ``/api/v1/sso/`` is routed there.
+    proxy_sso_hostname: str | None = None
+
     # --- client configuration (Phase 6) ------------------------------------
     #: What a generated client config puts in ``AllowedIPs``. See
     #: :class:`~foxguard.clientconfig.AllowedIpsMode`.
@@ -213,6 +283,9 @@ class Settings(BaseSettings):
         "dns_listen_addresses",
         "dns_extra_options",
         "client_config_extra_allowed_ips",
+        "proxy_internal_binds",
+        "proxy_external_binds",
+        "proxy_extra_options",
         mode="before",
     )
     @classmethod
@@ -495,6 +568,72 @@ class Settings(BaseSettings):
             stop_dns_rebind=self.dns_stop_dns_rebind,
             log_queries=self.dns_log_queries,
             extra_options=tuple(self.dns_extra_options),
+        )
+
+    @property
+    def proxy_sso_secret_value(self) -> str:
+        return (
+            self.proxy_sso_secret.get_secret_value() if self.proxy_sso_secret else ""
+        )
+
+    @property
+    def proxy_sso_host(self) -> str | None:
+        """Where the login page lives.
+
+        A subdomain of the proxy domain, so the wildcard certificate already
+        covers it and the cookie can be scoped to the parent domain -- which is
+        what makes one sign-in work across every published service.
+        """
+        if self.proxy_sso_hostname:
+            return self.proxy_sso_hostname
+        return f"auth.{self.proxy_domain}" if self.proxy_domain else None
+
+    @property
+    def proxy_internal_listen(self) -> tuple[str, ...]:
+        """Tunnel addresses the internal listener binds.
+
+        Defaults to the gateway's own tunnel address, and anything outside the
+        tunnel pools is dropped: the guarantee that makes ``peer_identity``
+        sound is that the packet arrived on ``wg0``, so a listener bound
+        anywhere else would hand out the same identity for a source address
+        that proves nothing.
+        """
+        if self.proxy_internal_binds:
+            return tuple(
+                address
+                for address in self.proxy_internal_binds
+                if self.is_tunnel_address(address)
+            )
+        return (self.gateway_ip,)
+
+    def proxy_base_spec(self) -> ProxySpec:
+        """Project settings onto a proxy spec with no services in it yet.
+
+        ``services/proxy.py`` fills in the services, source sets and peers,
+        exactly as ``services/dns.py`` fills in hosts and aliases.
+        """
+        return ProxySpec(
+            domain=self.proxy_domain or "",
+            internal_binds=self.proxy_internal_listen,
+            external_binds=tuple(self.proxy_external_binds),
+            internal_https_port=self.proxy_internal_https_port,
+            external_http_port=self.proxy_external_http_port,
+            external_https_port=self.proxy_external_https_port,
+            certs_dir=self.proxy_certs_dir,
+            maps_dir=self.proxy_maps_dir,
+            runtime_socket=self.proxy_runtime_socket,
+            hsts_max_age=self.proxy_hsts_max_age,
+            send_group_header=self.proxy_send_group_header,
+            sso_secret=self.proxy_sso_secret_value,
+            sso_cookie=self.proxy_sso_cookie_name,
+            sso_hostname=self.proxy_sso_host,
+            sso_cookie_domain=self.proxy_domain or "",
+            sso_api_port=self.portal_port,
+            connect_timeout_seconds=self.proxy_connect_timeout_seconds,
+            client_timeout_seconds=self.proxy_client_timeout_seconds,
+            server_timeout_seconds=self.proxy_server_timeout_seconds,
+            tunnel_timeout_seconds=self.proxy_tunnel_timeout_seconds,
+            extra_options=tuple(self.proxy_extra_options),
         )
 
     def gateway_spec(self) -> GatewaySpec:

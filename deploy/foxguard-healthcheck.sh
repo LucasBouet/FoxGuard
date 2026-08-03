@@ -378,6 +378,113 @@ else
 fi
 
 # --------------------------------------------------------------------------- #
+section "Reverse proxy"
+
+if [[ ${FOXGUARD_PROXY_ENABLED:-false} != true ]]; then
+  ok "the reverse proxy is off"
+else
+  PROXY_DOMAIN=${FOXGUARD_PROXY_DOMAIN:-}
+  CERTS=${FOXGUARD_PROXY_CERTS_DIR:-/etc/foxguard/proxy/certs}
+  if systemctl is-active --quiet foxguard-proxy 2>/dev/null; then
+    ok "foxguard-proxy is running"
+  else
+    bad "foxguard-proxy is not running (journalctl -u foxguard-proxy -n 30)"
+  fi
+
+  if [[ -n $PROXY_DOMAIN ]]; then
+    ok "services are published under $PROXY_DOMAIN"
+  else
+    bad "FOXGUARD_PROXY_DOMAIN is unset: services have no name a CA will sign"
+  fi
+
+  # The internal zone must not swallow the certificate domain in split mode:
+  # _acme-challenge would come back NXDOMAIN and renewals would stop.
+  if [[ ${FOXGUARD_DNS_ENABLED:-false} == true && ${FOXGUARD_DNS_MODE:-forward} == split \
+        && -n $PROXY_DOMAIN && $PROXY_DOMAIN == *"${FOXGUARD_DNS_ZONE:-fox.internal}" ]]; then
+    bad "the DNS zone covers $PROXY_DOMAIN and the resolver is in split mode:"
+    bad "certbot's _acme-challenge lookup will get NXDOMAIN and renewals will fail"
+  fi
+
+  # The proxy binds the tunnel address, and only the tunnel address. This is
+  # the listener on which a source address counts as an identity.
+  INT_BIND=${FOXGUARD_PROXY_INTERNAL_BINDS:-}
+  EXT_BIND=${FOXGUARD_PROXY_EXTERNAL_BINDS:-}
+  # $4 is "Local Address:Port" -- not $5, which is Peer.
+  TCP_LISTENERS=$(ss -ltn 2>/dev/null | awk 'NR>1 {print $4}')
+  if [[ -z $EXT_BIND ]]; then
+    ok "no external listener configured (tunnel-side only)"
+  else
+    ok "external listener on $EXT_BIND"
+  fi
+  if [[ -n $INT_BIND ]] && grep -q "$INT_BIND:" <<<"$TCP_LISTENERS"; then
+    ok "the internal listener is bound to $INT_BIND"
+  elif [[ -n $INT_BIND ]]; then
+    warn "nothing is listening on $INT_BIND yet — the agent starts the proxy"
+    warn "once the control plane has a configuration to give it"
+  fi
+
+  # Certificates. A wildcard covering the whole domain is the highest-value
+  # secret on this box, so its permissions are a failure, not a note.
+  if [[ -d $CERTS ]] && compgen -G "$CERTS/*.pem" >/dev/null; then
+    for pem in "$CERTS"/*.pem; do
+      NAME=$(basename "$pem")
+      MODE=$(stat -c '%a' "$pem" 2>/dev/null || echo "?")
+      case $MODE in
+        640|600|440|400) ok "$NAME is mode $MODE" ;;
+        *) bad "$NAME is mode $MODE — a private key must not be world-readable" ;;
+      esac
+      NOT_AFTER=$(openssl x509 -in "$pem" -noout -enddate 2>/dev/null | cut -d= -f2)
+      if [[ -n $NOT_AFTER ]]; then
+        EXPIRY=$(date -d "$NOT_AFTER" +%s 2>/dev/null || echo 0)
+        DAYS=$(( (EXPIRY - $(date +%s)) / 86400 ))
+        SUBJECT=$(openssl x509 -in "$pem" -noout -subject 2>/dev/null)
+        if openssl x509 -in "$pem" -noout -issuer 2>/dev/null | grep -qi "CN=${PROXY_DOMAIN}"; then
+          warn "$NAME is self-signed — browsers will refuse it until certbot replaces it"
+        fi
+        if [[ $DAYS -lt 0 ]]; then
+          bad "$NAME expired $(( -DAYS )) day(s) ago"
+        elif [[ $DAYS -lt 14 ]]; then
+          bad "$NAME expires in $DAYS day(s) — renewal is not working"
+        else
+          ok "$NAME valid for $DAYS more day(s) (${SUBJECT#subject=})"
+        fi
+      fi
+    done
+  else
+    bad "no certificate in $CERTS — HAProxy cannot start with an empty crt directory"
+  fi
+
+  # The configuration the control plane wants, against what is on disk.
+  PROXY_STATE=$(api /api/v1/proxy 2>/dev/null || echo '{}')
+  WANT=$(jq -r '.digest // ""' <<<"$PROXY_STATE" 2>/dev/null)
+  SERVICES=$(jq -r '.service_count // 0' <<<"$PROXY_STATE" 2>/dev/null)
+  ok "${SERVICES} service(s) published"
+  jq -r '.warnings[]?' <<<"$PROXY_STATE" 2>/dev/null | while read -r line; do
+    [[ -n $line ]] && warn "$line"
+  done
+  PROXY_CONF=${FOXGUARD_PROXY_CONF_PATH:-/etc/foxguard/proxy/haproxy.cfg}
+  if [[ -n $WANT && -r $PROXY_CONF ]]; then
+    if command -v haproxy >/dev/null 2>&1; then
+      if haproxy -c -f "$PROXY_CONF" >/dev/null 2>&1; then
+        ok "the configuration on disk is valid"
+      else
+        bad "haproxy -c rejects $PROXY_CONF — the agent could not install a good one"
+      fi
+    fi
+  fi
+
+  # Publishing a service opens a gateway-to-upstream path the ACL model does
+  # not cover. Foxguard creates no output chain by design, so this is listed
+  # rather than enforced -- and listing it is the whole point.
+  PATHS=$(jq -r '.implicit_paths | length' <<<"$PROXY_STATE" 2>/dev/null || echo 0)
+  if [[ ${PATHS:-0} -gt 0 ]]; then
+    warn "$PATHS gateway->upstream path(s) exist outside the ACL model:"
+    jq -r '.implicit_paths[]? | "      \(.service): gateway -> \(.destination):\(.port)"' \
+      <<<"$PROXY_STATE" 2>/dev/null
+  fi
+fi
+
+# --------------------------------------------------------------------------- #
 section "Client configurations"
 
 # The dashboard builds client configs in the operator's browser, but it cannot

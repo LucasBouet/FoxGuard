@@ -2199,3 +2199,385 @@ def test_reading_a_profile_is_audited(api, tag):
         "/api/v1/audit-log", params={"action": "peer.config_profile.read"}
     ).json()
     assert any(entry["object_id"] == peer["id"] for entry in entries)
+
+
+# --------------------------------------------------------------------------- #
+# published services (Phase 6)
+# --------------------------------------------------------------------------- #
+
+
+def _service(api, tag: str, peer: dict, **extra) -> dict:
+    body = {
+        "slug": f"svc-{tag}",
+        "name": f"svc-{tag}",
+        "kind": "http",
+        "exposure": "internal",
+        "upstream_peer_id": peer["id"],
+        "upstream_host": peer["tunnel_ip"],
+        "upstream_port": 8080,
+        # A service and the way in are one request: a listener with no
+        # applicable authenticator is refused, so there is no valid two-step.
+        "authenticators": [{"kind": "peer_identity", "scope": "internal"}],
+    }
+    body.update(extra)
+    return api.post("/api/v1/services", json=body)
+
+
+def _active_peer(api, tag: str, **extra) -> dict:
+    """A peer the proxy will actually serve: only ``active`` counts."""
+    peer = _create_peer(api, tag, **extra)
+    response = api.patch(f"/api/v1/peers/{peer['id']}", json={"state": "active"})
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def test_a_service_is_created_and_gets_a_default_hostname(api, tag):
+    peer = _active_peer(api, tag)
+    response = _service(api, tag, peer)
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["internal_hostname"] == f"svc-{tag}.example.test"
+    # Internal only: no external name is invented for a door that does not exist.
+    assert body["external_hostname"] is None
+    assert body["active_doors"] == "internal"
+
+
+def test_an_upstream_no_peer_routes_to_is_refused(api, tag):
+    """The validator that turns a timeout into a message."""
+    peer = _active_peer(api, tag)
+    response = _service(api, tag, peer, upstream_host=_off_tunnel_ip(tag))
+    assert response.status_code == 422, response.text
+    assert "not reachable through" in response.text
+
+
+def test_a_service_pointing_at_the_portal_is_refused(api, tag):
+    """A proxy in front of the portal destroys the identity it runs on."""
+    peer = _active_peer(api, tag)
+    gateway = api.get("/api/v1/proxy").json()["internal_binds"][0]
+    response = _service(
+        api, tag, peer, upstream_host=gateway, upstream_port=8080, upstream_peer_id=None
+    )
+    assert response.status_code == 422, response.text
+    assert "source address" in response.text
+
+
+def test_a_slug_colliding_with_a_group_is_refused(api, tag):
+    group = _group(api, tag)
+    peer = _active_peer(api, tag)
+    response = _service(api, tag, peer, slug=group["slug"])
+    assert response.status_code == 409, response.text
+    assert "already a group" in response.text
+
+
+def test_a_plain_tcp_service_is_allocated_a_port(api, tag):
+    peer = _active_peer(api, tag)
+    response = _service(api, tag, peer, kind="tcp", upstream_port=22)
+    assert response.status_code == 201, response.text
+    port = response.json()["listen_port"]
+    assert port is not None
+
+    other = _service(api, f"{tag}b", peer, kind="tcp", upstream_port=22)
+    assert other.status_code == 201, other.text
+    assert other.json()["listen_port"] != port
+
+
+def test_a_service_with_no_authenticator_is_refused_at_creation(api, tag):
+    """A door Foxguard cannot describe is not opened.
+
+    Refused at creation rather than left to fail later, which is also why the
+    policy travels in the same request: there is no valid intermediate state
+    where the service exists and nothing guards it.
+    """
+    peer = _active_peer(api, tag)
+    created = _service(api, tag, peer, authenticators=[])
+    assert created.status_code == 422, created.text
+    assert "no authenticator" in created.text
+
+
+def test_peer_identity_scoped_externally_is_refused(api, tag):
+    peer = _active_peer(api, tag)
+    service = _service(api, tag, peer).json()
+    response = api.post(
+        f"/api/v1/services/{service['id']}/auth",
+        json={"kind": "peer_identity", "scope": "external"},
+    )
+    assert response.status_code == 422, response.text
+    assert "external listener" in response.text
+    api.delete(f"/api/v1/services/{service['id']}")
+
+
+def test_a_refused_authenticator_leaves_no_row_behind(api, tag):
+    """The Phase 5 stale-collection bug, guarded against in its new home.
+
+    A rejected child row that commits anyway poisons every later regeneration
+    anywhere in the application, so the check is that the *next* unrelated
+    write still works.
+    """
+    peer = _active_peer(api, tag)
+    service = _service(api, tag, peer).json()
+    api.post(
+        f"/api/v1/services/{service['id']}/auth",
+        json={"kind": "peer_identity", "scope": "internal"},
+    )
+
+    bad = api.post(
+        f"/api/v1/services/{service['id']}/auth",
+        json={"kind": "basic", "scope": "internal"},
+    )
+    assert bad.status_code == 422, bad.text
+
+    fetched = api.get(f"/api/v1/services/{service['id']}").json()
+    kinds = [row["kind"] for row in fetched["authenticators"]]
+    assert "basic" not in kinds, "a refused authenticator was committed anyway"
+
+    # And the ruleset still regenerates from an unrelated endpoint.
+    assert _group(api, f"{tag}after")["slug"].endswith(f"{tag}after")
+    api.delete(f"/api/v1/services/{service['id']}")
+
+
+def test_a_token_is_shown_once_and_lands_in_the_rendered_map(api, tag):
+    import hashlib
+
+    peer = _active_peer(api, tag)
+    service = _service(api, tag, peer).json()
+    api.post(
+        f"/api/v1/services/{service['id']}/auth",
+        json={"kind": "bearer", "scope": "internal"},
+    )
+    created = api.post(
+        f"/api/v1/services/{service['id']}/tokens", json={"name": "ci"}
+    )
+    assert created.status_code == 201, created.text
+    plaintext = created.json()["token"]
+
+    listed = api.get(f"/api/v1/services/{service['id']}/tokens").json()
+    assert all("token" not in row for row in listed)
+
+    digest = hashlib.sha256(plaintext.encode()).hexdigest()
+    files = api.get("/api/v1/proxy").json()["files"]
+    assert digest in files[f"tok_svc-{tag}.map"]
+    # Lowercase, because the rendered config lowercases before the lookup.
+    assert digest == digest.lower()
+    api.delete(f"/api/v1/services/{service['id']}")
+
+
+def test_revoking_a_token_removes_it_from_the_map(api, tag):
+    import hashlib
+
+    peer = _active_peer(api, tag)
+    service = _service(api, tag, peer).json()
+    api.post(
+        f"/api/v1/services/{service['id']}/auth",
+        json={"kind": "bearer", "scope": "internal"},
+    )
+    keep = api.post(f"/api/v1/services/{service['id']}/tokens", json={"name": "keep"})
+    drop = api.post(f"/api/v1/services/{service['id']}/tokens", json={"name": "drop"})
+    kept = hashlib.sha256(keep.json()["token"].encode()).hexdigest()
+    dropped = hashlib.sha256(drop.json()["token"].encode()).hexdigest()
+
+    assert api.delete(
+        f"/api/v1/services/{service['id']}/tokens/{drop.json()['id']}"
+    ).status_code == 204
+
+    body = api.get("/api/v1/proxy").json()["files"][f"tok_svc-{tag}.map"]
+    assert kept in body
+    assert dropped not in body
+    api.delete(f"/api/v1/services/{service['id']}")
+
+
+def test_a_service_account_password_is_generated_and_shown_once(api, tag):
+    peer = _active_peer(api, tag)
+    service = _service(api, tag, peer).json()
+    api.post(
+        f"/api/v1/services/{service['id']}/auth",
+        json={"kind": "basic", "scope": "internal", "realm": "x"},
+    )
+    created = api.post(
+        f"/api/v1/services/{service['id']}/accounts", json={"username": "svc"}
+    )
+    assert created.status_code == 201, created.text
+    password = created.json()["password"]
+    assert len(password) >= 24
+
+    listed = api.get(f"/api/v1/services/{service['id']}/accounts").json()
+    assert all("password" not in row for row in listed)
+
+    conf = api.get("/api/v1/proxy").json()["config"]
+    assert password not in conf, "a plaintext password reached the gateway config"
+    assert "$6$" in conf
+    api.delete(f"/api/v1/services/{service['id']}")
+
+
+def test_a_published_service_appears_as_an_implicit_path(api, tag):
+    peer = _active_peer(api, tag)
+    service = _service(api, tag, peer).json()
+    api.post(
+        f"/api/v1/services/{service['id']}/auth",
+        json={"kind": "peer_identity", "scope": "internal"},
+    )
+    paths = api.get("/api/v1/proxy").json()["implicit_paths"]
+    mine = [p for p in paths if p["service"] == f"svc-{tag}"]
+    assert mine, "publishing a service must never open an invisible path"
+    assert mine[0]["destination"] == peer["tunnel_ip"]
+    assert mine[0]["enforced_by"] == "proxy configuration"
+    api.delete(f"/api/v1/services/{service['id']}")
+
+
+def test_a_service_name_resolves_to_the_gateway_not_the_peer(api, tag):
+    """Split-horizon: the proxy is the destination."""
+    peer = _active_peer(api, tag)
+    service = _service(api, tag, peer).json()
+    api.post(
+        f"/api/v1/services/{service['id']}/auth",
+        json={"kind": "peer_identity", "scope": "internal"},
+    )
+    zone = api.get("/api/v1/dns").json()
+    hosts = zone.get("hosts") or ""
+    if hosts:
+        line = [ln for ln in hosts.splitlines() if f"svc-{tag}.example.test" in ln]
+        assert line, hosts
+        assert peer["tunnel_ip"] not in line[0]
+    api.delete(f"/api/v1/services/{service['id']}")
+
+
+def test_the_agent_receives_the_proxy_configuration(api, tag):
+    peer = _active_peer(api, tag)
+    service = _service(api, tag, peer).json()
+    api.post(
+        f"/api/v1/services/{service['id']}/auth",
+        json={"kind": "peer_identity", "scope": "internal"},
+    )
+    state = api.get("/api/v1/agent/state").json()
+    assert state["proxy"] is not None
+    assert state["proxy"]["digest"] == api.get("/api/v1/proxy").json()["digest"]
+    assert f"svc-{tag}" in state["proxy"]["conf"]
+    # The pattern files travel with it: haproxy -c resolves -f at parse time.
+    assert state["proxy"]["files"]
+    api.delete(f"/api/v1/services/{service['id']}")
+
+
+def test_deleting_a_service_removes_it_from_the_rendered_config(api, tag):
+    peer = _active_peer(api, tag)
+    service = _service(api, tag, peer).json()
+    api.post(
+        f"/api/v1/services/{service['id']}/auth",
+        json={"kind": "peer_identity", "scope": "internal"},
+    )
+    assert f"svc-{tag}" in api.get("/api/v1/proxy").json()["config"]
+
+    assert api.delete(f"/api/v1/services/{service['id']}").status_code == 204
+    assert f"svc-{tag}" not in (api.get("/api/v1/proxy").json()["config"] or "")
+
+
+def test_a_tcp_service_refuses_an_http_authenticator(api, tag):
+    peer = _active_peer(api, tag)
+    service = _service(api, tag, peer, kind="tcp", upstream_port=22).json()
+    assert "id" in service, service
+    response = api.post(
+        f"/api/v1/services/{service['id']}/auth",
+        json={"kind": "bearer", "scope": "internal"},
+    )
+    assert response.status_code == 422, response.text
+    assert "plaintext" in response.text
+    api.delete(f"/api/v1/services/{service['id']}")
+
+
+# --------------------------------------------------------------------------- #
+# single sign-on (Phase 7c)
+# --------------------------------------------------------------------------- #
+
+
+def _sso_enabled(api) -> bool:
+    """The e2e server only configures SSO when the environment says so."""
+    body = api.get("/api/v1/proxy").json()
+    return bool(body.get("domain"))
+
+
+def test_the_login_page_renders_without_a_session(api):
+    response = api.get("/api/v1/sso/login")
+    if response.status_code == 503:
+        pytest.skip("FOXGUARD_PROXY_SSO_SECRET is not set on this server")
+    assert response.status_code == 200
+    assert "Sign in" in response.text
+    # The page must not leak whether a destination exists before sign-in.
+    assert "password" in response.text
+
+
+def test_an_unknown_redirect_target_is_refused(api, tag):
+    """A login page that redirects wherever ?h= says is a phishing hop."""
+    response = api.get("/api/v1/sso/login", params={"h": "evil.example.net", "p": "/"})
+    if response.status_code == 503:
+        pytest.skip("SSO is not configured on this server")
+    assert response.status_code == 200
+    assert "not a published service" in response.text
+
+
+def test_signing_in_with_bad_credentials_says_nothing_useful(api, tag):
+    response = api.post(
+        "/api/v1/sso/login",
+        data={"username": f"ghost-{tag}", "password": "wrong", "totp": "", "h": "", "p": ""},
+    )
+    if response.status_code == 503:
+        pytest.skip("SSO is not configured on this server")
+    assert response.status_code == 401
+    # One message for a bad password, a bad code and an unknown account.
+    assert "did not work" in response.text
+    assert "no such account" not in response.text
+
+
+def test_a_non_admin_can_sign_in_for_services_but_gets_no_admin_session(api, tag):
+    """The point of SSO: an ordinary account, and a cookie that is not an admin token."""
+    username = f"person-{tag}"
+    password = "correct-horse-battery-staple"
+    created = api.post(
+        "/api/v1/users",
+        json={"username": username, "password": password, "is_admin": False},
+    )
+    assert created.status_code == 201, created.text
+
+    response = api.post(
+        "/api/v1/sso/login",
+        data={"username": username, "password": password, "totp": "", "h": "", "p": ""},
+        follow_redirects=False,
+    )
+    if response.status_code == 503:
+        pytest.skip("SSO is not configured on this server")
+    assert response.status_code == 303, response.text
+    cookie = response.headers.get("set-cookie", "")
+    assert "fg_sso=" in cookie
+    assert "HttpOnly" in cookie
+    assert "Secure" in cookie
+
+    # The same account is still refused an *admin* session.
+    admin = api.post(
+        "/api/v1/admin/login", json={"username": username, "password": password}
+    )
+    assert admin.status_code in (401, 403), admin.text
+
+
+def test_a_session_appears_and_can_be_revoked(api, tag):
+    username = f"revme-{tag}"
+    password = "correct-horse-battery-staple"
+    api.post(
+        "/api/v1/users",
+        json={"username": username, "password": password, "is_admin": False},
+    )
+    login = api.post(
+        "/api/v1/sso/login",
+        data={"username": username, "password": password, "totp": "", "h": "", "p": ""},
+        follow_redirects=False,
+    )
+    if login.status_code == 503:
+        pytest.skip("SSO is not configured on this server")
+    assert login.status_code == 303
+
+    sessions = api.get("/api/v1/proxy/sso-sessions").json()
+    mine = [row for row in sessions if row["username"] == username]
+    assert mine, sessions
+    # Nothing resembling a token is stored or shown: the proxy verifies the
+    # signature itself, so there is nothing here to leak.
+    assert "token" not in mine[0]
+
+    assert api.delete(f"/api/v1/proxy/sso-sessions/{mine[0]['id']}").status_code == 204
+    after = api.get("/api/v1/proxy/sso-sessions").json()
+    assert not [row for row in after if row["username"] == username]

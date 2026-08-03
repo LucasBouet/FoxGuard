@@ -21,7 +21,17 @@ from pydantic import (
 
 from .clientconfig import AllowedIpsMode
 from .dns import RecordKind, ResolverMode
-from .models import ActorType, AuthMethod, GroupKind, RulesetStatus
+from .models import (
+    ActorType,
+    AuthMethod,
+    GroupKind,
+    RulesetStatus,
+    ServiceAuthKind,
+    ServiceExposure,
+    ServiceFilterKind,
+    ServiceKind,
+    ServiceScope,
+)
 from .nftables import Action, EndpointKind, PeerState, PeerType, Protocol
 from .services.killswitch import CONFIRMATION as KILL_SWITCH_CONFIRMATION
 from .services.killswitch import KillSwitchMode
@@ -949,6 +959,28 @@ class AgentDnsState(ApiModel):
     conf_path: str
 
 
+class AgentProxyState(ApiModel):
+    """The rendered proxy configuration, or nothing at all.
+
+    Absent when the proxy is disabled *or* when the current state cannot be
+    rendered. Both mean the same thing to the agent -- leave the proxy exactly
+    as it is -- and neither may stop the ruleset in the same response from
+    being applied.
+
+    ``files`` are the pattern files the configuration references, keyed by base
+    name. They travel together because ``haproxy -c`` resolves ``-f`` at parse
+    time: a configuration whose maps are not yet on disk does not validate.
+    """
+
+    digest: str
+    conf: str
+    conf_path: str
+    maps_dir: str
+    certs_dir: str
+    runtime_socket: str
+    files: dict[str, str] = Field(default_factory=dict)
+
+
 class AgentStateResponse(ApiModel):
     """Everything the gateway agent needs for one reconciliation pass."""
 
@@ -960,6 +992,7 @@ class AgentStateResponse(ApiModel):
     #: Carries its own digest: the ruleset digest identifies a row in
     #: ``ruleset_versions`` and must keep meaning exactly that.
     dns: AgentDnsState | None = None
+    proxy: AgentProxyState | None = None
 
 
 class AgentReport(ApiModel):
@@ -970,6 +1003,8 @@ class AgentReport(ApiModel):
     #: for a ruleset that would not apply.
     dns_digest: str | None = None
     dns_error: str | None = None
+    proxy_digest: str | None = None
+    proxy_error: str | None = None
 
 
 class AuditLogRead(ApiModel):
@@ -982,3 +1017,261 @@ class AuditLogRead(ApiModel):
     object_id: str | None
     source_ip: IpString | None
     detail: dict[str, Any]
+
+
+# --------------------------------------------------------------------------- #
+# published services (Phase 6)
+# --------------------------------------------------------------------------- #
+
+
+class ServiceAuthBase(ApiModel):
+    kind: ServiceAuthKind
+    scope: ServiceScope = ServiceScope.BOTH
+    enabled: bool = True
+    priority: int = 100
+    realm: str | None = Field(default=None, max_length=64)
+
+
+class ServiceAuthCreate(ServiceAuthBase):
+    pass
+
+
+class ServiceAuthRead(ServiceAuthBase):
+    id: uuid.UUID
+    created_at: datetime
+
+
+class ServiceFilterBase(ApiModel):
+    kind: ServiceFilterKind
+    scope: ServiceScope = ServiceScope.BOTH
+    enabled: bool = True
+    priority: int = 100
+    values: list[str] = Field(default_factory=list)
+    rate: int | None = Field(default=None, ge=1)
+    period_seconds: int | None = Field(default=None, ge=1)
+
+    @field_validator("values")
+    @classmethod
+    def _validate_values(cls, value: list[str]) -> list[str]:
+        for item in value:
+            try:
+                ipaddress.ip_network(item, strict=False)
+            except ValueError as exc:
+                raise ValueError(f"{item!r} is not an address or prefix") from exc
+        return value
+
+    @model_validator(mode="after")
+    def _rate_needs_both(self) -> ServiceFilterBase:
+        if self.kind is ServiceFilterKind.RATE_LIMIT and not (
+            self.rate and self.period_seconds
+        ):
+            raise ValueError("a rate limit needs both a rate and a period")
+        if self.kind in (ServiceFilterKind.IP_ALLOW, ServiceFilterKind.IP_DENY) and not (
+            self.values
+        ):
+            # An empty allow list denies everything, which is never what anyone
+            # meant to type.
+            raise ValueError(f"an {self.kind.value} filter needs at least one address")
+        return self
+
+
+class ServiceFilterCreate(ServiceFilterBase):
+    pass
+
+
+class ServiceFilterRead(ServiceFilterBase):
+    id: uuid.UUID
+    created_at: datetime
+
+
+class ServiceAccessBase(ApiModel):
+    action: Action = Action.ACCEPT
+    kind: EndpointKind
+    group_id: uuid.UUID | None = None
+    cidr: str | None = None
+    priority: int = 100
+
+    @model_validator(mode="after")
+    def _consistent(self) -> ServiceAccessBase:
+        if self.kind in (EndpointKind.GROUP, EndpointKind.ZONE) and not self.group_id:
+            raise ValueError(f"a {self.kind.value} endpoint needs group_id")
+        if self.kind is EndpointKind.CIDR and not self.cidr:
+            raise ValueError("a cidr endpoint needs cidr")
+        if self.cidr:
+            try:
+                ipaddress.ip_network(self.cidr, strict=False)
+            except ValueError as exc:
+                raise ValueError(f"{self.cidr!r} is not a prefix") from exc
+        return self
+
+
+class ServiceAccessCreate(ServiceAccessBase):
+    pass
+
+
+class ServiceAccessRead(ServiceAccessBase):
+    id: uuid.UUID
+    group_slug: str | None = None
+    created_at: datetime
+
+
+class ServiceBase(ApiModel):
+    slug: str = Field(pattern=SLUG_PATTERN, max_length=24)
+    name: str = Field(max_length=128)
+    description: str | None = None
+    enabled: bool = True
+    kind: ServiceKind
+    exposure: ServiceExposure = ServiceExposure.INTERNAL
+    upstream_peer_id: uuid.UUID | None = None
+    upstream_host: str
+    upstream_port: int = Field(ge=1, le=65535)
+    upstream_tls: bool = False
+    upstream_tls_verify: bool = False
+    internal_hostname: str | None = Field(default=None, max_length=255)
+    external_hostname: str | None = Field(default=None, max_length=255)
+    #: Omit for a plain-TCP service and one is allocated from the configured
+    #: range. Plain TCP has no SNI and no Host header, so it cannot share a port.
+    listen_port: int | None = Field(default=None, ge=1, le=65535)
+    sni_hostname: str | None = Field(default=None, max_length=255)
+    health_check: bool = False
+    health_check_interval: int = Field(default=30, ge=1)
+
+    @field_validator("upstream_host")
+    @classmethod
+    def _validate_upstream(cls, value: str) -> str:
+        try:
+            ipaddress.ip_address(value)
+        except ValueError as exc:
+            raise ValueError(
+                f"{value!r} is not an IP address. The upstream must be an address "
+                "inside the tunnel or behind a peer's routes, not a name -- the "
+                "control plane checks reachability against AllowedIPs"
+            ) from exc
+        return value
+
+
+class ServiceCreate(ServiceBase):
+    """A service and the way in, in one request.
+
+    The policy is not optional extra: a service exposed on a listener with no
+    authenticator that applies there is refused by the renderer, so creating
+    the two separately would make it impossible to ever create the first one.
+    Publishing a service and saying how it is guarded are one decision.
+    """
+
+    authenticators: list[ServiceAuthCreate] = Field(default_factory=list)
+    filters: list[ServiceFilterCreate] = Field(default_factory=list)
+    access: list[ServiceAccessCreate] = Field(default_factory=list)
+
+
+class ServiceUpdate(ApiModel):
+    name: str | None = Field(default=None, max_length=128)
+    description: str | None = None
+    enabled: bool | None = None
+    exposure: ServiceExposure | None = None
+    upstream_peer_id: uuid.UUID | None = None
+    upstream_host: str | None = None
+    upstream_port: int | None = Field(default=None, ge=1, le=65535)
+    upstream_tls: bool | None = None
+    upstream_tls_verify: bool | None = None
+    internal_hostname: str | None = Field(default=None, max_length=255)
+    external_hostname: str | None = Field(default=None, max_length=255)
+    listen_port: int | None = Field(default=None, ge=1, le=65535)
+    sni_hostname: str | None = Field(default=None, max_length=255)
+    health_check: bool | None = None
+    health_check_interval: int | None = Field(default=None, ge=1)
+
+
+class ServiceRead(ServiceBase):
+    id: uuid.UUID
+    created_at: datetime
+    updated_at: datetime
+    upstream_peer_name: str | None = None
+    #: Which listeners the service currently has. Differs from ``exposure``
+    #: when the upstream peer is not active -- see ``services/proxy.doors_for``.
+    active_doors: ServiceExposure | None = None
+    authenticators: list[ServiceAuthRead] = Field(default_factory=list)
+    filters: list[ServiceFilterRead] = Field(default_factory=list)
+    access: list[ServiceAccessRead] = Field(default_factory=list)
+    token_count: int = 0
+    account_count: int = 0
+
+
+class ServiceTokenCreate(ApiModel):
+    name: str = Field(max_length=128)
+    expires_at: datetime | None = None
+
+
+class ServiceTokenRead(ApiModel):
+    id: uuid.UUID
+    name: str
+    prefix: str
+    expires_at: datetime | None
+    revoked_at: datetime | None
+    created_at: datetime
+
+
+class ServiceTokenCreated(ServiceTokenRead):
+    #: The only time the plaintext exists outside the caller's memory.
+    token: str
+
+
+class ServiceAccountCreate(ApiModel):
+    username: str = Field(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$", max_length=64)
+
+
+class ServiceAccountRead(ApiModel):
+    id: uuid.UUID
+    username: str
+    revoked_at: datetime | None
+    created_at: datetime
+
+
+class ServiceAccountCreated(ServiceAccountRead):
+    #: Generated, high-entropy, and shown once. That is what allows the hash on
+    #: the gateway to be sha-512-crypt rather than argon2.
+    password: str
+
+
+class ImplicitPathRead(ApiModel):
+    """A gateway-to-upstream path a published service has opened.
+
+    Not enforced by nftables -- Foxguard creates no ``output`` chain, by design.
+    Surfaced so the path is never invisible.
+    """
+
+    service: str
+    source: str
+    destination: str
+    peer: str | None
+    protocol: str
+    port: int
+    enforced_by: str
+
+
+class SsoSessionRead(ApiModel):
+    """A browser session on a published service.
+
+    No token, not even a prefix of one: the cookie is a signed JWT the proxy
+    verifies on its own, so there is nothing stored here that could be shown.
+    """
+
+    id: uuid.UUID
+    username: str | None
+    source_ip: str | None
+    user_agent: str | None
+    expires_at: datetime
+    created_at: datetime
+
+
+class ProxyStatusRead(ApiModel):
+    enabled: bool
+    domain: str | None
+    internal_binds: list[str]
+    external_binds: list[str]
+    service_count: int
+    digest: str | None
+    config: str | None
+    files: dict[str, str] = Field(default_factory=dict)
+    implicit_paths: list[ImplicitPathRead] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)

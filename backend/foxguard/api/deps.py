@@ -22,7 +22,9 @@ from ..config import Settings, get_settings
 from ..db import get_db
 from ..models import Peer
 from ..nftables import RulesetValidationError
+from ..proxy import ProxyValidationError
 from ..services import admin_auth
+from ..services import proxy as proxy_service
 from ..services import ruleset as ruleset_service
 from ..services.admin_auth import AdminIdentity
 from ..services.ratelimit import RateLimited, RateLimiter
@@ -193,6 +195,21 @@ def regenerate_or_422(session: Session, settings, actor: str) -> None:
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             {"message": "resulting ruleset is invalid", "errors": list(exc.errors)},
         ) from exc
+
+    # The proxy is validated here too, for the reason in the paragraph above:
+    # its renderer also validates the *whole* spec, so a service that cannot
+    # render would otherwise be caught by whatever unrelated request happened
+    # to regenerate next. Rendering is discarded -- the agent state endpoint
+    # renders again from the same state -- this call exists to raise.
+    if settings.proxy_enabled:
+        try:
+            proxy_service.render(session, settings)
+        except ProxyValidationError as exc:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                {"message": "resulting proxy configuration is invalid",
+                 "errors": [str(exc)]},
+            ) from exc
 
 
 def audit_context(request: Request) -> dict:

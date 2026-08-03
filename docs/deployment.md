@@ -907,6 +907,131 @@ something grants it.
 you would rather manage the routing table yourself. The `AllowedIPs` half still
 happens, so an `ip route add <cidr> dev wg0` by hand completes the path.
 
+## 5g. Reverse proxy (optional)
+
+Publishes services that live behind peers: HTTP terminated, or TCP passed
+through untouched. Off by default.
+
+```sh
+sudo ./deploy/foxguard-install.sh \
+  --proxy --proxy-domain example.com \
+  --proxy-external 203.0.113.10 \
+  --acme-email you@example.com \
+  --acme-cf-token <a Zone:DNS:Edit token for that zone>
+```
+
+**The domain is not optional and cannot be `.internal`.** Peer names stay on the
+DNS zone (`laptop.fox.internal`); a *service* needs a name a public CA will
+sign. Use a domain you own.
+
+**Certificates.** DNS-01 with the Cloudflare plugin, one wildcard for
+`example.com` and `*.example.com`. DNS-01 rather than HTTP-01 because HTTP-01
+needs every name to resolve publicly to this box, which would force public
+records for internal-only services. A wildcard rather than per-service
+certificates for two reasons: publishing becomes a database write with no ACME
+round trip, and per-name certificates would publish your internal service
+inventory to Certificate Transparency logs.
+
+The installer prints the `certbot certonly` command and installs the deploy
+hook. Run it once; renewals then load the new certificate over HAProxy's runtime
+socket **without a reload**, so a passthrough session is never dropped.
+
+Until you do, the proxy runs on a self-signed bootstrap certificate — it has to,
+because HAProxy will not start with an empty `crt` directory. Browsers will
+refuse it and the healthcheck says so.
+
+**A service and the way in are one request.** A listener with no authenticator
+that applies to it is refused, so there is no valid state where a service exists
+and nothing guards it:
+
+```sh
+curl -X POST http://<gateway>:8080/api/v1/services \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"slug":"grafana","name":"Grafana","kind":"http","exposure":"both",
+       "upstream_peer_id":"<peer uuid>","upstream_host":"10.88.0.6","upstream_port":3000,
+       "authenticators":[{"kind":"peer_identity","scope":"internal"},
+                         {"kind":"bearer","scope":"external"}],
+       "access":[{"kind":"group","group_id":"<devs uuid>","action":"accept"}]}'
+```
+
+That publishes `grafana.example.com` on both doors: inside the tunnel the source
+address proves who you are and the `devs` group is enough; from the internet a
+bearer token is required. **Peer identity scoped to the external listener is
+refused** — outside the tunnel a source address belongs to an ISP or a NAT and
+is bound to no key.
+
+**Split-horizon is what makes one name work on both doors.** With the internal
+resolver on, `grafana.example.com` resolves to the gateway's tunnel address for
+a connected peer, so it never leaves the tunnel. Everyone else gets your public
+record and arrives on the WAN listener.
+
+One conflict to avoid, and both the installer and the healthcheck refuse it: do
+not set `FOXGUARD_DNS_ZONE` to a domain that covers `FOXGUARD_PROXY_DOMAIN`
+while `FOXGUARD_DNS_MODE=split`. The resolver would answer NXDOMAIN for
+`_acme-challenge` and renewals would stop.
+
+**What a passthrough service can and cannot have:**
+
+| | HTTP terminated | TCP passthrough |
+| --- | --- | --- |
+| Peer identity, IP filters, rate limit | yes | yes |
+| Bearer, basic auth | yes | **no** |
+| Identity headers to the upstream | yes | **no** |
+
+A plain-TCP service also cannot share a port — no SNI, no Host header — so one
+is allocated from `FOXGUARD_PROXY_TCP_PORT_START..END` (20000–20999 by default).
+
+**Publishing a service opens a path your ACLs do not cover.** The proxy connects
+*from the gateway*, which no zone or group rule constrains. `GET /api/v1/proxy`
+lists those paths under `implicit_paths` and the healthcheck prints them. What
+constrains them is that HAProxy can only ever reach the declared `host:port` —
+not a firewall rule. Publish accordingly.
+
+**Never put the proxy in front of the Foxguard API or portal.** They identify
+their caller by source address and refuse any forwarded header; a proxy destroys
+that identity. The control plane refuses such a service at creation.
+
+## 5h. Single sign-on (optional)
+
+Lets a person reach a published service with their Foxguard account instead of a
+shared token.
+
+```sh
+sudo ./deploy/foxguard-install.sh --proxy --proxy-domain example.com --sso ...
+```
+
+The installer generates `FOXGUARD_PROXY_SSO_SECRET` and writes it to
+`backend.env`. Foxguard signs the cookie with it and the proxy verifies with the
+same value, so **it is rendered into the HAProxy configuration** — which is why
+that file is `0640 root:haproxy`. Rotating it signs everybody out.
+
+**The login page lives at `auth.<your domain>`**, covered by the wildcard
+certificate you already have. This is the one place the proxy is put in front of
+the Foxguard API, and it is bounded by construction: only `/api/v1/sso/` is
+routed there, everything else on that host name is refused by HAProxy before it
+reaches a backend. The portal and enrollment endpoints in particular must never
+be reachable that way — they identify their caller by source address.
+
+**The proxy verifies the cookie itself.** No round trip to the API per request,
+so a published service keeps serving while `foxguard-api` restarts. The cost is
+that a valid cookie stays valid until it expires, which is why revocation is
+explicit: `DELETE /api/v1/proxy/sso-sessions/<id>` puts the session id in a map
+the proxy consults, and the agent pushes that map over the runtime socket
+without a reload.
+
+**Signing out is two things**, and `GET /api/v1/sso/logout` does both: it clears
+the cookie *and* revokes the session behind it. Clearing alone would leave a
+token that still verifies.
+
+Two limits to know before you rely on it:
+
+* **An SSO service admits any active Foxguard account.** Groups belong to
+  devices, not to people, so there is nothing finer to authorize on yet.
+  `is_admin` is the only distinction available.
+* **Sessions are not idle-based.** A session ends at a wall-clock deadline
+  (`FOXGUARD_PROXY_SSO_LIFETIME_SECONDS`, 8h by default), not after a period of
+  inactivity — the same limitation admin sessions have.
+
 ## 6. Operating it
 
 **See what is live:**
@@ -1026,10 +1151,14 @@ sudo ./deploy/foxguard-uninstall.sh --dry-run       # print the plan, change not
 sudo ./deploy/foxguard-uninstall.sh                 # the default removal
 ```
 
-The default stops and disables the four units, deletes `inet foxguard` from
+The default stops and disables the five units, deletes `inet foxguard` from
 nftables, withdraws the kernel routes the agent installed for zone networks, and
 removes `/opt/foxguard`, `/etc/foxguard`, `/var/lib/foxguard`, the unit files and
-the service user. It leaves the database, the WireGuard interface and every apt
+the service user. Certificate private keys are **shredded** before that
+directory goes: `rm -rf` unlinks without overwriting, and a wildcard key covers
+the whole domain. `/etc/letsencrypt` is deliberately left alone — certbot owns
+it, other things may use the same certificate, and re-issuing after an
+accidental deletion runs into rate limits. It leaves the database, the WireGuard interface and every apt
 package alone, because none of those is unambiguously Foxguard's to delete.
 
 The routes are not opt-in and not left behind either: they point into a tunnel
@@ -1132,6 +1261,21 @@ because there is no lockout; if you need it cleared immediately, restart the API
 - [ ] PostgreSQL is not reachable from outside the box.
 - [ ] `FOXGUARD_INTERNAL_CIDRS` lists every internal network, otherwise
       `internet_exit` groups can route to them.
+- [ ] If SSO is on: `FOXGUARD_PROXY_SSO_SECRET` is at least 32 characters and
+      was generated, not chosen. It sits in two files on the gateway
+      (`backend.env` and the rendered HAProxy configuration) and both are
+      `0640` or tighter.
+- [ ] If SSO is on: `GET /api/v1/proxy/sso-sessions` shows nobody you do not
+      recognise, and nothing signed in from an address you do not expect.
+- [ ] If the proxy is on: the wildcard private key is `0640 root:haproxy`, and
+      the Cloudflare credential is an API **token** scoped to `Zone:DNS:Edit` on
+      that one zone, never the global key.
+- [ ] If the proxy is on: `/api/v1/proxy` shows no `implicit_paths` you did not
+      intend — each one is a gateway-to-upstream path outside the ACL model.
+- [ ] If the proxy is on: no service is exposed externally with an authenticator
+      list you would not put on the public internet. The control plane refuses
+      peer identity there, but a bearer token you pasted into a wiki is yours to
+      worry about.
 - [ ] Your management SSH does not transit the tunnel — check before switching
       `FOXGUARD_GATEWAY_INPUT_POLICY` to `restricted`.
 - [ ] `/var/lib/foxguard/last-good.nft` exists after the first successful apply.

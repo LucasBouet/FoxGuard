@@ -304,3 +304,150 @@ export interface ClientConfigProfile {
   warnings: string[];
   complete: boolean;
 }
+
+// --------------------------------------------------------------------------- //
+// published services (Phase 7)
+// --------------------------------------------------------------------------- //
+
+export type ServiceKind = "http" | "tcp";
+export type ServiceExposure = "internal" | "external" | "both";
+export type ServiceScope = "internal" | "external" | "both";
+export type ServiceAuthKind =
+  | "peer_identity"
+  | "bearer"
+  | "basic"
+  | "foxguard_sso"
+  | "mtls";
+export type ServiceFilterKind =
+  | "ip_allow"
+  | "ip_deny"
+  | "geo_allow"
+  | "geo_deny"
+  | "rate_limit"
+  | "waf"
+  | "crowdsec";
+
+export interface ServiceAuth {
+  id: string;
+  kind: ServiceAuthKind;
+  scope: ServiceScope;
+  enabled: boolean;
+  priority: number;
+  realm: string | null;
+  created_at: string;
+}
+
+export interface ServiceFilter {
+  id: string;
+  kind: ServiceFilterKind;
+  scope: ServiceScope;
+  enabled: boolean;
+  priority: number;
+  values: string[];
+  rate: number | null;
+  period_seconds: number | null;
+  created_at: string;
+}
+
+export interface ServiceAccess {
+  id: string;
+  action: "accept" | "drop" | "reject";
+  kind: "any" | "group" | "cidr" | "zone";
+  group_id: string | null;
+  group_slug: string | null;
+  cidr: string | null;
+  priority: number;
+  created_at: string;
+}
+
+export interface Service {
+  id: string;
+  slug: string;
+  name: string;
+  description: string | null;
+  enabled: boolean;
+  kind: ServiceKind;
+  exposure: ServiceExposure;
+  upstream_peer_id: string | null;
+  upstream_peer_name: string | null;
+  upstream_host: string;
+  upstream_port: number;
+  upstream_tls: boolean;
+  upstream_tls_verify: boolean;
+  internal_hostname: string | null;
+  external_hostname: string | null;
+  listen_port: number | null;
+  sni_hostname: string | null;
+  health_check: boolean;
+  health_check_interval: number;
+  /**
+   * Which listeners the service currently has. Differs from `exposure` when the
+   * upstream peer is not active -- a peer going down takes the internal door
+   * with it and leaves the external one answering the 503 page.
+   */
+  active_doors: ServiceExposure | null;
+  authenticators: ServiceAuth[];
+  filters: ServiceFilter[];
+  access: ServiceAccess[];
+  token_count: number;
+  account_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ImplicitPath {
+  service: string;
+  source: string;
+  destination: string;
+  peer: string | null;
+  protocol: string;
+  port: number;
+  enforced_by: string;
+}
+
+export interface ProxyStatus {
+  enabled: boolean;
+  domain: string | null;
+  internal_binds: string[];
+  external_binds: string[];
+  service_count: number;
+  digest: string | null;
+  config: string | null;
+  files: Record<string, string>;
+  implicit_paths: ImplicitPath[];
+  warnings: string[];
+}
+
+export interface ServiceToken {
+  id: string;
+  name: string;
+  prefix: string;
+  expires_at: string | null;
+  revoked_at: string | null;
+  created_at: string;
+}
+
+/** Only ever returned once, by the creating request. */
+export interface ServiceTokenCreated extends ServiceToken {
+  token: string;
+}
+
+export interface ServiceAccount {
+  id: string;
+  username: string;
+  revoked_at: string | null;
+  created_at: string;
+}
+
+export interface ServiceAccountCreated extends ServiceAccount {
+  password: string;
+}
+
+export interface SsoSession {
+  id: string;
+  username: string | null;
+  source_ip: string | null;
+  user_agent: string | null;
+  expires_at: string;
+  created_at: string;
+}

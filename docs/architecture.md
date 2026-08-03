@@ -1111,3 +1111,253 @@ Stated plainly rather than discovered later:
   the agent in `FOXGUARD_AGENT_DRY_RUN=true` for its first run on a new gateway
   anyway — that checks the ruleset your database actually produces, against your
   kernel, without applying it.
+
+---
+
+## 19. The reverse proxy: publishing what lives behind a peer
+
+Third instance of the rendered-artefact pattern, after nftables and DNS, and the
+first one that terminates traffic from strangers. `foxguard/proxy/model.py` holds
+frozen data, `haproxy.py` turns it into text, `services/proxy.py` projects the
+database onto it, and the agent installs it. HAProxy 3.0, because `haproxy -c`
+is the third `nft -c -f` and because master-worker reload is what lets a
+passthrough session survive a configuration change.
+
+### A reverse proxy is an ACL bypass machine
+
+This is the thing to understand before anything else. The proxy originates its
+connection **from the gateway**, so it traverses an `output` chain — and
+Foxguard deliberately has none: base chains are `policy accept` with explicit
+drops precisely so a bad ruleset cannot lock the operator out (§ "The nftables
+ruleset"). Publishing a service therefore opens a path that zones and groups do
+not cover.
+
+Two things follow, and both are implemented rather than documented away:
+
+* **The path is surfaced.** `services/proxy.implicit_paths()` derives one entry
+  per published service and `GET /api/v1/proxy` returns them, with
+  `enforced_by: "proxy configuration"` — honest about the fact that what
+  actually constrains it is HAProxy only ever connecting to the declared
+  `host:port`, not a firewall rule. The healthcheck prints them as warnings.
+* **The policy speaks the ACL vocabulary.** `service_access` reuses
+  `endpoint_kind` and `acl_action`. There is no `peer` kind because there is
+  none in `endpoint_kind`; a single device is named by its `/32`, exactly as
+  `acl_rules` already requires. Two access-control vocabularies that can
+  disagree is how a segmentation model becomes a lie.
+
+The half that *is* enforced in nftables is the other direction: peers reaching
+the internal listener traverse `chain input`, so `GatewaySpec.proxy_ports`
+carries the tunnel-side listener ports and the generator emits accepts for them
+when `gateway_input_policy` is RESTRICTED.
+
+### Identity is a property of the listener, not of the service
+
+Inside the tunnel a source address is bound to a public key by cryptokey
+routing, which is the same guarantee `deps.calling_peer` already rests on. So
+`peer_identity` needs no secret, no lookup and no round trip to the control
+plane — and it is meaningless the moment the packet did not arrive on `wg0`.
+
+`Authenticator` therefore carries a `Scope`, and `peer_identity` scoped anywhere
+but `internal` is **refused**, not ignored. The rendered configuration only
+consults the peer set on `fg_int_https` and on internal TCP frontends, and only
+that frontend populates `txn.fg_peer`.
+
+The rule with teeth is the other one: a listener with no authenticator that
+applies to it is refused at render time *and* at creation time. Without it the
+service is either wide open or wholly shut depending on how the fallback is
+written, and neither is something an operator chose.
+
+A consequence worth stating because it looks like an omission: **a service and
+its policy are created in one request**. `ServiceCreate` carries
+`authenticators`, `filters` and `access`, because a two-step creation could
+never succeed — the first step would always be refused.
+
+### Passthrough is not HTTP
+
+A TCP service never sees the plaintext, so bearer, basic, SSO and the WAF cannot
+apply to it. That is a capability table (`HTTP_ONLY_AUTH`, `HTTP_ONLY_FILTERS`)
+and a validator, not a paragraph: an operator who ticks "WAF" on an SSH
+passthrough believes the service is protected.
+
+Plain TCP also cannot share a port — no SNI, no Host header — so each such
+service is allocated one from `proxy_tcp_port_start..end`, backed by a partial
+unique index rather than a runtime scan of what happens to be listening.
+
+### Names: two namespaces that do not collide
+
+Peers keep `laptop.fox.internal`. Services live under the real `proxy_domain`,
+because `.internal` can never carry a publicly signed certificate and
+split-horizon requires the *same name* on both doors.
+
+An internal service name becomes an A record to the **gateway**, not a CNAME to
+the peer: the proxy is the destination. Measured against dnsmasq 2.91 — a
+hosts-file entry outside `local=/zone/` is still answered, in both resolver
+modes, which is what lets the two namespaces coexist in one resolver.
+
+The trap this creates is recorded in the installer and the healthcheck: if
+`dns_zone` ever covered `proxy_domain` **and** the resolver were in `split`
+mode, `_acme-challenge` would come back NXDOMAIN and certbot renewals would
+stop.
+
+### Credentials the gateway can verify
+
+Two of them, and both are shaped by what HAProxy can actually do.
+
+**Bearer tokens are stored unsalted.** The only unsalted secret digest in
+Foxguard, and it has to be: verification happens inside HAProxy, which computes
+`sha2(256)` over the presented token and looks the result up in a map. There is
+no way to hand it a salt. Acceptable because the token is a generated 256-bit
+secret — a salt defends against precomputation across guessable secrets, and
+there is no guessing this.
+
+*Measured, and it cost a debugging session:* HAProxy's `hex` converter emits
+**uppercase**, while `hashlib.sha256().hexdigest()` emits lowercase. Every token
+expression ends in `,lower`. Without it nothing matches and the failure mode is
+a silent 403.
+
+**Basic auth uses generated service accounts, never human passwords.** A
+`userlist` can only verify crypt(3), so a human password would have to leave
+argon2 behind and land on the gateway as sha-512-crypt. A generated 192-bit
+secret makes that hash adequate; that is the entire reason `service_accounts`
+exists separately from `users`.
+
+*Measured:* rounds are pinned at 5000, the crypt(3) default, **not** passlib's
+656000. HAProxy re-verifies on every request, and 656000 rounds costs 267 ms per
+request against 15 ms at 5000 — a 3 req/s ceiling that would look like the proxy
+being broken.
+
+### Applying it: write the file, then push
+
+`ProxyApplier` follows `DnsApplier`'s contract with three HAProxy-specific
+properties, all measured against 3.0.11 rather than assumed:
+
+| Property | Measurement |
+| --- | --- |
+| Pattern files go down **before** validation | `haproxy -c` resolves `-f` at parse time and fails with "failed to open pattern file" |
+| A reload keeps in-flight connections | a 6 s response with the reload fired at t+2 s completed with 200; the master PID never changed |
+| A Runtime API change **does not survive a reload** | `add map` was live immediately and gone after the next reload; `commit ssl cert` reverted to the on-disk certificate |
+
+The third is what the applier is shaped around. Adding a token or moving a peer
+between groups touches only a pattern file, and pushing it over the Runtime API
+avoids a reload — but the file is written **as well**, always, because a runtime
+change alone silently undoes itself the next time anything else reloads.
+`test_a_runtime_synced_map_survives_a_later_reload` guards exactly that.
+
+Certificates follow the same rule from the other side: certbot's deploy hook
+concatenates `fullchain` and `privkey` into one PEM (HAProxy wants one file,
+certbot writes two), then loads it over the Runtime API. No reload, because a
+passthrough session can be a shell somebody is typing in.
+
+### Two small things that are fatal rather than advisory
+
+* A stats socket path over **97 characters** is a fatal parse error, not a
+  warning. `validate_spec` refuses it before HAProxy ever sees it.
+* HAProxy will not start with an empty `crt` directory, and the agent cannot
+  write a certificate. The installer places a self-signed bootstrap certificate
+  so the proxy can come up before ACME has ever run; the healthcheck flags it as
+  self-signed until certbot replaces it.
+
+---
+
+## 20. Single sign-on: a signed cookie, not a subrequest
+
+Phase 7c. A person opens `grafana.example.com`, has no session, is sent to a
+Foxguard login page, signs in with the account they already have, and comes back
+with a cookie every published service accepts.
+
+### Why the proxy verifies it itself
+
+The Phase 7 spec called this "forward-auth", and the reasoning there was sound:
+a login page, a redirect and session state genuinely need the control plane.
+What changed is where *per-request* validation happens. HAProxy 3.0 verifies a
+JWT natively (measured: `jwt_verify` is present in 3.0.11), so a request to a
+published service costs no round trip and keeps working while `foxguard-api` is
+restarting. Coupling every request on every service to the API's availability
+was a worse trade than it first looked.
+
+What that costs is revocation, and it is bought back rather than waved away: the
+session's `jti` goes into a HAProxy map, the agent pushes that map over the
+runtime socket **without a reload** (§19), and signing somebody out means now
+rather than "within the token lifetime".
+
+### Three measurements, three lines of configuration
+
+Everything `_sso_setup` emits exists because of something measured against
+HAProxy 3.0.11, and one of them is a genuine vulnerability in the idiom.
+
+**The algorithm is pinned, never read from the token.** The form that appears in
+most HAProxy JWT examples is:
+
+```
+http-request set-var(txn.alg) var(txn.jwt),jwt_header_query('$.alg')
+http-request set-var(txn.ok)  var(txn.jwt),jwt_verify(txn.alg, <secret>)
+```
+
+Measured: a token carrying `{"alg":"none"}`, **no signature at all**, and any
+claims the attacker likes, makes that return **1**. Pinning the algorithm to a
+value Foxguard sets makes the same token return -3. Foxguard therefore emits
+`set-var(txn.fg_alg_<slug>) str(HS256)` and never lets the token choose.
+
+**`jwt_verify` does not look at `exp`.** An expired token verifies happily, so
+expiry is a separate condition: `exp` is read as an int, `date()` is subtracted
+from it, and the result must be positive.
+
+**Only `1` counts.** The converter returns negative values for invalid tokens,
+unknown algorithms and out-of-memory. `-3` is truthy, so a bare truthiness test
+would admit exactly the forgery above.
+
+`test_sso_live.py` runs a rendered SSO service in a real HAProxy and throws all
+of these at it.
+
+### The one place the proxy fronts the Foxguard API
+
+§19 says never to put the proxy in front of the control plane, and that stands —
+`deps.calling_peer` treats a source address as an identity because cryptokey
+routing binds it to a key, and a proxy destroys that. The SSO endpoints are the
+exception because they identify by password and TOTP instead, so nothing about
+them depends on where the packet came from.
+
+The exception is kept narrow by construction rather than by convention:
+
+* one vhost, `auth.<proxy_domain>`, covered by the wildcard certificate already;
+* `path_beg /api/v1/sso/` is the only path routed there, everything else on that
+  host is a 404 from HAProxy before it reaches a backend;
+* the live tests assert that `/api/v1/peers`, `/api/v1/killswitch`,
+  `/api/v1/portal/status`, `/api/v1/enroll` and `/api/v1/agent/state` are all
+  refused *by the proxy* — distinguishing HAProxy's 404 from an upstream's,
+  because a status code alone cannot tell them apart.
+
+**`X-Foxguard-Client-IP`** carries the real browser address to the sign-in
+endpoint. It is unforgeable because every `X-Foxguard-*` header the caller sent
+is deleted at the top of the frontend before any rule runs, and it is only
+trusted when the request actually arrived from the gateway. Without it every
+sign-in attempt would appear to come from the proxy and share one throttle
+budget.
+
+### Three kinds of session, on purpose
+
+| | What it grants | Where it lives |
+| --- | --- | --- |
+| `sessions` (portal) | **network** access, in nftables | no cookie, no token — see `api/routes/portal.py` |
+| `admin_sessions` | the admin API | bearer token, hashed |
+| `sso_sessions` | published services | signed cookie, verified by the proxy |
+
+Keeping them separate is the point. An SSO cookie handed out for reaching an
+internal wiki must not be mistakable for an admin token, and
+`admin_auth.authenticate` grows a `require_admin` flag rather than a second
+password-and-TOTP path that could drift from the first.
+
+### Open redirect, closed
+
+A login page that redirects wherever `?h=` says is a phishing hop wearing your
+own domain and your own certificate. `_safe_target` accepts a destination only
+if it is a host name Foxguard currently publishes — and a service whose peer is
+down is not published, so it is not a target either.
+
+### What is still missing
+
+**Per-user authorization beyond "has an account".** The JWT carries `sub` and
+`admin`, and `service_access` speaks in peers, groups and zones — which are
+properties of *devices*. There is no user-to-group relation in the schema, so an
+SSO service today admits any active account. `is_admin` is the only distinction
+available. Adding user groups is the honest fix and it is not in this phase.

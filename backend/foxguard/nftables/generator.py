@@ -651,6 +651,15 @@ def _render_input_chain(spec: RulesetSpec) -> Iterator[str]:
         if gw.allow_icmp_to_gateway:
             yield f'{INDENT * 2}icmp type echo-request counter accept comment "fg:ping"'
             yield f'{INDENT * 2}icmpv6 type echo-request counter accept comment "fg:ping"'
+        for port in gw.proxy_ports:
+            # The reverse proxy terminates on the gateway, so peers reach it
+            # here rather than through the forward chain. Which peers may use a
+            # given service is the proxy's own access list; this only decides
+            # whether the listener is reachable at all.
+            yield (
+                f"{INDENT * 2}tcp dport {port} counter accept "
+                f'comment "fg:proxy"'
+            )
         yield f'{INDENT * 2}counter drop comment "fg:gateway-input-deny"'
     else:
         yield f"{INDENT * 2}# --- active peers: gateway-local services left to the host firewall ---"

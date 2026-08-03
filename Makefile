@@ -100,6 +100,10 @@ test-api: api-test-db ## Run end-to-end API tests against a throwaway server
 	  FOXGUARD_OIDC_CLIENT_ID=foxguard-test \
 	  FOXGUARD_OIDC_CLIENT_SECRET=test-client-secret \
 	  FOXGUARD_OIDC_REDIRECT_URL='http://127.0.0.1:8765/api/v1/portal/oidc/callback' \
+	  FOXGUARD_PROXY_ENABLED=true \
+	  FOXGUARD_PROXY_DOMAIN=example.test \
+	  FOXGUARD_PROXY_EXTERNAL_BINDS=203.0.113.10 \
+	  FOXGUARD_PROXY_SSO_SECRET=test-sso-secret-at-least-32-chars \
 	  sh -c 'foxguard-serve --host 127.0.0.1 --port 8765 & \
 	    server=$$!; \
 	    trap "kill $$server 2>/dev/null" EXIT; \
@@ -146,3 +150,15 @@ test-dns-applier-live: ## Drive a real dnsmasq through the agent's applier (need
 .PHONY: dns
 dns: ## Print the DNS zone the current database state implies
 	cd $(BACKEND) && python -c "from foxguard.config import get_settings; from foxguard.db import SessionLocal; from foxguard.services import dns; h, c = dns.render(SessionLocal(), get_settings()); print(h); print(c)"
+
+.PHONY: test-sso-live
+test-sso-live: ## Attack a rendered SSO service in a real HAProxy (needs haproxy)
+	cd $(BACKEND) && FOXGUARD_LIVE_PROXY=1 pytest tests/test_sso_live.py -v
+
+.PHONY: test-proxy-live
+test-proxy-live: ## Drive a real HAProxy through the agent's applier (needs haproxy)
+	cd $(AGENT) && FOXGUARD_LIVE_PROXY=1 pytest tests/test_proxy_live.py -v
+
+.PHONY: proxy
+proxy: ## Print the HAProxy configuration the control plane would render
+	cd $(BACKEND) && python -c "from foxguard.config import get_settings; from foxguard.db import SessionLocal; from foxguard.services import proxy; c, f = proxy.render(SessionLocal(), get_settings()); print(c); print('--- pattern files ---'); [print(f'== {n} ==\n{b}') for n, b in sorted(f.items())]"
