@@ -58,6 +58,22 @@ die()     { printf '\n%sStopped:%s %s\n\n' "$R" "$N" "$*" >&2; exit 1; }
 # asking
 # --------------------------------------------------------------------------- #
 
+# Everything read from a human goes through this first.
+#
+# A carriage return is not whitespace to `read`: over a console that sends CRLF
+# -- Proxmox's noVNC, a serial line, some SSH clients -- pressing Enter yields
+# $'\r', which is *not empty*, so `${answer:-$default}` never fires and the
+# default silently stops working. Worse, printing it back inside quotes puts the
+# cursor at the start of the line, so the complaint renders as '' and looks like
+# the script lost the input entirely. Observed exactly that way on a Proxmox
+# LXC console.
+clean() {
+  local value=${1//$'\r'/}
+  value=${value#"${value%%[![:space:]]*}"}
+  value=${value%"${value##*[![:space:]]}"}
+  printf '%s' "$value"
+}
+
 # ask <varname> <prompt> [default] [validator]
 #
 # The validator is a function name taking the answer and printing a complaint on
@@ -73,6 +89,7 @@ ask() {
       printf '  %s%s%s: ' "$B" "$prompt" "$N"
     fi
     read -r answer || answer=""
+    answer=$(clean "$answer")
     answer=${answer:-$default}
     if [[ -z $answer && -z $default ]]; then
       bad "this one has no default -- an answer is needed"
@@ -93,7 +110,7 @@ ask_secret() {
   printf '  %s%s%s: ' "$B" "$prompt" "$N"
   read -rs answer || answer=""
   printf '\n'
-  printf -v "$__var" '%s' "$answer"
+  printf -v "$__var" '%s' "$(clean "$answer")"
 }
 
 # yesno <prompt> <default y|n>
@@ -103,6 +120,7 @@ yesno() {
   while true; do
     printf '  %s%s%s %s: ' "$B" "$prompt" "$N" "$hint"
     read -r answer || answer=""
+    answer=$(clean "$answer")
     answer=${answer:-$default}
     case ${answer,,} in
       y|yes) return 0 ;;
@@ -126,8 +144,14 @@ v_ip() {
 v_port() {
   [[ $1 =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 )) || { echo "a port is 1-65535"; return; }
 }
+# `ip a` displays a veth as "eth0@if30" -- the @ifNN is the peer index, not part
+# of the name, and it is what people copy out of the output they are looking at.
+strip_ifindex() { printf '%s' "${1%%@*}"; }
+
 v_iface() {
-  [[ -d /sys/class/net/$1 ]] || echo "no interface called '$1' on this box (see: ip -brief link)"
+  local name; name=$(strip_ifindex "$1")
+  [[ -d /sys/class/net/$name ]] && return
+  echo "no interface called '$name' here. This box has: $(ip -brief link show 2>/dev/null | awk '{print $1}' | sed 's/@.*//' | tr '\n' ' ')"
 }
 v_domain() {
   [[ $1 =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]] || {
@@ -258,7 +282,9 @@ ask STAGING_POOL "Staging pool (optional)" "none"
 WAN_DETECTED=$(detect_wan || true)
 why "The interface facing the internet. Foxguard needs it to NAT traffic for"
 why "peers you let out through the gateway."
+eg "eth0 -- if 'ip a' shows eth0@if30, the name is just eth0"
 ask WAN_IF "Internet-facing interface" "${WAN_DETECTED:-eth0}" v_iface
+WAN_IF=$(strip_ifindex "$WAN_IF")
 
 # --------------------------------------------------------------------------- #
 section "3. The control plane"

@@ -81,6 +81,11 @@ confirm() {
   [[ $ASSUME_YES -eq 1 ]] && return 0
   local reply
   read -r -p "  ${1} [y/N] " reply </dev/tty || die "no terminal to prompt on; pass --yes"
+  # ${reply,,} is compared against a bare "y", and a console that sends CRLF --
+  # Proxmox noVNC, a serial line, some SSH clients -- makes reply $'y\r', which
+  # matches nothing. The prompt then cancels an installation the operator just
+  # agreed to. Strip it rather than trusting the terminal.
+  reply=${reply//$'\r'/}
   [[ ${reply,,} == y || ${reply,,} == yes ]]
 }
 
