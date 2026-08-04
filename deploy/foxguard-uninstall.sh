@@ -366,7 +366,7 @@ fi
 # /etc/letsencrypt, other things on this box may use the same certificate, and
 # re-issuing after an accidental deletion runs into rate limits.
 [[ -d /etc/letsencrypt/live ]] && \
-  say "  note: /etc/letsencrypt is left as it is -- remove the lineage yourself"
+  skip "/etc/letsencrypt is certbot's -- remove the lineage yourself if you want it gone"
 
 for dir in "$PREFIX" "$STATEDIR" "$CONFDIR"; do
   if [[ -d $dir ]]; then

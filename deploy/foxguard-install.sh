@@ -87,6 +87,8 @@ fi
 
 step()  { printf '\n%s==> %s%s\n' "$B" "$*" "$N"; }
 ok()    { printf '  %s✓%s %s\n' "$G" "$N" "$*"; }
+# Plain indented text, for the multi-line instructions that follow an ok/warn.
+say()   { printf '  %s\n' "$*"; }
 warn()  { printf '  %s!%s %s\n' "$Y" "$N" "$*"; }
 fail()  { printf '  %s✗%s %s\n' "$R" "$N" "$*"; }
 die()   { printf '\n%sInstallation stopped:%s %s\n\n' "$R" "$N" "$*" >&2; exit 1; }
@@ -492,10 +494,28 @@ if [[ $PROXY_ENABLED -eq 1 ]]; then
     fail "split mode that makes the resolver answer NXDOMAIN for _acme-challenge"
     PREFLIGHT_FAILED=1
   fi
+  # A listener can only bind an address the kernel already has. Behind NAT the
+  # public address is on the router, and giving it here passes every other
+  # check and then fails at HAProxy start-up with EADDRNOTAVAIL -- which is the
+  # least useful moment to find out.
+  PROXY_LOCAL_BINDS=""
+  for addr in ${PROXY_EXTERNAL_BINDS//,/ }; do
+    if ip -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -qx "$addr"; then
+      ok "$addr is on this box"
+      PROXY_LOCAL_BINDS="${PROXY_LOCAL_BINDS:+$PROXY_LOCAL_BINDS }$addr"
+    else
+      fail "no interface here carries $addr -- that looks like a public address."
+      fail "Bind this box's own address and forward tcp/80 and tcp/443 to it."
+      PREFLIGHT_FAILED=1
+    fi
+  done
+
+  # Only for addresses that exist: "the ports are free on 203.0.113.10" is not
+  # a useful thing to say about an address this box does not have.
   # Column 4 of `ss -ltn` is the local address:port. Not 5 -- that is Peer.
   PROXY_PORTS_FREE=1
   for port in 80 443; do
-    for addr in ${PROXY_EXTERNAL_BINDS//,/ }; do
+    for addr in $PROXY_LOCAL_BINDS; do
       if ss -ltn 2>/dev/null | awk 'NR>1 {print $4}' | grep -qE "(^|[^0-9.])($addr|0\.0\.0\.0|\[::\]):$port$"; then
         fail "tcp/$port on $addr is already taken -- stop that service first"
         PREFLIGHT_FAILED=1
@@ -503,8 +523,8 @@ if [[ $PROXY_ENABLED -eq 1 ]]; then
       fi
     done
   done
-  [[ -n $PROXY_EXTERNAL_BINDS && $PROXY_PORTS_FREE -eq 1 ]] && \
-    ok "tcp/80 and tcp/443 free on $PROXY_EXTERNAL_BINDS"
+  [[ -n $PROXY_LOCAL_BINDS && $PROXY_PORTS_FREE -eq 1 ]] && \
+    ok "tcp/80 and tcp/443 free on $PROXY_LOCAL_BINDS"
   if [[ -n $ACME_EMAIL && -z $ACME_CF_TOKEN ]]; then
     warn "--acme-email without --acme-cf-token: certbot is installed but no"
     warn "certificate is requested, and the proxy runs on a self-signed one"
@@ -1004,6 +1024,18 @@ EXISTING=$(curl -sf -H "Authorization: Bearer $ADMIN_TOKEN" \
 
 if [[ ${EXISTING:-0} -gt 0 ]]; then
   ok "an administrator account already exists"
+  # Silence here is what a re-run looks like, and it is easy to read as "the
+  # script forgot to print my password". It never had one to print: the
+  # password is generated once and stored as an argon2 hash. Say so, and say
+  # what to do about it, rather than leaving a gap where a secret used to be.
+  say "  no password is shown on a re-run -- the first one was generated once"
+  say "  and only its hash is stored. To set a new one:"
+  say ""
+  say "    TOKEN=\$(sed -n 's/^FOXGUARD_ADMIN_API_TOKEN=//p' $CONFDIR/backend.env)"
+  say "    ID=\$(curl -s -H \"Authorization: Bearer \$TOKEN\" \\"
+  say "         http://$TUNNEL_IP:$API_PORT/api/v1/users | jq -r '.[]|select(.is_admin)|.id' | head -1)"
+  say "    curl -s -X PATCH -H \"Authorization: Bearer \$TOKEN\" -H 'Content-Type: application/json' \\"
+  say "         -d '{\"password\":\"<a new one>\"}' http://$TUNNEL_IP:$API_PORT/api/v1/users/\$ID"
 else
   ADMIN_PASS=$("$PREFIX/venv/bin/python" -c 'import secrets; print(secrets.token_urlsafe(18))')
   if curl -sf -X POST "http://$TUNNEL_IP:$API_PORT/api/v1/users" \

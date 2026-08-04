@@ -141,6 +141,15 @@ v_cidr() {
 v_ip() {
   [[ $1 =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || { echo "that is not an IPv4 address"; return; }
 }
+
+# A listener binds an address the kernel already has. Behind NAT the public
+# address lives on the router, not here, and asking for it fails at start-up
+# with EADDRNOTAVAIL -- long after the preflight said everything was fine.
+v_local_ip() {
+  local complaint; complaint=$(v_ip "$1"); [[ -n $complaint ]] && { echo "$complaint"; return; }
+  ip -4 -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -qx "$1" && return
+  echo "this box has no address $1 -- a listener can only bind an address that is already here. It has: $(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | tr '\n' ' ')"
+}
 v_port() {
   [[ $1 =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 )) || { echo "a port is 1-65535"; return; }
 }
@@ -221,6 +230,12 @@ if [[ -d /etc/foxguard ]]; then
   why "Re-running is safe: existing tokens and passwords are reused, not"
   why "regenerated, so the agent does not lose its credentials mid-upgrade."
   why "Answer the same way as last time for anything you are not changing."
+  why ""
+  why "One consequence, because it surprises people: the administrator"
+  why "password will NOT be printed again. It was generated once on the first"
+  why "run and only its hash is kept. The installer will tell you how to set a"
+  why "new one. The same goes for a device you already registered -- register"
+  why "a different one, or use the dashboard's config generator."
 fi
 
 ask SRC "Path to the Foxguard source tree" "$(cd "$HERE/.." && pwd)" v_dir
@@ -381,9 +396,15 @@ if yesno "Publish services through the gateway?" n; then
   why "nothing else is needed. From the internet it proves nothing, so every"
   why "externally published service needs a token or a sign-in."
   if yesno "Publish anything to the internet?" n; then
-    why "The address on this box that faces the internet. tcp/80 and tcp/443"
-    why "must be free on it."
-    ask PROXY_EXTERNAL "WAN address to listen on" "$(detect_public_ip || echo '')" v_ip
+    why "This is the address HAProxy binds on *this machine* -- not your public"
+    why "IP. Behind a router they are different, and the public one does not"
+    why "exist here, so binding it would fail at start-up."
+    why ""
+    why "Your public IP belongs in two other places: the A record for"
+    why "*.<domain> in your public DNS, and a port forward on your router"
+    why "sending tcp/80 and tcp/443 to the address you give below."
+    eg "192.168.1.105 -- the LAN address of this box, not 203.0.113.x"
+    ask PROXY_EXTERNAL "WAN-facing address to bind on this box" "$(detect_public_ip || echo '')" v_local_ip
 
     why "Let's Encrypt via the DNS-01 challenge, so nothing has to be publicly"
     why "reachable to prove ownership -- and internal-only services never get"
