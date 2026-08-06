@@ -330,10 +330,10 @@ def test_bearer_without_a_token_is_refused():
 # --------------------------------------------------------------------------- #
 
 
-@pytest.mark.parametrize(
-    "kind", [FilterKind.GEO_ALLOW, FilterKind.GEO_DENY, FilterKind.CROWDSEC]
-)
+@pytest.mark.parametrize("kind", [FilterKind.CROWDSEC, FilterKind.WAF])
 def test_unimplemented_filters_are_refused_rather_than_ignored(kind):
+    """Geo left this list in phase D. CrowdSec and the WAF are one project and
+    have not."""
     with pytest.raises(ProxyValidationError, match="not implemented"):
         render_conf(_spec(_service(filters=(Filter(kind, Scope.INTERNAL),))))
 
@@ -682,3 +682,152 @@ def test_the_user_header_is_set_from_the_verified_claim():
     assert conf.index("del-header X-Foxguard-User") < conf.index(
         "set-header X-Foxguard-User"
     )
+
+
+# --------------------------------------------------------------------------- #
+# rate limiting
+# --------------------------------------------------------------------------- #
+
+
+def _rate_limited(rate=10, period=60):
+    return _spec(
+        _service(
+            filters=(
+                Filter(
+                    FilterKind.RATE_LIMIT,
+                    Scope.INTERNAL,
+                    rate=rate,
+                    period_seconds=period,
+                ),
+            ),
+        )
+    )
+
+
+def test_a_rate_limit_gets_a_table_sized_to_its_own_window():
+    conf = render_conf(_rate_limited(rate=10, period=60))
+    assert "stick-table type ip size 100k expire 120s store http_req_rate(60s)" in conf
+    assert "http-request track-sc0 src table" in conf
+    assert "{ sc_http_req_rate(0) gt 10 }" in conf
+
+
+def test_the_refusal_says_when_to_come_back():
+    """A 429 with no Retry-After is a refusal a client cannot act on.
+
+    Rendered as ``return`` rather than ``deny`` for exactly this: ``deny`` takes
+    a status and nothing else, so the header would have nowhere to go.
+    """
+    conf = render_conf(_rate_limited(period=45))
+    refusal = next(row for row in conf.splitlines() if "status 429" in row)
+    assert 'hdr retry-after "45"' in refusal
+    assert "retry in 45s" in refusal
+
+
+def test_a_rate_limit_with_half_its_numbers_is_refused():
+    with pytest.raises(ProxyValidationError, match="needs both a rate and a period"):
+        render_conf(
+            _spec(
+                _service(
+                    filters=(Filter(FilterKind.RATE_LIMIT, Scope.INTERNAL, rate=10),),
+                )
+            )
+        )
+
+
+# --------------------------------------------------------------------------- #
+# geography
+# --------------------------------------------------------------------------- #
+
+
+def _geo(kind, *countries, scope=Scope.INTERNAL):
+    return _spec(_service(filters=(Filter(kind, scope, values=countries),)))
+
+
+def test_an_allow_list_denies_everyone_it_does_not_name():
+    conf = render_conf(_geo(FilterKind.GEO_ALLOW, "FR", "CH"))
+    line = next(row for row in conf.splitlines() if "map_ip" in row)
+    # Negated: deny unless the lookup says one of these.
+    assert "!{ src,map_ip(/etc/foxguard/proxy/maps/geo.map) -m str FR CH }" in line
+    assert line.strip().startswith("http-request deny")
+
+
+def test_a_deny_list_denies_only_who_it_names():
+    conf = render_conf(_geo(FilterKind.GEO_DENY, "CN", "RU"))
+    line = next(row for row in conf.splitlines() if "map_ip" in row)
+    assert "{ src,map_ip(/etc/foxguard/proxy/maps/geo.map) -m str CN RU }" in line
+    assert "!{" not in line
+
+
+def test_every_service_shares_one_map():
+    """Not a pattern file per service: the map is built from the union, and the
+    union is what keeps it 47 MiB of memory instead of 367."""
+    spec = _spec(
+        _service(filters=(Filter(FilterKind.GEO_DENY, Scope.INTERNAL, values=("CN",)),)),
+        _service(
+            slug="other",
+            internal_hostname="b.example.com",
+            filters=(Filter(FilterKind.GEO_ALLOW, Scope.INTERNAL, values=("FR",)),),
+        ),
+    )
+    conf = render_conf(spec)
+    assert conf.count("geo.map") == 2
+    assert "geo_app" not in conf and "geo_other" not in conf
+
+
+def test_the_countries_the_gateway_must_cover_are_the_union():
+    spec = _spec(
+        _service(
+            filters=(Filter(FilterKind.GEO_DENY, Scope.INTERNAL, values=("RU", "CN")),)
+        ),
+        _service(
+            slug="other",
+            internal_hostname="b.example.com",
+            filters=(
+                Filter(FilterKind.GEO_ALLOW, Scope.INTERNAL, values=("FR", "CN")),
+            ),
+        ),
+    )
+    assert spec.geo_countries == ("CN", "FR", "RU")
+    assert spec.uses_geo
+
+
+def test_a_spec_with_no_geo_filter_asks_for_no_countries():
+    spec = _spec(_service())
+    assert spec.geo_countries == ()
+    assert not spec.uses_geo
+    assert "geo.map" not in render_conf(spec)
+
+
+@pytest.mark.parametrize("code", ["fr", "FRA", "F", "F1", "", "FR,CH"])
+def test_a_value_that_is_not_a_country_code_is_refused(code):
+    with pytest.raises(ProxyValidationError, match="ISO 3166-1"):
+        render_conf(_geo(FilterKind.GEO_ALLOW, code))
+
+
+def test_an_empty_allow_list_is_refused_for_what_it_would_do():
+    with pytest.raises(ProxyValidationError, match="would deny everything"):
+        render_conf(_geo(FilterKind.GEO_ALLOW))
+
+
+def test_an_empty_deny_list_is_refused_for_what_it_would_not_do():
+    """The other half of "a filter that does nothing is worse than one that
+    refuses to save"."""
+    with pytest.raises(ProxyValidationError, match="would do nothing at all"):
+        render_conf(_geo(FilterKind.GEO_DENY))
+
+
+def test_geo_applies_to_a_passthrough_service_too():
+    """Unlike the WAF: this reads a source address, not a request."""
+    conf = render_conf(
+        _spec(
+            _service(
+                kind=ServiceKind.TCP,
+                listen_port=20000,
+                internal_hostname=None,
+                filters=(
+                    Filter(FilterKind.GEO_DENY, Scope.INTERNAL, values=("CN",)),
+                ),
+            )
+        )
+    )
+    assert "tcp-request content reject if { src,map_ip" in conf

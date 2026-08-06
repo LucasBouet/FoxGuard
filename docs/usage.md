@@ -440,6 +440,35 @@ Two behaviours worth knowing before you rely on it:
 Each door can ask for something different. "Anyone signed in, from the tunnel;
 only `infra`, from the internet" is one service with two ways in.
 
+### Narrowing further: addresses, countries, rate
+
+*Services > Policy > Restrictions* holds the rules that **narrow** rather than
+admit. They are ANDed with each other and with whatever way in the caller used,
+so a restriction can never let somebody in — only keep them out.
+
+- **Only / never these addresses** — a list of addresses or prefixes.
+- **Only / never these countries** — two-letter codes, `FR, CH`.
+- **Rate limit** — requests per period, per source address. A caller over the
+  limit gets `429` with a `Retry-After` naming the period, so a well-behaved
+  client knows when to come back instead of guessing.
+
+**About the country filters.** They are noise reduction, not a security control:
+anybody who cares defeats one with a VPN in a single click. Use them to quiet
+the background scanning on an externally published service, not to protect
+anything.
+
+They also need data Foxguard does not own. The gateway builds its own prefix
+map, from a dataset refreshed weekly by `foxguard-geo-refresh.timer`. Two things
+follow:
+
+- **Until that has run at least once, the map is empty** — an allow list then
+  refuses everyone and a deny list blocks nobody. The dashboard says so, and the
+  map file itself says so in a comment. Fetch it now with
+  `systemctl start foxguard-geo-refresh`, or pass `--geo-now` at install time.
+- **Only the countries you actually name are downloaded into the map.** That is
+  a deliberate memory trade: the whole world costs HAProxy about 367 MiB, three
+  countries about 47. Naming a fourth country rebuilds the map on the next poll.
+
 ## What your users see
 
 One page, at the portal address. It tells them which device this is, and offers

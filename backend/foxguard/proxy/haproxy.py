@@ -35,6 +35,7 @@ import re
 from collections.abc import Iterator
 
 from .model import (
+    GEO_FILTERS,
     HTTP_ONLY_AUTH,
     HTTP_ONLY_FILTERS,
     SLUG_RE,
@@ -91,6 +92,10 @@ _MAX_PORT = 65535
 #: here because it is what makes ``GROUP_DELIMITER`` unambiguous: a slug that
 #: could contain a comma would let one group's name impersonate two.
 GROUP_SLUG = re.compile(r"^[a-z0-9][a-z0-9_-]{0,23}$")
+#: ISO 3166-1 alpha-2, upper case. Not validated against a list of real
+#: countries: the list changes, the dataset is the authority on what it holds,
+#: and an unknown-but-well-formed code simply matches nothing.
+COUNTRY_CODE = re.compile(r"^[A-Z]{2}$")
 _SET_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,47}$")
 _USERNAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
 _OPTION_RE = re.compile(r"^[a-z0-9][a-z0-9. _-]*[^\r\n]*$")
@@ -385,6 +390,23 @@ def _validate_policy(spec: ProxySpec, service: Service) -> None:
                 f"service {service.slug!r}: filter {item.kind.value} needs the "
                 "plaintext and this service is TCP passthrough"
             )
+        if item.kind in GEO_FILTERS:
+            if not item.values:
+                raise ProxyValidationError(
+                    f"service {service.slug!r}: a {item.kind.value} filter with no "
+                    "countries "
+                    + (
+                        "would deny everything"
+                        if item.kind is FilterKind.GEO_ALLOW
+                        else "would do nothing at all"
+                    )
+                )
+            for value in item.values:
+                if not COUNTRY_CODE.fullmatch(value):
+                    raise ProxyValidationError(
+                        f"service {service.slug!r}: {value!r} is not an ISO 3166-1 "
+                        "alpha-2 country code (two upper-case letters, e.g. 'FR')"
+                    )
         if item.kind in (FilterKind.IP_ALLOW, FilterKind.IP_DENY):
             if not item.values:
                 raise ProxyValidationError(
@@ -777,11 +799,32 @@ def _service_rules(
         elif item.kind is FilterKind.IP_ALLOW:
             path = f"{spec.maps_dir}/{ipfilter_file(service.slug, index)}"
             yield f"{prefix}{deny}{cond(f'!{{ src -f {path} }}')}"
+        elif item.kind in GEO_FILTERS:
+            # One lookup against a prefix map the gateway builds. Deliberately
+            # not a per-service pattern file: the map holds only the countries
+            # somebody named, so every service shares one, and the union is what
+            # keeps it 47 MiB of memory instead of 367.
+            #
+            # An address in none of those countries does not match -- measured,
+            # ``map_ip`` returns nothing and ``-m str`` is false. That is the
+            # right answer for both directions: an allow list refuses it, a deny
+            # list ignores it.
+            lookup = f"src,map_ip({spec.maps_dir}/{spec.geo_map})"
+            codes = " ".join(item.values)
+            negate = "" if item.kind is FilterKind.GEO_DENY else "!"
+            yield f"{prefix}{deny}{cond(f'{negate}{{ {lookup} -m str {codes} }}')}"
         elif item.kind is FilterKind.RATE_LIMIT and http:
             table = table_name(service.slug)
             yield f"{prefix}http-request track-sc0 src table {table}{cond()}"
+            # ``return`` rather than ``deny``, purely so the refusal can carry a
+            # header: a 429 with no Retry-After tells a client it was refused and
+            # nothing about when to come back, so well-behaved ones guess and
+            # badly-behaved ones hammer. The period is the honest answer -- the
+            # counter is a sliding window over exactly that long.
             yield (
-                f"{prefix}http-request deny deny_status 429"
+                f"{prefix}http-request return status 429 content-type text/plain "
+                f'hdr retry-after "{item.period_seconds}" '
+                f'lf-string "too many requests -- retry in {item.period_seconds}s"'
                 f"{cond(f'{{ sc_http_req_rate(0) gt {item.rate} }}')}"
             )
 

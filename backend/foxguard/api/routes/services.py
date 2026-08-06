@@ -353,8 +353,11 @@ def _add_child(
     # is already loaded, and a bare INSERT would leave the validator looking at
     # a state that is not the one about to commit.
     collection.append(row)
-    session.flush()
     try:
+        # The flush is inside the try, not before it: a duplicate authenticator
+        # violates uq_service_auth_kind *here*, and leaving it outside turned
+        # "you already have that way in" into a 500.
+        session.flush()
         regenerate_or_422(session, settings, actor="admin-api")
     except HTTPException:
         session.rollback()

@@ -122,6 +122,27 @@ class AgentSettings(BaseSettings):
     def proxy_maps_dir(self) -> Path:
         return self.proxy_dir / "maps"
 
+    @property
+    def geo_dataset_path(self) -> Path:
+        """The downloaded dataset. State, not configuration.
+
+        Under ``state_dir`` because it is a cache of somebody else's data that
+        the agent replaces wholesale every month, not something an operator
+        edits -- and because nothing breaks if it is deleted.
+        """
+        return self.state_dir / "dbip-country-lite.csv.gz"
+
+    @property
+    def geo_map_path(self) -> Path:
+        """The built map, which lives beside the other pattern files.
+
+        Its name is deliberately outside the prefixes the applier treats as
+        Foxguard-rendered: it is built here rather than sent by the control
+        plane, so the reconcile loop must not see it as an unexpected file and
+        delete it.
+        """
+        return self.proxy_maps_dir / "geo.map"
+
 
 @functools.lru_cache
 def get_agent_settings() -> AgentSettings:

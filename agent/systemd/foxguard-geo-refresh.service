@@ -1,0 +1,36 @@
+[Unit]
+Description=Refresh the Foxguard country prefix dataset
+Documentation=https://github.com/your-org/foxguard
+# Deliberately separate from foxguard-agent. The agent installs firewall rules,
+# and making that loop depend on a third party's web server being reachable
+# would mean a ruleset that fails to apply because somebody else had an outage.
+# This runs on a timer instead; if it fails the previous dataset is still there.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/foxguard/agent.env
+ExecStart=/opt/foxguard/venv/bin/foxguard-geo-refresh --rebuild
+
+# It downloads a file and writes it under /var/lib/foxguard. It needs no
+# capabilities at all -- notably not CAP_NET_ADMIN, which the agent does need.
+User=root
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# The dataset itself, and the map the agent rebuilds from it.
+ReadWritePaths=/var/lib/foxguard /etc/foxguard/proxy/maps
+
+[Install]
+WantedBy=multi-user.target

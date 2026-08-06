@@ -2774,3 +2774,141 @@ def test_an_unchanged_membership_does_not_sign_anybody_out(api, tag):
         if row["username"] == username
     ]
     assert still, "an unchanged membership ended the session anyway"
+
+
+# --------------------------------------------------------------------------- #
+# geography
+# --------------------------------------------------------------------------- #
+
+
+def test_a_service_can_refuse_countries(api, tag):
+    peer = _active_peer(api, tag)
+    response = _service(
+        api, tag, peer,
+        filters=[{"kind": "geo_deny", "scope": "both", "values": ["CN", "RU"]}],
+    )
+    assert response.status_code == 201, response.text
+    item = response.json()["filters"][0]
+    assert item["kind"] == "geo_deny"
+    assert item["values"] == ["CN", "RU"]
+    # Cleaned up because the country set is a property of the whole proxy, not
+    # of one service: a leftover here changes what the next test observes.
+    api.delete(f"/api/v1/services/{response.json()['id']}")
+
+
+@pytest.mark.parametrize("code", ["fr", "FRA", "F", "F1"])
+def test_a_value_that_is_not_a_country_code_is_refused(api, tag, code):
+    peer = _active_peer(api, tag)
+    response = _service(
+        api, tag, peer,
+        filters=[{"kind": "geo_allow", "scope": "both", "values": [code]}],
+    )
+    assert response.status_code == 422, response.text
+    assert "ISO 3166-1" in response.text
+
+
+def test_an_address_is_not_a_country(api, tag):
+    """``values`` means one thing for an ip filter and another for a geo one."""
+    peer = _active_peer(api, tag)
+    response = _service(
+        api, tag, peer,
+        filters=[{"kind": "geo_deny", "scope": "both", "values": ["203.0.113.0/24"]}],
+    )
+    assert response.status_code == 422, response.text
+
+
+def test_a_country_is_not_an_address(api, tag):
+    peer = _active_peer(api, tag)
+    response = _service(
+        api, tag, peer,
+        filters=[{"kind": "ip_deny", "scope": "both", "values": ["FR"]}],
+    )
+    assert response.status_code == 422, response.text
+
+
+def test_an_empty_country_list_is_refused(api, tag):
+    peer = _active_peer(api, tag)
+    response = _service(
+        api, tag, peer,
+        filters=[{"kind": "geo_allow", "scope": "both", "values": []}],
+    )
+    assert response.status_code == 422, response.text
+
+
+def test_the_countries_the_gateway_must_cover_reach_it(api, tag):
+    """The gateway builds its own map, so what travels is the question."""
+    peer = _active_peer(api, tag)
+    created = _service(
+        api, tag, peer,
+        filters=[{"kind": "geo_deny", "scope": "both", "values": ["RU", "CN"]}],
+    )
+    assert created.status_code == 201, created.text
+
+    state = api.get("/api/v1/agent/state").json()
+    assert state["proxy"] is not None
+    assert set(state["proxy"]["geo_countries"]) >= {"CN", "RU"}
+    # And the map itself is emphatically *not* in the payload: 27 MiB of
+    # prefixes must never travel on every poll.
+    assert "geo.map" not in state["proxy"]["files"]
+    assert "map_ip" in state["proxy"]["conf"]
+    api.delete(f"/api/v1/services/{created.json()['id']}")
+
+
+def test_the_status_endpoint_warns_about_what_geo_depends_on(api, tag):
+    peer = _active_peer(api, tag)
+    created = _service(
+        api, tag, peer,
+        filters=[{"kind": "geo_allow", "scope": "both", "values": ["FR"]}],
+    )
+    assert created.status_code == 201, created.text
+    status_body = api.get("/api/v1/proxy").json()
+    assert "FR" in status_body["geo_countries"]
+    joined = " ".join(status_body["warnings"])
+    assert "geo-refresh" in joined
+    # Sold as what it is, in the place an operator actually looks.
+    assert "not a security control" in joined
+    api.delete(f"/api/v1/services/{created.json()['id']}")
+
+
+def test_removing_a_geo_filter_stops_this_service_asking_for_countries(api, tag):
+    """Asserted per service, not globally.
+
+    ``geo_countries`` is the union across every published service, so another
+    test's leftover would make a global assertion pass or fail for reasons that
+    have nothing to do with this one.
+    """
+    peer = _active_peer(api, tag)
+    created = _service(
+        api, tag, peer,
+        filters=[{"kind": "geo_deny", "scope": "both", "values": ["CN"]}],
+    ).json()
+    conf = api.get("/api/v1/agent/state").json()["proxy"]["conf"]
+    assert any(
+        f"h_{created['slug']}" in line and "map_ip" in line
+        for line in conf.splitlines()
+    ), "the filter never reached the configuration"
+
+    filter_id = created["filters"][0]["id"]
+    after = api.delete(f"/api/v1/services/{created['id']}/filters/{filter_id}")
+    assert after.status_code == 200, after.text
+    assert after.json()["filters"] == []
+
+    conf = api.get("/api/v1/agent/state").json()["proxy"]["conf"]
+    assert not any(
+        f"h_{created['slug']}" in line and "map_ip" in line
+        for line in conf.splitlines()
+    )
+    api.delete(f"/api/v1/services/{created['id']}")
+
+
+def test_a_duplicate_way_in_is_a_conflict_not_a_crash(api, tag):
+    """uq_service_auth_kind fires on the flush, which used to escape the guard."""
+    peer = _active_peer(api, tag)
+    created = _service(api, tag, peer).json()
+    again = api.post(
+        f"/api/v1/services/{created['id']}/auth",
+        json={"kind": "peer_identity", "scope": "internal"},
+    )
+    assert again.status_code == 409, again.text
+    assert "uq_service_auth_kind" in again.text
+    api.delete(f"/api/v1/services/{created['id']}")

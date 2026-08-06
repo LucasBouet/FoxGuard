@@ -371,6 +371,7 @@ why "internal wiki, an SSH jump host. The gateway fronts them, checks who is"
 why "asking, and never exposes the device itself."
 PROXY_ENABLED=0
 SSO_ENABLED=0
+GEO_NOW=0
 PROXY_DOMAIN=""
 PROXY_EXTERNAL=""
 ACME_EMAIL=""
@@ -429,6 +430,16 @@ if yesno "Publish services through the gateway?" n; then
     SSO_ENABLED=1
     ok "the login page will be at auth.$PROXY_DOMAIN"
   fi
+
+  why "Country filters let a service refuse whole countries. This downloads a"
+  why "prefix dataset (~4 MiB, from db-ip.com) now instead of waiting for the"
+  why "weekly timer. Say no and nothing breaks -- the timer still runs, and you"
+  why "can fetch it any time with: systemctl start foxguard-geo-refresh"
+  warn "geo is noise reduction, not security: any VPN defeats it in one click"
+  if yesno "Download the country dataset now?" n; then
+    GEO_NOW=1
+    ok "it will be fetched during the install"
+  fi
 fi
 
 # --------------------------------------------------------------------------- #
@@ -475,6 +486,7 @@ if [[ $PROXY_ENABLED -eq 1 ]]; then
   [[ -n $ACME_EMAIL ]] && add --acme-email "$ACME_EMAIL"
   [[ -n $ACME_CF_TOKEN ]] && add --acme-cf-token "$ACME_CF_TOKEN"
   [[ $SSO_ENABLED -eq 1 ]] && add --sso
+  [[ $GEO_NOW -eq 1 ]] && add --geo-now
 fi
 [[ -n $BOOTSTRAP_PEER ]] && add --bootstrap-peer "$BOOTSTRAP_PEER"
 

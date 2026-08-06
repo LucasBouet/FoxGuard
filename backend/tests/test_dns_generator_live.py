@@ -13,7 +13,7 @@ because the interesting failures are all in the seam:
 
 Opt-in, because it starts a process and binds a port::
 
-    FOXGUARD_LIVE_DNS=1 pytest tests/test_dns_live.py
+    FOXGUARD_LIVE_DNS=1 pytest tests/test_dns_generator_live.py
 
 or ``make test-dns-live``. Skipped otherwise, and skipped if ``dnsmasq`` or
 ``dig`` is not installed.

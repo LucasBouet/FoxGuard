@@ -1,0 +1,17 @@
+[Unit]
+Description=Refresh the Foxguard country prefix dataset monthly
+Documentation=https://github.com/your-org/foxguard
+
+[Timer]
+# The dataset is published once a month, so anything more frequent is load on
+# somebody else's server for no new data. Weekly rather than monthly only
+# because a single missed run should not leave the map stale for eight weeks.
+OnCalendar=weekly
+# Spread over six hours: every Foxguard gateway in the world running this timer
+# would otherwise hit the same host at the same minute.
+RandomizedDelaySec=6h
+# So a box that was off on the scheduled day still refreshes when it comes back.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

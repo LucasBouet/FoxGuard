@@ -1411,5 +1411,56 @@ everybody.
 
 ### What is still missing
 
-**mTLS**, and the geo/WAF/CrowdSec filters the schema accepts and the validator
+**mTLS**, and the WAF/CrowdSec filters the schema accepts and the validator
 refuses. See the roadmap.
+
+---
+
+## 21. Geography: a design decided by a measurement
+
+The plan for geo said "load the prefixes as a map through the Runtime API, never
+rendered into the config". Measuring it changed the design, so the numbers are
+worth recording. Against the real DB-IP dataset and real HAProxy 3.0.11:
+
+| map | entries | on disk | HAProxy RSS |
+| --- | --- | --- | --- |
+| none | — | — | 24.9 MiB |
+| three countries, IPv4 only | 33,948 | 0.6 MiB | 34.4 MiB |
+| three countries, IPv4 and IPv6 | 170,966 | 3.4 MiB | 71.5 MiB |
+| the whole world | 1,372,328 | 26.6 MiB | 391.7 MiB |
+
+367 MiB of resident memory for a feature described as "noise reduction" is not a
+trade worth making on a gateway that is often a 512 MiB container. So **the map
+holds only the countries some filter actually names**, and the union is built
+from the whole spec — every service shares one file rather than owning a slice.
+
+The IPv6 half is where the weight is: 33,948 IPv4 prefixes against 137,018 IPv6
+ones for the same three countries. Worth knowing before anybody proposes
+trimming elsewhere.
+
+**A partial map is correct, not a compromise.** Measured: `map_ip` returns
+nothing for an address in no listed country, and `-m str` is then false. An
+allow list renders as `deny if !{...}` and refuses it; a deny list renders as
+`deny if {...}` and ignores it. Each is what the operator asked for.
+
+**The dataset never crosses the API.** `AgentProxyState` carries
+`geo_countries` — the *question* — and the gateway answers it locally. 27 MiB of
+prefixes on every poll would dwarf everything else in that response, and only
+the gateway knows when it last refreshed.
+
+**Refreshing is a timer, never a reconcile.** `foxguard-geo-refresh.timer` runs
+weekly with a six-hour jitter. The reconciliation loop installs firewall rules,
+and making it depend on db-ip.com being reachable would mean a ruleset that
+fails to apply because somebody else had an outage.
+
+**No dataset writes an empty map rather than none.** `haproxy -c` resolves `-f`
+at parse time, so a *missing* map fails the whole configuration and takes every
+unrelated service down with it. An empty one fails closed for an allow list and
+open for a deny list — and because the second is silent, the agent reports it,
+the dashboard warns, and the file says so in its own header. An empty build
+writes **no stamp**, so it is retried rather than mistaken for finished; that
+was a real bug, caught by a test written to cover the case.
+
+DB-IP lite over MaxMind's GeoLite2 purely because it needs no account and no
+licence key. It is CC-BY-4.0, so the attribution is a comment in every generated
+map.

@@ -18,6 +18,10 @@ dev = ["pytest>=8.2", "ruff>=0.6"]
 
 [project.scripts]
 foxguard-agent = "foxguard_agent.main:main"
+# Refreshing the geo dataset is a scheduled command, never part of a
+# reconcile: the loop that installs firewall rules must not depend on a
+# third party's web server being up.
+foxguard-geo-refresh = "foxguard_agent.main:geo_refresh"
 
 [build-system]
 requires = ["setuptools>=68"]

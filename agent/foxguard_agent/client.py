@@ -39,6 +39,12 @@ class ProxyState:
     #: Pattern files the configuration references, keyed by base name. They
     #: travel with it because ``haproxy -c`` resolves ``-f`` at parse time.
     files: dict[str, str]
+    #: Countries the geo map must cover, or empty when nothing uses geo. The
+    #: map itself is built here rather than sent: the whole world is 1.37
+    #: million prefixes and 367 MiB of HAProxy memory, the countries somebody
+    #: actually named are a fraction of that, and only the gateway knows when it
+    #: last refreshed its dataset.
+    geo_countries: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +61,22 @@ class DesiredState:
     #: ``None`` when the proxy is off, or when the control plane could not
     #: render a valid configuration. Both mean "leave the proxy alone".
     proxy: ProxyState | None = None
+
+
+def _proxy_state(payload: dict | None) -> ProxyState | None:
+    """Build a :class:`ProxyState`, tolerating a control plane that predates a field.
+
+    The agent is the component upgraded last, so a key it has never heard of
+    must not turn a whole reconciliation into a ``TypeError``. Same reasoning as
+    the ``.get`` on ``dns`` above, applied per field rather than per block.
+    """
+    if not payload:
+        return None
+    known = {name for name in ProxyState.__annotations__}
+    data = {name: value for name, value in payload.items() if name in known}
+    if "geo_countries" in data:
+        data["geo_countries"] = tuple(data["geo_countries"])
+    return ProxyState(**data)
 
 
 class ControlPlaneClient:
@@ -91,7 +113,7 @@ class ControlPlaneClient:
                 for route in payload.get("routes", [])
             ),
             dns=DnsState(**dns) if dns else None,
-            proxy=ProxyState(**proxy) if proxy else None,
+            proxy=_proxy_state(proxy),
         )
 
     def report(

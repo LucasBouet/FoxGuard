@@ -3,7 +3,7 @@
 Written the same way as the nftables tests: safety properties first (no
 injection, no open resolver, no name hijack, no leak of internal names) and
 feature coverage second. Nothing here needs root, a database or dnsmasq --
-``test_dns_live.py`` covers what only a real daemon can prove.
+``test_dns_generator_live.py`` covers what only a real daemon can prove.
 """
 
 from __future__ import annotations

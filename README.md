@@ -600,9 +600,19 @@ These are enforced in code and covered by tests, not just documented:
   names what they lack, never a redirect — that would bounce a valid cookie
   round a loop nothing on the client can break. Changing a membership revokes
   the sessions carrying it.
-- **Still open.** Geo restrictions, and CrowdSec — whose AppSec component is a
-  Coraza WAF, so the bouncer and the WAF are one integration rather than two.
-  Then mTLS.
+- **Phase 7e — geo restrictions, done.** A service can name the countries it
+  admits or refuses. The measurement that shaped it: the whole world is 1.37
+  million prefixes and **367 MiB of HAProxy memory** over an empty
+  configuration, so the gateway builds a map holding only the countries some
+  filter actually names — three countries cost 47 MiB. A partial map is correct
+  rather than a compromise, because an address in no listed country matches
+  nothing, which an allow list reads as "refuse" and a deny list as "ignore".
+  The 27 MiB dataset never crosses the API; only the list of countries does.
+  Refreshing it is a systemd timer and never part of a reconciliation — the loop
+  that installs firewall rules must not fail because someone else's web server
+  is down. Sold as noise reduction, not security: any VPN defeats it.
+- **Still open.** CrowdSec — whose AppSec component is a Coraza WAF, so the
+  bouncer and the WAF are one integration rather than two. Then mTLS.
 
 ## License
 

@@ -130,6 +130,7 @@ def get_state(
             maps_dir=settings.proxy_maps_dir,
             certs_dir=settings.proxy_certs_dir,
             runtime_socket=settings.proxy_runtime_socket,
+            geo_countries=list(proxied.geo_countries),
         )
         if proxied
         else None

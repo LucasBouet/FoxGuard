@@ -73,6 +73,9 @@ PROXY_DOMAIN=""
 PROXY_EXTERNAL_BINDS=""
 ACME_EMAIL=""
 ACME_CF_TOKEN=""
+# Fetch the country prefix dataset during install. Off by default: it is an
+# outbound call to a third party, and an operator should opt into that.
+GEO_NOW=no
 SSO_ENABLED=0
 
 # --------------------------------------------------------------------------- #
@@ -245,6 +248,11 @@ Reverse proxy (opt-in — publishes services that live behind peers):
                          token scoped to Zone:DNS:Edit on that one zone, never
                          the global API key: the wildcard it obtains covers the
                          whole domain.
+  --geo-now              Download the country prefix dataset (~4 MiB, from
+                         db-ip.com) during the install rather than waiting for
+                         the weekly timer. Only needed if you intend to use
+                         country filters. Geo is noise reduction, not a
+                         security control -- any VPN defeats it.
   -y, --yes              Do not prompt
   -h, --help             This text
 
@@ -285,6 +293,7 @@ while [[ $# -gt 0 ]]; do
     --proxy-domain)    PROXY_DOMAIN=$2; PROXY_ENABLED=1; shift 2 ;;
     --proxy-external)  PROXY_EXTERNAL_BINDS="${PROXY_EXTERNAL_BINDS:+$PROXY_EXTERNAL_BINDS,}$2"; PROXY_ENABLED=1; shift 2 ;;
     --sso)             SSO_ENABLED=1; PROXY_ENABLED=1; shift ;;
+    --geo-now)         GEO_NOW=yes; PROXY_ENABLED=1; shift ;;
     --acme-email)      ACME_EMAIL=$2; shift 2 ;;
     --acme-cf-token)   ACME_CF_TOKEN=$2; shift 2 ;;
     --bootstrap-wireguard) BOOTSTRAP_WG=1; shift ;;
@@ -945,6 +954,34 @@ if [[ $PROXY_ENABLED -eq 1 ]]; then
   sed -i "s|/etc/foxguard/proxy|$CONFDIR/proxy|g; s|wg-quick@wg0.service|wg-quick@$WG_IF.service|" \
       /etc/systemd/system/foxguard-proxy.service
   ok "foxguard-proxy unit installed (started by the agent once it has a config)"
+
+  # Country filters need a prefix dataset, and the reconciliation loop must
+  # never fetch it: that loop installs firewall rules, and a ruleset that fails
+  # to apply because db-ip.com had an outage is not a trade worth making. The
+  # timer is installed either way -- it costs nothing until a filter exists, and
+  # discovering it is missing on the day you add one is worse.
+  render_unit "$SRC/agent/systemd/foxguard-geo-refresh.service" \
+              /etc/systemd/system/foxguard-geo-refresh.service
+  render_unit "$SRC/agent/systemd/foxguard-geo-refresh.timer" \
+              /etc/systemd/system/foxguard-geo-refresh.timer
+  sed -i "s|/etc/foxguard/proxy|$CONFDIR/proxy|g" \
+      /etc/systemd/system/foxguard-geo-refresh.service
+  systemctl enable --now foxguard-geo-refresh.timer >/dev/null 2>&1 || true
+  ok "foxguard-geo-refresh.timer enabled (weekly, for country filters)"
+
+  if [[ $GEO_NOW == yes ]]; then
+    step "fetching the country prefix dataset"
+    if "$VENV/bin/foxguard-geo-refresh" >/dev/null 2>&1; then
+      ok "country dataset downloaded"
+    else
+      warn "could not download the country dataset -- geo filters will refuse"
+      warn "everyone (allow lists) or nobody (deny lists) until it succeeds"
+      say "retry with: systemctl start foxguard-geo-refresh.service"
+    fi
+  else
+    say "geo filters also need: systemctl start foxguard-geo-refresh.service"
+    say "(about 4 MiB, from db-ip.com -- skipped unless you pass --geo-now)"
+  fi
 
   if [[ -n $ACME_CF_TOKEN ]]; then
     install -d -m 0700 "$CONFDIR/proxy"

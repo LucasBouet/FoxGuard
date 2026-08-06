@@ -35,6 +35,7 @@ import type {
   Service,
   ServiceAccountCreated,
   ServiceAuthKind,
+  ServiceFilterKind,
   ServiceExposure,
   ServiceKind,
   ServiceScope,
@@ -641,6 +642,35 @@ export async function removeServiceAuth(
 ): Promise<Result<Service>> {
   const result = await run(() =>
     api.delete<Service>(`/api/v1/services/${serviceId}/auth/${authId}`),
+  );
+  if (result.ok) refreshEverything();
+  return result;
+}
+
+export async function addServiceFilter(
+  serviceId: string,
+  input: {
+    kind: ServiceFilterKind;
+    scope: ServiceScope;
+    /** Addresses for `ip_*`, ISO country codes for `geo_*`, unused otherwise. */
+    values?: string[];
+    rate?: number;
+    period_seconds?: number;
+  },
+): Promise<Result<Service>> {
+  const result = await run(() =>
+    api.post<Service>(`/api/v1/services/${serviceId}/filters`, input),
+  );
+  if (result.ok) refreshEverything();
+  return result;
+}
+
+export async function removeServiceFilter(
+  serviceId: string,
+  filterId: string,
+): Promise<Result<Service>> {
+  const result = await run(() =>
+    api.delete<Service>(`/api/v1/services/${serviceId}/filters/${filterId}`),
   );
   if (result.ok) refreshEverything();
   return result;

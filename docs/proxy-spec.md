@@ -716,10 +716,23 @@ keeps the project's normal lowercase-hex convention and the config lowercases.
   matched with `-m sub`, where several patterns are an OR and the wrapping is
   what prevents `infra` matching `infrastructure`. A valid session that fails
   the check must return 403 — a redirect loops forever against its own cookie.
-* **Phase D** — geo. GeoLite2 now needs a MaxMind account and `geoipupdate`;
-  DB-IP lite is the no-account alternative. Load as a map through the Runtime
-  API, never rendered into the config: hundreds of thousands of prefixes. Sell
-  it as noise reduction, not security — any VPN defeats it.
+* **Phase D — geo.** *(Shipped.)* DB-IP lite, chosen over GeoLite2 because it
+  needs no MaxMind account. The plan said "load as a map through the Runtime
+  API, never rendered into the config: hundreds of thousands of prefixes", and
+  measurement changed the shape: the whole world is **1,372,328** prefixes,
+  26.6 MiB on disk and **367 MiB of HAProxy RSS** over an empty configuration.
+  So the map holds only the countries some filter names — three countries cost
+  47 MiB, and their IPv4 half alone costs 9. It is a plain `-f` map file rather
+  than a runtime push, because a million entries pushed one line at a time is
+  not a reload avoided, it is a reload made slower.
+
+  Two further consequences, both measured. A partial map is *correct*: an
+  address in no listed country does not match, so an allow list refuses it and a
+  deny list ignores it. And the gateway builds the map itself — the 27 MiB
+  source never crosses the API, only the list of countries does. Refreshing the
+  dataset is a **timer, never a reconcile**: the loop that installs firewall
+  rules must not fail because db-ip.com had an outage.
+  Sold as noise reduction, not security — any VPN defeats it.
 * **Phase E** — CrowdSec and WAF, which are **one project, not two**: CrowdSec's
   AppSec component is a Coraza-based WAF speaking OWASP CRS, and a single SPOE
   integration provides both. Standalone alternative: `coraza-spoa`. Neither is

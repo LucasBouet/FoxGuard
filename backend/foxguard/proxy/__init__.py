@@ -24,6 +24,7 @@ from .haproxy import (
     validate_spec,
 )
 from .model import (
+    GEO_FILTERS,
     HTTP_ONLY_AUTH,
     HTTP_ONLY_FILTERS,
     SLUG_RE,
@@ -53,6 +54,7 @@ __all__ = [
     "PEERS_MAP_FILE",
     "PEER_SET",
     "SLUG_RE",
+    "GEO_FILTERS",
     "UNIMPLEMENTED_FILTERS",
     "AccessAction",
     "AccessRule",

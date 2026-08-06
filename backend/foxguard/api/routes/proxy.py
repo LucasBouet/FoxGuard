@@ -62,6 +62,19 @@ def read_proxy(
     ):
         warnings.append("a service asks for external exposure but no WAN bind address is set")
 
+    if spec.uses_geo:
+        # Stated rather than assumed. A country filter is the one rule here that
+        # depends on data Foxguard does not own and that goes stale by itself,
+        # and its failure mode is silent in one direction: an out-of-date deny
+        # list simply stops matching.
+        warnings.append(
+            "a service filters by country. The gateway builds its own prefix map "
+            f"for {', '.join(spec.geo_countries)} from a dataset refreshed by "
+            "'foxguard-geo-refresh'; if that has never run, an allow list "
+            "refuses everyone and a deny list blocks nobody. Geo is noise "
+            "reduction, not a security control -- any VPN defeats it"
+        )
+
     return {
         "enabled": settings.proxy_enabled,
         "domain": settings.proxy_domain,
@@ -71,6 +84,7 @@ def read_proxy(
         "digest": digest,
         "config": conf,
         "files": files,
+        "geo_countries": list(spec.geo_countries),
         "implicit_paths": proxy_service.implicit_paths(session, settings),
         "warnings": warnings,
     }

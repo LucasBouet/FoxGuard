@@ -27,6 +27,7 @@ from __future__ import annotations
 import ipaddress
 import logging
 from collections.abc import Iterable
+from typing import NamedTuple
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -507,6 +508,23 @@ def implicit_paths(session: Session, settings: Settings) -> list[dict]:
 # --------------------------------------------------------------------------- #
 
 
+class Rendered(NamedTuple):
+    """What the gateway needs to install one proxy configuration.
+
+    A named tuple rather than a plain one because ``geo_countries`` joined it
+    late and ``rendered[3]`` at a call site says nothing. It indexes exactly as
+    before, so existing callers are unaffected.
+    """
+
+    conf: str
+    files: dict[str, str]
+    digest: str
+    #: Countries the gateway must have prefixes for. Not the map itself: the
+    #: full dataset is 27 MiB and the useful subset is built on the gateway, so
+    #: what travels is the *question*, not the answer.
+    geo_countries: tuple[str, ...]
+
+
 def render(session: Session, settings: Settings) -> tuple[str, dict[str, str]]:
     """Render ``(conf, files)`` from current database state.
 
@@ -521,8 +539,8 @@ def digest(conf: str, files: dict[str, str]) -> str:
     return proxy_digest(conf, files)
 
 
-def render_or_none(session: Session, settings: Settings) -> tuple[str, dict[str, str], str] | None:
-    """``(conf, files, digest)``, or ``None`` when the proxy is off or unrenderable.
+def render_or_none(session: Session, settings: Settings) -> Rendered | None:
+    """A :class:`Rendered`, or ``None`` when the proxy is off or unrenderable.
 
     The failure is logged at error level and swallowed, for the same reason
     ``dns.render_or_none`` does it: the caller is the agent state endpoint, and
@@ -532,11 +550,12 @@ def render_or_none(session: Session, settings: Settings) -> tuple[str, dict[str,
     if not settings.proxy_enabled:
         return None
     try:
-        conf, files = render(session, settings)
+        spec = build_spec(session, settings)
+        conf, files = render_conf(spec), render_files(spec)
     except ProxyValidationError as exc:
         logger.error(
             "proxy configuration cannot be rendered, leaving the proxy untouched: %s",
             exc,
         )
         return None
-    return conf, files, proxy_digest(conf, files)
+    return Rendered(conf, files, proxy_digest(conf, files), spec.geo_countries)

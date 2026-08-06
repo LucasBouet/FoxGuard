@@ -14,18 +14,21 @@ import {
   SecretOnce,
   Select,
   SlugChips,
+  parseList,
   toggleSlug,
 } from "@/components/forms";
 import { Card, Cell, Row, Table } from "@/components/ui";
 import {
   addServiceAccess,
   addServiceAuth,
+  addServiceFilter,
   createService,
   createServiceAccount,
   createServiceToken,
   deleteService,
   removeServiceAccess,
   removeServiceAuth,
+  removeServiceFilter,
   revokeSsoSession,
 } from "@/lib/actions";
 import type { Result } from "@/lib/actions";
@@ -37,6 +40,8 @@ import type {
   ServiceAuth,
   ServiceAuthKind,
   ServiceExposure,
+  ServiceFilter,
+  ServiceFilterKind,
   ServiceKind,
   ServiceScope,
   ServiceTokenCreated,
@@ -82,6 +87,35 @@ function describeAudience(auth: ServiceAuth): string {
   if (auth.require_admin) parts.push("administrators");
   if (auth.group_slugs.length > 0) parts.push(auth.group_slugs.join(" or "));
   return parts.length > 0 ? parts.join(" and in ") : "any Foxguard account";
+}
+
+/**
+ * Filters this kind of service can carry.
+ *
+ * A TCP passthrough service never sees the plaintext, so a rate limit — which
+ * counts *requests* — has nothing to count. The WAF and CrowdSec are absent
+ * entirely: the control plane refuses them until they exist, and offering a
+ * control that always errors is worse than not offering it.
+ */
+function availableFilters(kind: ServiceKind): ServiceFilterKind[] {
+  const shared: ServiceFilterKind[] = ["ip_allow", "ip_deny", "geo_allow", "geo_deny"];
+  return kind === "tcp" ? shared : [...shared, "rate_limit"];
+}
+
+const FILTER_LABEL: Record<string, string> = {
+  ip_allow: "only these addresses",
+  ip_deny: "never these addresses",
+  geo_allow: "only these countries",
+  geo_deny: "never these countries",
+  rate_limit: "rate limit",
+};
+
+/** What a filter actually narrows to, in one phrase. */
+function describeFilter(item: ServiceFilter): string {
+  if (item.kind === "rate_limit") {
+    return `${item.rate} requests / ${item.period_seconds}s`;
+  }
+  return item.values.join(", ") || "—";
 }
 
 /** Scopes an authenticator may have, given the exposure it is being added to. */
@@ -387,7 +421,17 @@ export function ServiceDetail({
   const [authScope, setAuthScope] = useState<ServiceScope>("internal");
   const [authGroups, setAuthGroups] = useState<string[]>([]);
   const [authAdmin, setAuthAdmin] = useState(false);
+  const [filterKind, setFilterKind] = useState<ServiceFilterKind>("ip_deny");
+  const [filterScope, setFilterScope] = useState<ServiceScope>("both");
+  const [filterValues, setFilterValues] = useState("");
+  const [rate, setRate] = useState("60");
+  const [period, setPeriod] = useState("60");
   const [accessTarget, setAccessTarget] = useState("");
+
+  const filterReady =
+    filterKind === "rate_limit"
+      ? Number(rate) > 0 && Number(period) > 0
+      : parseList(filterValues).length > 0;
 
   const targets = [
     ...groups.map((group) => ({ id: group.id, label: `group ${group.slug}`, kind: "group" })),
@@ -497,6 +541,132 @@ export function ServiceDetail({
                   onChange={setAuthAdmin}
                 />
               </div>
+            )}
+          </div>
+
+          <div>
+            <p className="mb-2 text-sm font-semibold">Restrictions</p>
+            <p className="mb-2 text-xs text-ink-secondary">
+              Narrowing, not admitting: these are ANDed with each other and with
+              whatever way in the caller used.
+            </p>
+            <Table headers={["Kind", "Door", "What", ""]} empty="None.">
+              {service.filters.map((item) => (
+                <Row key={item.id}>
+                  <Cell>{FILTER_LABEL[item.kind] ?? item.kind}</Cell>
+                  <Cell className="text-ink-secondary">{item.scope}</Cell>
+                  <Cell className="text-ink-secondary">{describeFilter(item)}</Cell>
+                  <Cell className="text-right">
+                    <ConfirmButton
+                      label="Remove"
+                      confirmLabel="Remove it"
+                      warning="The service stops narrowing on this immediately."
+                      onConfirm={() =>
+                        start(async () => {
+                          setResult(await removeServiceFilter(service.id, item.id));
+                        })
+                      }
+                    />
+                  </Cell>
+                </Row>
+              ))}
+            </Table>
+            <div className="mt-3 flex flex-wrap items-end gap-3">
+              <Field label="Add">
+                <Select
+                  value={filterKind}
+                  onChange={(event) =>
+                    setFilterKind(event.target.value as ServiceFilterKind)
+                  }
+                >
+                  {availableFilters(service.kind).map((option) => (
+                    <option key={option} value={option}>
+                      {FILTER_LABEL[option] ?? option}
+                    </option>
+                  ))}
+                </Select>
+              </Field>
+              <Field label="Door">
+                <Select
+                  value={filterScope}
+                  onChange={(event) => setFilterScope(event.target.value as ServiceScope)}
+                >
+                  {(["both", "internal", "external"] as ServiceScope[]).map((option) => (
+                    <option key={option} value={option}>
+                      {option}
+                    </option>
+                  ))}
+                </Select>
+              </Field>
+              {filterKind === "rate_limit" ? (
+                <>
+                  <Field label="Requests">
+                    <Input
+                      type="number"
+                      min={1}
+                      value={rate}
+                      onChange={(event) => setRate(event.target.value)}
+                      className="w-24"
+                    />
+                  </Field>
+                  <Field label="Per (seconds)" hint="Also what Retry-After will say.">
+                    <Input
+                      type="number"
+                      min={1}
+                      value={period}
+                      onChange={(event) => setPeriod(event.target.value)}
+                      className="w-24"
+                    />
+                  </Field>
+                </>
+              ) : (
+                <Field
+                  label={filterKind.startsWith("geo") ? "Countries" : "Addresses"}
+                  hint={
+                    filterKind.startsWith("geo")
+                      ? "Two-letter codes, comma separated: FR, CH"
+                      : "Addresses or prefixes, comma separated"
+                  }
+                >
+                  <Input
+                    value={filterValues}
+                    onChange={(event) => setFilterValues(event.target.value)}
+                    placeholder={filterKind.startsWith("geo") ? "FR, CH" : "203.0.113.0/24"}
+                  />
+                </Field>
+              )}
+              <Button
+                disabled={pending || !filterReady}
+                onClick={() =>
+                  start(async () => {
+                    const outcome = await addServiceFilter(service.id, {
+                      kind: filterKind,
+                      scope: filterScope,
+                      values:
+                        filterKind === "rate_limit"
+                          ? undefined
+                          : parseList(filterValues).map((value) =>
+                              filterKind.startsWith("geo") ? value.toUpperCase() : value,
+                            ),
+                      rate: filterKind === "rate_limit" ? Number(rate) : undefined,
+                      period_seconds:
+                        filterKind === "rate_limit" ? Number(period) : undefined,
+                    });
+                    setResult(outcome);
+                    if (outcome.ok) setFilterValues("");
+                  })
+                }
+              >
+                Add
+              </Button>
+            </div>
+            {filterKind.startsWith("geo") && (
+              <Notice kind="warning">
+                Geo is noise reduction, not a security control — any VPN defeats
+                it in one click. The gateway builds its own prefix map, and until{" "}
+                <code>foxguard-geo-refresh</code> has run there, an allow list
+                refuses everyone and a deny list blocks nobody.
+              </Notice>
             )}
           </div>
 

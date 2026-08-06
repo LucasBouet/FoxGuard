@@ -988,6 +988,11 @@ class AgentProxyState(ApiModel):
     certs_dir: str
     runtime_socket: str
     files: dict[str, str] = Field(default_factory=dict)
+    #: ISO country codes the geo map must cover. Deliberately the *question*
+    #: rather than the answer: the full prefix dataset is 27 MiB of text and
+    #: costs 367 MiB of HAProxy memory, so the gateway builds the subset it
+    #: actually needs and none of it travels through this response.
+    geo_countries: list[str] = Field(default_factory=list)
 
 
 class AgentStateResponse(ApiModel):
@@ -1068,6 +1073,12 @@ class ServiceAuthRead(ServiceAuthBase):
     created_at: datetime
 
 
+#: ISO 3166-1 alpha-2, upper case. The renderer enforces the same expression;
+#: neither checks the code against a list of real countries, because the list
+#: changes and the dataset on the gateway is the authority on what it holds.
+_COUNTRY_CODE = re.compile(r"^[A-Z]{2}$")
+
+
 class ServiceFilterBase(ApiModel):
     kind: ServiceFilterKind
     scope: ServiceScope = ServiceScope.BOTH
@@ -1077,28 +1088,43 @@ class ServiceFilterBase(ApiModel):
     rate: int | None = Field(default=None, ge=1)
     period_seconds: int | None = Field(default=None, ge=1)
 
-    @field_validator("values")
-    @classmethod
-    def _validate_values(cls, value: list[str]) -> list[str]:
-        for item in value:
-            try:
-                ipaddress.ip_network(item, strict=False)
-            except ValueError as exc:
-                raise ValueError(f"{item!r} is not an address or prefix") from exc
-        return value
-
     @model_validator(mode="after")
-    def _rate_needs_both(self) -> ServiceFilterBase:
+    def _values_match_the_kind(self) -> ServiceFilterBase:
+        """``values`` means addresses for one kind of filter and countries for another.
+
+        Validated here rather than in a ``field_validator`` because the field
+        alone cannot tell which: ``FR`` is not a prefix and ``10.0.0.0/8`` is not
+        a country, and each is correct for exactly one ``kind``.
+        """
         if self.kind is ServiceFilterKind.RATE_LIMIT and not (
             self.rate and self.period_seconds
         ):
             raise ValueError("a rate limit needs both a rate and a period")
-        if self.kind in (ServiceFilterKind.IP_ALLOW, ServiceFilterKind.IP_DENY) and not (
-            self.values
-        ):
-            # An empty allow list denies everything, which is never what anyone
-            # meant to type.
-            raise ValueError(f"an {self.kind.value} filter needs at least one address")
+
+        if self.kind in (ServiceFilterKind.IP_ALLOW, ServiceFilterKind.IP_DENY):
+            if not self.values:
+                # An empty allow list denies everything, which is never what
+                # anyone meant to type.
+                raise ValueError(
+                    f"an {self.kind.value} filter needs at least one address"
+                )
+            for item in self.values:
+                try:
+                    ipaddress.ip_network(item, strict=False)
+                except ValueError as exc:
+                    raise ValueError(f"{item!r} is not an address or prefix") from exc
+
+        if self.kind in (ServiceFilterKind.GEO_ALLOW, ServiceFilterKind.GEO_DENY):
+            if not self.values:
+                raise ValueError(
+                    f"a {self.kind.value} filter needs at least one country"
+                )
+            for item in self.values:
+                if not _COUNTRY_CODE.fullmatch(item):
+                    raise ValueError(
+                        f"{item!r} is not an ISO 3166-1 alpha-2 country code "
+                        "(two upper-case letters, e.g. 'FR')"
+                    )
         return self
 
 
@@ -1300,5 +1326,8 @@ class ProxyStatusRead(ApiModel):
     digest: str | None
     config: str | None
     files: dict[str, str] = Field(default_factory=dict)
+    #: Countries some filter names, and therefore the ones the gateway builds a
+    #: prefix map for. Shown so an operator can see what the map should cover.
+    geo_countries: list[str] = Field(default_factory=list)
     implicit_paths: list[ImplicitPathRead] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)

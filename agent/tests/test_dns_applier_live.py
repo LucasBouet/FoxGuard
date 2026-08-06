@@ -2,7 +2,7 @@
 
 Opt-in and privileged-ish::
 
-    FOXGUARD_LIVE_DNS=1 pytest tests/test_dns_live.py
+    FOXGUARD_LIVE_DNS=1 pytest tests/test_dns_applier_live.py
 
 ``systemd`` is not available in a build container, so ``systemctl`` is a shim
 script that starts, stops and reports on a real dnsmasq process. That is enough

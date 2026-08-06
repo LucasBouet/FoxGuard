@@ -137,7 +137,7 @@ ruleset: ## Print the ruleset the current database state implies
 
 .PHONY: test-dns-live
 test-dns-live: ## Run the generated zone against a real dnsmasq (needs dnsmasq + dig)
-	cd $(BACKEND) && FOXGUARD_LIVE_DNS=1 pytest tests/test_dns_live.py -v
+	cd $(BACKEND) && FOXGUARD_LIVE_DNS=1 pytest tests/test_dns_generator_live.py -v
 
 .PHONY: test-routes-live
 test-routes-live: ## Reconcile real kernel routes on a dummy interface (needs sudo + CAP_NET_ADMIN)
@@ -145,7 +145,7 @@ test-routes-live: ## Reconcile real kernel routes on a dummy interface (needs su
 
 .PHONY: test-dns-applier-live
 test-dns-applier-live: ## Drive a real dnsmasq through the agent's applier (needs dnsmasq + dig)
-	cd $(AGENT) && FOXGUARD_LIVE_DNS=1 pytest tests/test_dns_live.py -v
+	cd $(AGENT) && FOXGUARD_LIVE_DNS=1 pytest tests/test_dns_applier_live.py -v
 
 .PHONY: dns
 dns: ## Print the DNS zone the current database state implies
@@ -153,7 +153,7 @@ dns: ## Print the DNS zone the current database state implies
 
 .PHONY: test-sso-live
 test-sso-live: ## Attack a rendered SSO service in a real HAProxy (needs haproxy)
-	cd $(BACKEND) && FOXGUARD_LIVE_PROXY=1 pytest tests/test_sso_live.py -v
+	cd $(BACKEND) && FOXGUARD_LIVE_PROXY=1 pytest tests/test_sso_live.py tests/test_geo_live.py -v
 
 .PHONY: test-proxy-live
 test-proxy-live: ## Drive a real HAProxy through the agent's applier (needs haproxy)

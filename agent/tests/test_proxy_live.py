@@ -1,7 +1,7 @@
 """ProxyApplier against a real HAProxy.
 
 Skipped unless ``FOXGUARD_LIVE_PROXY=1`` and ``haproxy`` is installed, exactly
-like ``test_dns_live.py``. What these cover that the mocked tests cannot:
+like ``test_dns_applier_live.py``. What these cover that the mocked tests cannot:
 
 * a reload really is seamless, measured with a request in flight;
 * a Runtime API map update really does *not* survive a reload, which is the

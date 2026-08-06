@@ -42,6 +42,8 @@ from pathlib import Path
 
 from foxguard.nftables.applier import CommandRunner, SubprocessRunner
 
+from .geo import GeoBuilder, GeoError
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -86,6 +88,7 @@ class ProxyApplier:
         service: str = "foxguard-proxy",
         systemctl_path: str = "systemctl",
         timeout: float = 30.0,
+        geo: GeoBuilder | None = None,
     ) -> None:
         self._conf = Path(conf_path)
         self._maps = Path(maps_dir)
@@ -95,6 +98,43 @@ class ProxyApplier:
         self._service = service
         self._systemctl = systemctl_path
         self._timeout = timeout
+        self._geo = geo
+        #: Set by :meth:`ensure_geo` and read by the caller for the report. Not
+        #: an exception, because a stale geo map must never stop a ruleset.
+        self.geo_warning: str | None = None
+
+    def ensure_geo(self, countries: Sequence[str]) -> str:
+        """Make the country map match ``countries``, before anything validates.
+
+        Ordering is not a preference: ``haproxy -c`` resolves ``-f`` at parse
+        time, so a configuration naming a map that is not yet on disk fails
+        wholesale -- taking down every service that has nothing to do with geo.
+
+        Never raises. A gateway with no dataset gets an empty map and a warning:
+        an allow list then refuses everyone, which is loud, and a deny list
+        blocks nobody, which is why the warning exists.
+        """
+        self.geo_warning = None
+        if self._geo is None:
+            if countries:
+                self.geo_warning = (
+                    "a service filters by country and this agent has no geo "
+                    "directory configured, so the filter cannot be enforced"
+                )
+            return "skipped"
+        try:
+            outcome = self._geo.build(countries)
+        except (GeoError, OSError) as exc:
+            self.geo_warning = f"the geo map could not be built: {exc}"
+            logger.error("geo map build failed: %s", exc)
+            return "failed"
+        if outcome == "empty":
+            self.geo_warning = (
+                "no geo dataset on this gateway, so the country map is empty: "
+                "an allow list refuses everyone and a deny list blocks nobody. "
+                "Run 'foxguard-agent geo-refresh'"
+            )
+        return outcome
 
     def _run(self, argv: Sequence[str]):
         return self._runner.run(argv, timeout=self._timeout)
@@ -171,6 +211,9 @@ class ProxyApplier:
             for name, body in files.items():
                 (Path(tmp) / name).write_text(body, encoding="utf-8")
             self._test(scratch)
+
+    def geo_map_name(self) -> str | None:
+        return self._geo.map_path.name if self._geo else None
 
     def _test(self, path: Path) -> None:
         result = self._run([self._haproxy, "-c", "-f", str(path)])

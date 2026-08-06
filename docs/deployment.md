@@ -997,6 +997,38 @@ not set `FOXGUARD_DNS_ZONE` to a domain that covers `FOXGUARD_PROXY_DOMAIN`
 while `FOXGUARD_DNS_MODE=split`. The resolver would answer NXDOMAIN for
 `_acme-challenge` and renewals would stop.
 
+### Country filters
+
+Installing the proxy also installs `foxguard-geo-refresh.timer`, which downloads
+a prefix dataset weekly (about 4 MiB, from db-ip.com). It costs nothing until a
+service names a country, and having it already there beats discovering it is
+missing on the day you add one.
+
+The download is **deliberately not part of a reconciliation**. The agent's loop
+installs firewall rules, and a ruleset that fails to apply because someone
+else's web server is down is not a trade worth making.
+
+```sh
+# Fetch it now instead of waiting for the timer:
+systemctl start foxguard-geo-refresh.service
+journalctl -u foxguard-geo-refresh -n 20
+
+# Or during the install:
+./deploy/foxguard-install.sh --proxy --proxy-domain example.com --geo-now
+```
+
+Until it has run once the map is empty, which means **an allow list refuses
+everyone and a deny list blocks nobody**. `GET /api/v1/proxy` says so in its
+warnings and the map file says so in its own header.
+
+The gateway builds the map from the countries your filters actually name, not
+the whole world — measured, the planet costs HAProxy about 367 MiB of resident
+memory and three countries about 47. Adding a country you have not used before
+rebuilds the map on the agent's next poll, which takes a few seconds.
+
+Geo is noise reduction, not a security control. Anybody who cares defeats it
+with a VPN in one click.
+
 **What a passthrough service can and cannot have:**
 
 | | HTTP terminated | TCP passthrough |

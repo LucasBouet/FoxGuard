@@ -13,11 +13,12 @@ change.
 
 from __future__ import annotations
 
+import argparse
 import logging
 import signal
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from types import FrameType
 
@@ -27,6 +28,7 @@ from foxguard.nftables.applier import NftApplier, NftError
 from .client import ControlPlaneClient, DesiredState, DnsState, ProxyState
 from .config import AgentSettings, get_agent_settings
 from .dns import DnsApplier, DnsError
+from .geo import GeoBuilder, GeoError, refresh_dataset
 from .proxy import ProxyApplier, ProxyError
 from .routes import RouteApplier, RouteError
 from .wireguard import WireGuardError, WireGuardManager
@@ -131,6 +133,16 @@ def reconcile_proxy(
     proxy: ProxyState, applier: ProxyApplier, *, dry_run: bool
 ) -> str | None:
     """Apply one proxy configuration. Returns an error message, or None."""
+    # Before anything is validated: haproxy -c resolves -f at parse time, so a
+    # configuration naming a country map that is not on disk fails wholesale and
+    # takes every unrelated service with it. Never raises -- a stale geo map is
+    # not worth refusing a configuration over, so it becomes a warning instead.
+    geo_action = applier.ensure_geo(proxy.geo_countries)
+    if geo_action not in ("unchanged", "skipped"):
+        logger.info("geo map: %s", geo_action)
+    if applier.geo_warning:
+        logger.warning("%s", applier.geo_warning)
+
     try:
         if dry_run:
             applier.check(proxy.conf, proxy.files)
@@ -223,6 +235,53 @@ def run_once(
     return Applied(ruleset=ruleset_digest, dns=dns_digest, proxy=proxy_digest)
 
 
+def geo_refresh(argv: Sequence[str] | None = None) -> int:
+    """Download the country dataset. A command, never part of a reconcile.
+
+    Separate on purpose. The reconciliation loop installs firewall rules, and
+    making it depend on a third party's web server being reachable would mean a
+    ruleset that fails to apply because somebody else had an outage. This runs
+    on a timer instead, and if it fails the previous dataset is still there.
+    """
+    parser = argparse.ArgumentParser(
+        prog="foxguard-agent geo-refresh",
+        description="Download the DB-IP country dataset used by geo filters.",
+    )
+    parser.add_argument(
+        "--url",
+        help="override the download location (default: this month's DB-IP lite)",
+    )
+    parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="also rebuild the map immediately, for the countries it already covers",
+    )
+    args = parser.parse_args(list(argv) if argv is not None else None)
+
+    settings = get_agent_settings()
+    logging.basicConfig(
+        level=settings.log_level.upper(),
+        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+    )
+    try:
+        written = refresh_dataset(settings.geo_dataset_path, url=args.url)
+    except GeoError as exc:
+        logger.error("%s", exc)
+        return 1
+    logger.info("geo dataset refreshed (%.1f MiB)", written / 1024 / 1024)
+
+    if args.rebuild:
+        builder = GeoBuilder(settings.geo_dataset_path, settings.geo_map_path)
+        current = builder.current_countries()
+        if not current:
+            logger.info("no country map to rebuild yet; the agent will build one")
+            return 0
+        # Force it: the stamp still matches, but the dataset underneath changed.
+        builder.build([])
+        logger.info("geo map rebuilt: %s", builder.build(current))
+    return 0
+
+
 def main() -> int:
     settings = get_agent_settings()
     logging.basicConfig(
@@ -264,6 +323,7 @@ def main() -> int:
             haproxy_path=settings.haproxy_path,
             systemctl_path=settings.systemctl_path,
             service=settings.proxy_service,
+            geo=GeoBuilder(settings.geo_dataset_path, settings.geo_map_path),
         )
         if settings.manage_proxy
         else None

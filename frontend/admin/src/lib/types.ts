@@ -424,6 +424,8 @@ export interface ProxyStatus {
   digest: string | null;
   config: string | null;
   files: Record<string, string>;
+  /** Countries some filter names, and therefore what the gateway's map covers. */
+  geo_countries: string[];
   implicit_paths: ImplicitPath[];
   warnings: string[];
 }
