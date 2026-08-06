@@ -231,10 +231,26 @@ class AccessRule:
 
 @dataclass(frozen=True, slots=True)
 class Authenticator:
+    """One way in. Several on a service are an OR: any one is enough.
+
+    ``groups`` and ``require_admin`` are the exception to that OR -- they do not
+    add a way in, they narrow the one they sit on. Proving who you are and being
+    allowed in are separate questions, and ``FOXGUARD_SSO`` answered only the
+    first until these existed.
+    """
+
     kind: AuthKind
     scope: Scope = Scope.BOTH
     #: ``BASIC`` only: the realm shown in the browser prompt.
     realm: str | None = None
+    #: ``FOXGUARD_SSO`` only: membership of *any* of these group slugs is
+    #: required. Empty means any signed-in account, because that is what every
+    #: service published before this existed already had.
+    groups: tuple[str, ...] = ()
+    #: ``FOXGUARD_SSO`` only: the account must be a Foxguard administrator.
+    #: Combined with ``groups`` by AND, not OR -- "an admin who is also in
+    #: infra" is expressible, "an admin or anyone in infra" is two rows.
+    require_admin: bool = False
 
 
 @dataclass(frozen=True, slots=True)

@@ -30,6 +30,7 @@ from ..deps import (
     integrity_conflict,
     regenerate_or_422,
     require_admin,
+    resolve_groups,
 )
 
 router = APIRouter(
@@ -69,27 +70,14 @@ def _get_or_404(session: Session, peer_id: uuid.UUID) -> Peer:
 
 
 def _resolve_groups(session: Session, slugs: list[str]) -> list[Group]:
-    if not slugs:
-        return []
-    groups = (
-        session.execute(select(Group).where(Group.slug.in_(slugs))).scalars().all()
-    )
-    missing = sorted(set(slugs) - {group.slug for group in groups})
-    if missing:
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY, f"unknown groups: {', '.join(missing)}"
-        )
     # Attaching a zone as a group would put the peer in the group set, which for
     # a zone is never rendered -- the peer would appear assigned in the API and
     # be absent from the dataplane.
-    zones = sorted(g.slug for g in groups if g.kind is GroupKind.ZONE)
-    if zones:
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
-            f"{', '.join(zones)} are zones, not groups: use zone_slug "
-            "(a peer belongs to at most one zone)",
-        )
-    return list(groups)
+    return resolve_groups(
+        session,
+        slugs,
+        zone_hint="use zone_slug (a peer belongs to at most one zone)",
+    )
 
 
 def _resolve_zone(session: Session, slug: str | None) -> Group | None:

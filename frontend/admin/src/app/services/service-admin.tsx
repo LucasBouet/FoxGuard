@@ -13,6 +13,8 @@ import {
   ResultNotice,
   SecretOnce,
   Select,
+  SlugChips,
+  toggleSlug,
 } from "@/components/forms";
 import { Card, Cell, Row, Table } from "@/components/ui";
 import {
@@ -32,6 +34,7 @@ import type {
   Peer,
   Service,
   ServiceAccountCreated,
+  ServiceAuth,
   ServiceAuthKind,
   ServiceExposure,
   ServiceKind,
@@ -63,6 +66,23 @@ const AUTH_LABEL: Record<string, string> = {
   basic: "service account (basic auth)",
   foxguard_sso: "Foxguard sign-in",
 };
+
+/**
+ * Who this way in actually admits, in one phrase.
+ *
+ * Worth spelling out rather than showing a realm nobody reads: an SSO
+ * authenticator with no groups admits every account in Foxguard, and that is
+ * the fact an operator most needs to see without opening anything.
+ */
+function describeAudience(auth: ServiceAuth): string {
+  if (auth.kind !== "foxguard_sso") {
+    return auth.realm ? `realm ${auth.realm}` : "anyone holding the credential";
+  }
+  const parts: string[] = [];
+  if (auth.require_admin) parts.push("administrators");
+  if (auth.group_slugs.length > 0) parts.push(auth.group_slugs.join(" or "));
+  return parts.length > 0 ? parts.join(" and in ") : "any Foxguard account";
+}
 
 /** Scopes an authenticator may have, given the exposure it is being added to. */
 function availableScopes(kind: ServiceAuthKind): ServiceScope[] {
@@ -98,6 +118,8 @@ export function CreateService({
   const [externalAuth, setExternalAuth] = useState<ServiceAuthKind>("bearer");
   const [accessTarget, setAccessTarget] = useState("");
   const [result, setResult] = useState<Result<unknown> | null>(null);
+  const [ssoGroups, setSsoGroups] = useState<string[]>([]);
+  const [ssoAdmin, setSsoAdmin] = useState(false);
   const [pending, start] = useTransition();
 
   const wantsExternal = exposure === "external" || exposure === "both";
@@ -111,9 +133,22 @@ export function CreateService({
     event.preventDefault();
     // The policy travels with the service: a listener with no authenticator
     // that applies to it is refused, so creating them separately can never work.
-    const authenticators: { kind: ServiceAuthKind; scope: ServiceScope }[] = [];
-    if (wantsInternal) authenticators.push({ kind: internalAuth, scope: "internal" });
-    if (wantsExternal) authenticators.push({ kind: externalAuth, scope: "external" });
+    const authenticators: {
+      kind: ServiceAuthKind;
+      scope: ServiceScope;
+      group_slugs?: string[];
+      require_admin?: boolean;
+    }[] = [];
+    // The group requirement rides on whichever door chose sign-in. Both doors
+    // get the same one here; making them differ is the Policy panel's job.
+    const sso = (kind: ServiceAuthKind) =>
+      kind === "foxguard_sso"
+        ? { group_slugs: ssoGroups, require_admin: ssoAdmin }
+        : {};
+    if (wantsInternal)
+      authenticators.push({ kind: internalAuth, scope: "internal", ...sso(internalAuth) });
+    if (wantsExternal)
+      authenticators.push({ kind: externalAuth, scope: "external", ...sso(externalAuth) });
 
     const chosen = targets.find((target) => target.id === accessTarget);
     start(async () => {
@@ -274,6 +309,29 @@ export function CreateService({
           </Field>
         )}
 
+        {(internalAuth === "foxguard_sso" || externalAuth === "foxguard_sso") && (
+          <div className="space-y-2 sm:col-span-2">
+            <span className="text-sm text-ink-secondary">
+              Which accounts may sign in
+            </span>
+            <p className="text-xs text-ink-muted">
+              Leave this empty and every Foxguard account reaches the service.
+              Pick groups and membership of any one of them is required.
+            </p>
+            <SlugChips
+              options={groups}
+              selected={ssoGroups}
+              onToggle={(slug) => setSsoGroups((current) => toggleSlug(current, slug))}
+            />
+            <Check
+              label="Administrators only"
+              hint="ANDed with the groups above."
+              checked={ssoAdmin}
+              onChange={setSsoAdmin}
+            />
+          </div>
+        )}
+
         <Field
           label="Who may use it"
           hint="Evaluated on the tunnel-side door only — a public address cannot be a peer."
@@ -327,6 +385,8 @@ export function ServiceDetail({
   const [pending, start] = useTransition();
   const [authKind, setAuthKind] = useState<ServiceAuthKind>("peer_identity");
   const [authScope, setAuthScope] = useState<ServiceScope>("internal");
+  const [authGroups, setAuthGroups] = useState<string[]>([]);
+  const [authAdmin, setAuthAdmin] = useState(false);
   const [accessTarget, setAccessTarget] = useState("");
 
   const targets = [
@@ -340,12 +400,15 @@ export function ServiceDetail({
         <div className="space-y-5">
           <div>
             <p className="mb-2 text-sm font-semibold">Ways in</p>
-            <Table headers={["Kind", "Door", "Realm", ""]} empty="None — the service is not served.">
+            <Table
+              headers={["Kind", "Door", "Who is allowed", ""]}
+              empty="None — the service is not served."
+            >
               {service.authenticators.map((auth) => (
                 <Row key={auth.id}>
                   <Cell>{AUTH_LABEL[auth.kind] ?? auth.kind}</Cell>
                   <Cell className="text-ink-secondary">{auth.scope}</Cell>
-                  <Cell className="text-ink-muted">{auth.realm ?? "—"}</Cell>
+                  <Cell className="text-ink-secondary">{describeAudience(auth)}</Cell>
                   <Cell className="text-right">
                     <ConfirmButton
                       label="Remove"
@@ -395,14 +458,46 @@ export function ServiceDetail({
                 onClick={() =>
                   start(async () => {
                     setResult(
-                      await addServiceAuth(service.id, { kind: authKind, scope: authScope }),
+                      await addServiceAuth(service.id, {
+                        kind: authKind,
+                        scope: authScope,
+                        group_slugs: authKind === "foxguard_sso" ? authGroups : [],
+                        require_admin: authKind === "foxguard_sso" && authAdmin,
+                      }),
                     );
+                    if (authKind === "foxguard_sso") {
+                      setAuthGroups([]);
+                      setAuthAdmin(false);
+                    }
                   })
                 }
               >
                 Add
               </Button>
             </div>
+            {authKind === "foxguard_sso" && (
+              <div className="mt-3 space-y-2 rounded-md border border-hairline bg-page p-3">
+                <p className="text-xs text-ink-secondary">
+                  Signing in is not the same as being allowed in. Pick no group
+                  and <em>every</em> Foxguard account reaches this service. Pick
+                  some and membership of any one of them is required — someone
+                  signed in without it gets a refusal that says so, not the login
+                  page again.
+                </p>
+                <SlugChips
+                  options={groups}
+                  selected={authGroups}
+                  on="surface"
+                  onToggle={(slug) => setAuthGroups((current) => toggleSlug(current, slug))}
+                />
+                <Check
+                  label="Administrators only"
+                  hint="Combined with the groups above by AND, not OR."
+                  checked={authAdmin}
+                  onChange={setAuthAdmin}
+                />
+              </div>
+            )}
           </div>
 
           <div>

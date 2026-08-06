@@ -441,7 +441,7 @@ def test_an_ipv6_bind_address_is_bracketed():
 # --------------------------------------------------------------------------- #
 
 
-def _sso_spec(**kwargs):
+def _sso_spec(_auth=None, **kwargs):
     base = {
         "sso_secret": "s" * 32,
         "sso_hostname": "auth.example.com",
@@ -450,7 +450,9 @@ def _sso_spec(**kwargs):
     base.update(kwargs)
     return _spec(
         _service(
-            authenticators=(Authenticator(AuthKind.FOXGUARD_SSO, Scope.INTERNAL),),
+            authenticators=(
+                _auth or Authenticator(AuthKind.FOXGUARD_SSO, Scope.INTERNAL),
+            ),
         ),
         **base,
     )
@@ -546,6 +548,125 @@ def test_sso_is_refused_on_a_passthrough_service():
                 sso_hostname="auth.example.com",
             )
         )
+
+
+# --------------------------------------------------------------------------- #
+# SSO authorisation: signed in is not the same as allowed in
+# --------------------------------------------------------------------------- #
+
+
+def _sso_auth(**kwargs):
+    return Authenticator(AuthKind.FOXGUARD_SSO, Scope.INTERNAL, **kwargs)
+
+
+def test_no_requirement_emits_no_authorisation_at_all():
+    """A service that admits any account renders what it did before this existed."""
+    conf = render_conf(_sso_spec())
+    assert "fg_az_app" not in conf
+    assert "fg_grp_app" not in conf
+    assert "jwt_payload_query('$.admin'" not in conf
+
+
+def test_a_group_requirement_matches_on_the_wrapped_slug():
+    """The delimiters are the whole defence against a prefix match.
+
+    Measured on HAProxy 3.0.11: ``-m sub infra`` matches a member of
+    ``infrastructure``; ``-m sub ,infra,`` does not.
+    """
+    conf = render_conf(_sso_spec(_sso_auth(groups=("infra",))))
+    assert "set-var(txn.fg_grp_app) var(txn.fg_jwt_app),jwt_payload_query('$.groups')" in conf
+    assert "{ var(txn.fg_grp_app) -m sub ,infra, }" in conf
+
+
+def test_several_groups_are_an_or_on_one_condition():
+    """Measured: multiple patterns on one match are an OR, which HAProxy's
+    condition language cannot otherwise express."""
+    conf = render_conf(_sso_spec(_sso_auth(groups=("infra", "ops"))))
+    assert "{ var(txn.fg_grp_app) -m sub ,infra, ,ops, }" in conf
+
+
+def test_admin_only_reads_the_claim_that_was_already_there():
+    conf = render_conf(_sso_spec(_sso_auth(require_admin=True)))
+    assert "jwt_payload_query('$.admin','int')" in conf
+    assert "{ var(txn.fg_adm_app) -m int eq 1 }" in conf
+
+
+def test_groups_and_admin_are_combined_by_and():
+    conf = render_conf(_sso_spec(_sso_auth(groups=("infra",), require_admin=True)))
+    line = next(
+        row for row in conf.splitlines() if "set-var(txn.fg_az_app) int(1)" in row
+    )
+    assert "{ var(txn.fg_grp_app) -m sub ,infra, }" in line
+    assert "{ var(txn.fg_adm_app) -m int eq 1 }" in line
+
+
+def test_the_verdict_goes_through_a_variable_so_it_can_be_negated():
+    """A conjunction's negation is a disjunction, and HAProxy has no OR.
+
+    Reducing the requirement to an integer first is what lets the refusal branch
+    ask for "not authorised" in one term.
+    """
+    conf = render_conf(_sso_spec(_sso_auth(groups=("infra",))))
+    assert "set-var(txn.fg_az_app) int(0)" in conf
+    assert "{ var(txn.fg_az_app) -m int eq 1 }" in conf
+    assert "{ var(txn.fg_az_app) -m int eq 0 }" in conf
+
+
+def test_a_signed_in_stranger_is_refused_not_redirected():
+    """The loop this prevents is unbreakable from the browser.
+
+    Redirecting somebody who already holds a valid cookie sends them to a login
+    page that signs them in again, hands back the same cookie, and bounces them
+    straight here -- forever, and reading as if the service were down.
+    """
+    conf = render_conf(_sso_spec(_sso_auth(groups=("infra",))))
+    refusal = next(row for row in conf.splitlines() if "status 403" in row)
+    redirect = next(row for row in conf.splitlines() if "http-request redirect" in row)
+    # It must ask for a *valid* session, or it would swallow the redirect.
+    assert "{ var(txn.fg_ok_app) -m int eq 1 }" in refusal
+    assert "{ var(txn.fg_az_app) -m int eq 0 }" in refusal
+    # And it must be evaluated first, or the redirect wins and the loop is back.
+    assert conf.index(refusal) < conf.index(redirect)
+
+
+def test_the_refusal_says_what_is_missing():
+    conf = render_conf(_sso_spec(_sso_auth(groups=("infra", "ops"), require_admin=True)))
+    refusal = next(row for row in conf.splitlines() if "status 403" in row)
+    assert "an administrator account" in refusal
+    assert "infra, ops" in refusal
+    # Named, so the person reading it knows which account was refused.
+    assert "var(txn.fg_sub_app)" in refusal
+
+
+def test_a_bearer_token_cannot_carry_a_group_requirement():
+    """It proves possession of a secret. It names nobody."""
+    with pytest.raises(ProxyValidationError, match="names no person"):
+        render_conf(
+            _spec(
+                _service(
+                    authenticators=(
+                        Authenticator(
+                            AuthKind.BEARER, Scope.INTERNAL, groups=("infra",)
+                        ),
+                    ),
+                    token_hashes=("a" * 64,),
+                )
+            )
+        )
+
+
+def test_a_group_slug_that_could_forge_a_membership_is_refused():
+    """The delimiter is the contract; a slug containing one would break it."""
+    with pytest.raises(ProxyValidationError, match="not a valid group slug"):
+        render_conf(_sso_spec(_sso_auth(groups=("infra,ops",))))
+
+
+def test_the_generator_and_the_issuer_agree_on_the_delimiter():
+    """Duplicated across a module boundary on purpose, so it is asserted."""
+    from foxguard.proxy.haproxy import GROUP_DELIMITER as rendered
+    from foxguard.services.sso import GROUP_DELIMITER as issued
+
+    assert rendered == issued
 
 
 def test_no_auth_vhost_is_emitted_when_nothing_uses_sso():

@@ -237,6 +237,11 @@ export interface User {
   last_login_at: string | null;
   created_at: string;
   auth_methods: AuthMethod[];
+  /**
+   * Read by SSO on published services and nothing else. A person's group grants
+   * no network access — that comes from their devices' own membership.
+   */
+  group_slugs: string[];
 }
 
 export type EndpointKind = "any" | "group" | "zone" | "cidr";
@@ -334,6 +339,11 @@ export interface ServiceAuth {
   enabled: boolean;
   priority: number;
   realm: string | null;
+  /** `foxguard_sso` only: membership of any one of these is required. Empty
+   *  means any account that can sign in. */
+  group_slugs: string[];
+  /** `foxguard_sso` only, and ANDed with `group_slugs`. */
+  require_admin: boolean;
   created_at: string;
 }
 

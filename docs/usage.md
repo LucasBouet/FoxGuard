@@ -411,9 +411,34 @@ signed in and from where; revoking one takes effect on the agent's next poll,
 without restarting anything. That matters because the cookie itself stays
 perfectly valid-looking — it is the revocation list that stops it.
 
-One limitation worth knowing now: an SSO service admits **any active Foxguard
-account**. Groups belong to devices, not to people, so there is nothing finer to
-filter on yet.
+### Deciding *which* accounts, not just that they have one
+
+By default an SSO service admits **any active Foxguard account**. That is rarely
+what you want once you publish more than one thing, so put people in groups and
+make the service ask for one.
+
+1. **Accounts** — each account now has its own groups, edited under *Manage*.
+   These are the same groups your devices use, and putting a person in one
+   **grants no network access at all**: it is read by sign-in on published
+   services and by nothing else. What a device may reach still comes from the
+   groups that device is in.
+2. **Services > Policy** — pick *Foxguard sign-in* and tick the groups it
+   requires. Membership of **any one** of them is enough. Leave it empty and you
+   are back to "anyone with an account". There is also *Administrators only*,
+   which is combined with the groups by **and**, not or.
+
+Two behaviours worth knowing before you rely on it:
+
+- **Someone signed in without the right group gets a refusal that says so**, not
+  the login page again. Sending them back to sign in would loop forever — they
+  already have a perfectly valid cookie.
+- **Changing a person's groups signs them out of every service immediately.**
+  Their membership is written into the cookie, which the proxy checks on its own
+  without asking Foxguard, so the session has to end for the change to mean
+  anything. Saving without changing anything does not sign them out.
+
+Each door can ask for something different. "Anyone signed in, from the tunnel;
+only `infra`, from the internet" is one service with two ways in.
 
 ## What your users see
 

@@ -62,6 +62,59 @@ export function Check({
   );
 }
 
+/**
+ * A set of slugs, toggled as chips. Used wherever membership is edited — a
+ * peer's groups, a person's groups, and the groups an SSO service demands — so
+ * that the same thing always looks and behaves the same way.
+ */
+export function SlugChips({
+  options,
+  selected,
+  onToggle,
+  empty = "No groups defined yet.",
+  // Which way the chip lifts off its background: "surface" for a chip sitting
+  // on the page, "page" for one already inside a raised panel.
+  on = "page",
+}: {
+  options: { id: string; slug: string }[];
+  selected: string[];
+  onToggle: (slug: string) => void;
+  empty?: string;
+  on?: "page" | "surface";
+}) {
+  if (options.length === 0) {
+    return <p className="text-xs text-ink-muted">{empty}</p>;
+  }
+  const lift = on === "page" ? "bg-page" : "bg-surface";
+  const hover = on === "page" ? "hover:bg-page" : "hover:bg-surface";
+  return (
+    <div className="flex flex-wrap gap-1">
+      {options.map((option) => (
+        <button
+          key={option.id}
+          type="button"
+          onClick={() => onToggle(option.slug)}
+          aria-pressed={selected.includes(option.slug)}
+          className={`rounded-md border px-2.5 py-1 text-sm ${
+            selected.includes(option.slug)
+              ? `border-hairline ${lift} font-medium`
+              : `border-transparent text-ink-secondary ${hover}`
+          }`}
+        >
+          {option.slug}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/** Add or remove one slug — the state update every {@link SlugChips} wants. */
+export function toggleSlug(current: string[], slug: string): string[] {
+  return current.includes(slug)
+    ? current.filter((item) => item !== slug)
+    : [...current, slug];
+}
+
 export function Button({
   children,
   variant = "default",

@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 
 from ..config import Settings, get_settings
 from ..db import get_db
-from ..models import Peer
+from ..models import Group, GroupKind, Peer
 from ..nftables import RulesetValidationError
 from ..proxy import ProxyValidationError
 from ..services import admin_auth
@@ -47,8 +47,38 @@ __all__ = [
     "client_ip",
     "integrity_conflict",
     "rate_limited_response",
+    "resolve_groups",
     "reset_limiters",
 ]
+
+
+def resolve_groups(session: Session, slugs: list[str], *, zone_hint: str) -> list[Group]:
+    """Slugs to :class:`Group` rows, refusing zones and anything unknown.
+
+    Zones are refused everywhere a *group* is asked for, because attaching one
+    would show as assigned in the API and be absent from whatever reads the
+    membership -- a peer's zone is rendered from ``zone_id`` and a person is not
+    in a routed segment at all. ``zone_hint`` says what to do instead, since
+    that differs by caller.
+    """
+    if not slugs:
+        return []
+    groups = (
+        session.execute(select(Group).where(Group.slug.in_(slugs))).scalars().all()
+    )
+    missing = sorted(set(slugs) - {group.slug for group in groups})
+    if missing:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"unknown groups: {', '.join(missing)}",
+        )
+    zones = sorted(g.slug for g in groups if g.kind is GroupKind.ZONE)
+    if zones:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"{', '.join(zones)} are zones, not groups: {zone_hint}",
+        )
+    return list(groups)
 
 
 def integrity_conflict(exc: IntegrityError, fallback: str) -> HTTPException:

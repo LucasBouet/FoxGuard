@@ -242,6 +242,10 @@ class UserCreate(UserBase):
     password: str | None = Field(default=None, min_length=12, max_length=256)
     external_idp_issuer: str | None = None
     external_idp_subject: str | None = None
+    #: Groups this person belongs to. Read by SSO on published services **and
+    #: nothing else** -- a person's group grants no network access, which is
+    #: their devices' business and comes from the peers' own membership.
+    group_slugs: list[Slug] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _needs_a_credential(self) -> UserCreate:
@@ -263,6 +267,10 @@ class UserUpdate(ApiModel):
     password: str | None = Field(default=None, min_length=12, max_length=256)
     external_idp_issuer: str | None = None
     external_idp_subject: str | None = None
+    #: Sent, this replaces the whole membership. Doing so ends the person's SSO
+    #: sessions, because their groups are a claim inside a cookie the proxy
+    #: verifies without asking anyone.
+    group_slugs: list[Slug] | None = None
 
 
 class UserRead(UserBase):
@@ -271,6 +279,7 @@ class UserRead(UserBase):
     last_login_at: datetime | None
     created_at: datetime
     auth_methods: list[AuthMethod] = Field(default_factory=list)
+    group_slugs: list[str] = Field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- #
@@ -1030,6 +1039,24 @@ class ServiceAuthBase(ApiModel):
     enabled: bool = True
     priority: int = 100
     realm: str | None = Field(default=None, max_length=64)
+    #: ``foxguard_sso`` only: membership of any one of these is required.
+    #: Empty means any account that can sign in, which is what SSO meant before
+    #: this field existed -- so the default cannot start denying on upgrade.
+    group_slugs: list[Slug] = Field(default_factory=list)
+    #: ``foxguard_sso`` only, and ANDed with ``group_slugs``.
+    require_admin: bool = False
+
+    @model_validator(mode="after")
+    def _authorisation_needs_an_identity(self) -> ServiceAuthBase:
+        if self.kind is not ServiceAuthKind.FOXGUARD_SSO and (
+            self.group_slugs or self.require_admin
+        ):
+            raise ValueError(
+                f"{self.kind.value} cannot carry a group or admin requirement: "
+                "it proves the caller holds a credential, not which person they "
+                "are. Only foxguard_sso names an account"
+            )
+        return self
 
 
 class ServiceAuthCreate(ServiceAuthBase):

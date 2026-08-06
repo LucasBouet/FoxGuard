@@ -2581,3 +2581,196 @@ def test_a_session_appears_and_can_be_revoked(api, tag):
     assert api.delete(f"/api/v1/proxy/sso-sessions/{mine[0]['id']}").status_code == 204
     after = api.get("/api/v1/proxy/sso-sessions").json()
     assert not [row for row in after if row["username"] == username]
+
+
+# --------------------------------------------------------------------------- #
+# SSO authorisation: signing in is not the same as being allowed in
+# --------------------------------------------------------------------------- #
+
+
+def test_a_person_can_be_put_in_a_group(api, tag):
+    group = _group(api, tag, "people")
+    person = _user(api, tag, group_slugs=[group["slug"]])
+    assert person["group_slugs"] == [group["slug"]]
+    # And it is visible to the very next read, not only in the create response.
+    assert api.get(f"/api/v1/users/{person['id']}").json()["group_slugs"] == [
+        group["slug"]
+    ]
+
+
+def test_a_person_cannot_be_put_in_a_zone(api, tag):
+    """A zone is a routed segment. Nobody sits in one."""
+    zone = api.post(
+        "/api/v1/zones", json={"slug": f"z-{tag}"[:24], "name": f"z-{tag}"}
+    )
+    assert zone.status_code == 201, zone.text
+    response = api.post(
+        "/api/v1/users",
+        json={
+            "username": f"nozone-{tag}",
+            "password": PASSWORD,
+            "group_slugs": [zone.json()["slug"]],
+        },
+    )
+    assert response.status_code == 422, response.text
+    assert "zones, not groups" in response.text
+
+
+def test_a_group_a_person_is_in_grants_no_network_access(api, tag):
+    """The reservation that makes reusing the groups table safe.
+
+    Membership must change the SSO decision and nothing else: the ruleset is
+    rendered from the peers' groups, so putting a *person* in one must leave the
+    firewall byte for byte identical.
+    """
+    group = _group(api, tag, "people")
+    before = api.get("/api/v1/ruleset/preview").json()["content"]
+    _user(api, tag, group_slugs=[group["slug"]])
+    after = api.get("/api/v1/ruleset/preview").json()["content"]
+    assert after == before
+
+
+def test_an_sso_service_can_require_a_group(api, tag):
+    peer = _active_peer(api, tag)
+    group = _group(api, tag, "people")
+    response = _service(
+        api,
+        tag,
+        peer,
+        authenticators=[
+            {
+                "kind": "foxguard_sso",
+                "scope": "internal",
+                "group_slugs": [group["slug"]],
+            }
+        ],
+    )
+    if response.status_code == 422 and "SSO_SECRET" in response.text:
+        pytest.skip("SSO is not configured on this server")
+    assert response.status_code == 201, response.text
+    auth = response.json()["authenticators"][0]
+    assert auth["group_slugs"] == [group["slug"]]
+    assert auth["require_admin"] is False
+
+
+def test_a_bearer_authenticator_cannot_require_a_group(api, tag):
+    """It proves possession of a secret; it names no person."""
+    peer = _active_peer(api, tag)
+    group = _group(api, tag, "people")
+    response = _service(
+        api,
+        tag,
+        peer,
+        authenticators=[
+            {"kind": "bearer", "scope": "internal", "group_slugs": [group["slug"]]}
+        ],
+    )
+    assert response.status_code == 422, response.text
+    assert "foxguard_sso" in response.text
+
+
+def test_a_group_requirement_reaches_the_agent(api, tag):
+    """The whole point: what the dashboard says must be what HAProxy enforces."""
+    peer = _active_peer(api, tag)
+    group = _group(api, tag, "people")
+    response = _service(
+        api,
+        tag,
+        peer,
+        authenticators=[
+            {
+                "kind": "foxguard_sso",
+                "scope": "internal",
+                "group_slugs": [group["slug"]],
+                "require_admin": True,
+            }
+        ],
+    )
+    if response.status_code == 422 and "SSO_SECRET" in response.text:
+        pytest.skip("SSO is not configured on this server")
+    assert response.status_code == 201, response.text
+
+    conf = api.get("/api/v1/agent/state").json()["proxy"]["conf"]
+    assert f",{group['slug']}," in conf
+    assert "jwt_payload_query('$.admin','int')" in conf
+    # And the refusal must be a refusal, not a trip back to the login page.
+    assert "status 403" in conf
+
+
+def test_changing_a_persons_groups_signs_them_out_everywhere(api, tag):
+    """Their membership is baked into a cookie the proxy trusts on its own.
+
+    Without this, removing somebody from a group would keep letting them in
+    until the cookie happened to expire, which is not what "remove" means.
+    """
+    group = _group(api, tag, "people")
+    username = f"moved-{tag}"
+    person = api.post(
+        "/api/v1/users",
+        json={
+            "username": username,
+            "password": PASSWORD,
+            "group_slugs": [group["slug"]],
+        },
+    )
+    assert person.status_code == 201, person.text
+    person = person.json()
+
+    login = api.post(
+        "/api/v1/sso/login",
+        data={"username": username, "password": PASSWORD, "totp": "", "h": "", "p": ""},
+        follow_redirects=False,
+    )
+    if login.status_code == 503:
+        pytest.skip("SSO is not configured on this server")
+    assert login.status_code == 303, login.text
+    mine = [
+        row
+        for row in api.get("/api/v1/proxy/sso-sessions").json()
+        if row["username"] == username
+    ]
+    assert mine, "the sign-in produced no session"
+
+    moved = api.patch(f"/api/v1/users/{person['id']}", json={"group_slugs": []})
+    assert moved.status_code == 200, moved.text
+    assert moved.json()["group_slugs"] == []
+
+    after = [
+        row
+        for row in api.get("/api/v1/proxy/sso-sessions").json()
+        if row["username"] == username
+    ]
+    assert not after, "the session survived the membership change"
+
+
+def test_an_unchanged_membership_does_not_sign_anybody_out(api, tag):
+    """Saving a form without touching the chips must not be destructive."""
+    group = _group(api, tag, "people")
+    username = f"stay-{tag}"
+    person = api.post(
+        "/api/v1/users",
+        json={
+            "username": username,
+            "password": PASSWORD,
+            "group_slugs": [group["slug"]],
+        },
+    ).json()
+    login = api.post(
+        "/api/v1/sso/login",
+        data={"username": username, "password": PASSWORD, "totp": "", "h": "", "p": ""},
+        follow_redirects=False,
+    )
+    if login.status_code == 503:
+        pytest.skip("SSO is not configured on this server")
+    assert login.status_code == 303
+
+    same = api.patch(
+        f"/api/v1/users/{person['id']}", json={"group_slugs": [group["slug"]]}
+    )
+    assert same.status_code == 200, same.text
+    still = [
+        row
+        for row in api.get("/api/v1/proxy/sso-sessions").json()
+        if row["username"] == username
+    ]
+    assert still, "an unchanged membership ended the session anyway"

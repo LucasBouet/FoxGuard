@@ -56,14 +56,24 @@ SECRET = "s" * 32
 REVOKED_JTI = "11111111-1111-1111-1111-111111111111"
 
 
-def _token(*, jti: str | None = None, sub="alice", offset=3600, key=SECRET, alg="HS256"):
+def _token(
+    *,
+    jti: str | None = None,
+    sub="alice",
+    offset=3600,
+    key=SECRET,
+    alg="HS256",
+    groups=",",
+    admin=1,
+):
     now = int(time.time())
     claims = {
         "sub": sub,
         "jti": jti or str(uuid.uuid4()),
         "exp": now + offset,
         "iat": now,
-        "admin": 1,
+        "admin": admin,
+        "groups": groups,
     }
     if alg == "none":
         # The classic forgery: no signature, and the token asks to be trusted.
@@ -108,6 +118,52 @@ def sso_proxy(tmp_path_factory):
                 backend=Backend("127.0.0.1", upstream_port, peer_label="nas"),
                 external_hostname="wiki.example.com",
                 authenticators=(Authenticator(AuthKind.FOXGUARD_SSO, Scope.EXTERNAL),),
+                access=(AccessRule(AccessAction.ALLOW, None),),
+            ),
+            # The same service, narrowed three different ways. Separate
+            # hostnames rather than separate fixtures: one HAProxy, one set of
+            # measurements, and the "no requirement" case above stays the
+            # control that proves the narrowing is what changed the answer.
+            Service(
+                slug="infra",
+                kind=ServiceKind.HTTP,
+                exposure=Exposure.EXTERNAL,
+                backend=Backend("127.0.0.1", upstream_port, peer_label="nas"),
+                external_hostname="infra.example.com",
+                authenticators=(
+                    Authenticator(
+                        AuthKind.FOXGUARD_SSO, Scope.EXTERNAL, groups=("infra", "ops")
+                    ),
+                ),
+                access=(AccessRule(AccessAction.ALLOW, None),),
+            ),
+            Service(
+                slug="panel",
+                kind=ServiceKind.HTTP,
+                exposure=Exposure.EXTERNAL,
+                backend=Backend("127.0.0.1", upstream_port, peer_label="nas"),
+                external_hostname="panel.example.com",
+                authenticators=(
+                    Authenticator(
+                        AuthKind.FOXGUARD_SSO, Scope.EXTERNAL, require_admin=True
+                    ),
+                ),
+                access=(AccessRule(AccessAction.ALLOW, None),),
+            ),
+            Service(
+                slug="vault",
+                kind=ServiceKind.HTTP,
+                exposure=Exposure.EXTERNAL,
+                backend=Backend("127.0.0.1", upstream_port, peer_label="nas"),
+                external_hostname="vault.example.com",
+                authenticators=(
+                    Authenticator(
+                        AuthKind.FOXGUARD_SSO,
+                        Scope.EXTERNAL,
+                        groups=("infra",),
+                        require_admin=True,
+                    ),
+                ),
                 access=(AccessRule(AccessAction.ALLOW, None),),
             ),
         ),
@@ -162,11 +218,20 @@ def sso_proxy(tmp_path_factory):
     Path(spec.runtime_socket).unlink(missing_ok=True)
 
 
+HOSTS = ("wiki", "infra", "panel", "vault", "auth")
+
+
+def _resolve(port: int) -> list[str]:
+    return [
+        arg
+        for host in HOSTS
+        for arg in ("--resolve", f"{host}.example.com:{port}:127.0.0.1")
+    ]
+
+
 def _curl(port: int, *extra: str, host="wiki.example.com", path="/"):
     argv = [
-        "curl", "-s", "-k",
-        "--resolve", f"wiki.example.com:{port}:127.0.0.1",
-        "--resolve", f"auth.example.com:{port}:127.0.0.1",
+        "curl", "-s", "-k", *_resolve(port),
         "-o", "/dev/null", "-w", "%{http_code}",
         *extra,
         f"https://{host}:{port}{path}",
@@ -174,10 +239,10 @@ def _curl(port: int, *extra: str, host="wiki.example.com", path="/"):
     return subprocess.run(argv, capture_output=True, text=True, check=False).stdout.strip()
 
 
-def _body(port: int, *extra: str):
+def _body(port: int, *extra: str, host="wiki.example.com"):
     argv = [
-        "curl", "-s", "-k", "--resolve", f"wiki.example.com:{port}:127.0.0.1",
-        *extra, f"https://wiki.example.com:{port}/",
+        "curl", "-s", "-k", *_resolve(port),
+        *extra, f"https://{host}:{port}/",
     ]
     return subprocess.run(argv, capture_output=True, text=True, check=False).stdout.strip()
 
@@ -230,6 +295,130 @@ def test_a_forged_identity_header_is_overwritten(sso_proxy):
         "-H", "X-Foxguard-User: root",
     )
     assert json.loads(body) == {"x-foxguard-user": "alice"}
+
+
+# --------------------------------------------------------------------------- #
+# Authorisation: signing in is not the same as being allowed in
+# --------------------------------------------------------------------------- #
+
+
+def test_a_service_with_no_requirement_admits_any_account(sso_proxy):
+    """The control for everything below: ``wiki`` asks for nothing."""
+    assert _curl(sso_proxy, "-b", f"fg_sso={_token(groups=',')}") == "200"
+
+
+@pytest.mark.parametrize("groups", [",infra,", ",ops,", ",sales,ops,"])
+def test_a_member_of_a_required_group_gets_in(sso_proxy, groups):
+    assert _curl(
+        sso_proxy, "-b", f"fg_sso={_token(groups=groups)}", host="infra.example.com"
+    ) == "200"
+
+
+@pytest.mark.parametrize(
+    "groups",
+    [
+        ",",  # in nothing at all
+        ",sales,",  # in the wrong group
+        ",inf,",  # a prefix of a required one
+        ",infrastructure,",  # a required one is a prefix of this
+    ],
+)
+def test_a_stranger_is_refused_and_not_sent_round_the_loop(sso_proxy, groups):
+    """403, never 302.
+
+    A redirect here would send a browser that already holds a valid cookie to a
+    login page, which would sign it in, hand back the very same cookie, and
+    bounce it straight back -- a loop nothing on the client can break, and one
+    that reads as the service being broken rather than forbidden.
+
+    The two near-miss slugs are the delimiters earning their keep: measured on
+    HAProxy 3.0.11, an unwrapped ``-m sub infra`` admits ``infrastructure``.
+    """
+    assert _curl(
+        sso_proxy, "-b", f"fg_sso={_token(groups=groups)}", host="infra.example.com"
+    ) == "403"
+
+
+def test_the_refusal_names_the_account_and_what_it_lacks(sso_proxy):
+    body = _body(
+        sso_proxy,
+        "-b", f"fg_sso={_token(sub='alice', groups=',sales,')}",
+        host="infra.example.com",
+    )
+    assert "alice" in body
+    assert "infra, ops" in body
+
+
+def test_no_cookie_still_goes_to_the_login_page(sso_proxy):
+    """The refusal above must not have swallowed the redirect."""
+    assert _curl(sso_proxy, host="infra.example.com") == "302"
+
+
+def test_an_expired_session_goes_to_the_login_page_not_a_refusal(sso_proxy):
+    """Its groups are irrelevant: it is not a session any more."""
+    assert _curl(
+        sso_proxy,
+        "-b", f"fg_sso={_token(groups=',infra,', offset=-60)}",
+        host="infra.example.com",
+    ) == "302"
+
+
+def test_the_admin_flag_does_not_bypass_a_group(sso_proxy):
+    assert _curl(
+        sso_proxy,
+        "-b", f"fg_sso={_token(groups=',sales,', admin=1)}",
+        host="infra.example.com",
+    ) == "403"
+
+
+def test_admin_only_admits_an_administrator(sso_proxy):
+    assert _curl(
+        sso_proxy, "-b", f"fg_sso={_token(admin=1)}", host="panel.example.com"
+    ) == "200"
+
+
+def test_admin_only_refuses_everyone_else(sso_proxy):
+    assert _curl(
+        sso_proxy,
+        "-b", f"fg_sso={_token(admin=0, groups=',infra,')}",
+        host="panel.example.com",
+    ) == "403"
+
+
+@pytest.mark.parametrize(
+    ("groups", "admin", "expected"),
+    [
+        (",infra,", 1, "200"),
+        (",infra,", 0, "403"),  # the group without the flag
+        (",", 1, "403"),  # the flag without the group
+    ],
+)
+def test_a_group_and_admin_are_required_together(sso_proxy, groups, admin, expected):
+    """AND, not OR. Either half alone is a refusal."""
+    assert _curl(
+        sso_proxy,
+        "-b", f"fg_sso={_token(groups=groups, admin=admin)}",
+        host="vault.example.com",
+    ) == expected
+
+
+def test_a_forged_membership_is_worth_nothing(sso_proxy):
+    """The claim is only as good as the signature over it.
+
+    302 rather than 403: the token never became a session, so the caller is
+    unauthenticated rather than unauthorised, and being sent to sign in is the
+    correct answer.
+    """
+    forged = _token(groups=",infra,", admin=1, key="x" * 32)
+    assert _curl(sso_proxy, "-b", f"fg_sso={forged}", host="vault.example.com") == "302"
+
+
+def test_an_alg_none_forgery_cannot_grant_itself_a_group(sso_proxy):
+    assert _curl(
+        sso_proxy,
+        "-b", f"fg_sso={_token(groups=',infra,', alg='none')}",
+        host="vault.example.com",
+    ) == "302"
 
 
 def _who_answered(port: int, path: str) -> str:

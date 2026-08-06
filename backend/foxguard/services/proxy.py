@@ -34,6 +34,7 @@ from sqlalchemy.orm import Session
 from ..config import Settings
 from ..models import (
     Group,
+    GroupKind,
     Peer,
     Service,
     ServiceAccess,
@@ -263,6 +264,18 @@ def _project_service(service: Service, exposure: Exposure) -> ServiceSpec:
             kind=AuthKind(row.kind.value),
             scope=Scope(row.scope.value),
             realm=row.realm,
+            # Zones are filtered rather than trusted: a zone is a routed
+            # segment, no person is in one, so a requirement naming one must
+            # find nobody. Same filter as ``sso.member_slugs``, so the two
+            # cannot disagree about what a group is.
+            groups=tuple(
+                sorted(
+                    group.slug
+                    for group in row.groups
+                    if group.kind is GroupKind.GROUP
+                )
+            ),
+            require_admin=row.require_admin,
         )
         for row in _enabled(service.authenticators)
     )

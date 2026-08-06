@@ -62,6 +62,7 @@ from ..deps import (
     integrity_conflict,
     regenerate_or_422,
     require_admin,
+    resolve_groups,
 )
 
 router = APIRouter(
@@ -78,6 +79,38 @@ def _get_or_404(session: Session, service_id: uuid.UUID) -> Service:
     if service is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "service not found")
     return service
+
+
+def _build_authenticator(session: Session, data: dict) -> ServiceAuth:
+    """One authenticator row, with its group requirement resolved to real rows.
+
+    Slugs arrive on the wire and foreign keys are stored, so a group that is
+    later deleted takes its requirement with it instead of leaving a string that
+    an unrelated future group with the same slug would satisfy.
+    """
+    slugs = data.pop("group_slugs", []) or []
+    row = ServiceAuth(**data)
+    row.groups = resolve_groups(
+        session,
+        slugs,
+        zone_hint="a person is not in a routed segment, so a zone can never "
+        "grant access to a published service",
+    )
+    return row
+
+
+def _serialise_auth(row: ServiceAuth) -> dict:
+    return {
+        "id": row.id,
+        "kind": row.kind,
+        "scope": row.scope,
+        "enabled": row.enabled,
+        "priority": row.priority,
+        "realm": row.realm,
+        "group_slugs": sorted(group.slug for group in row.groups),
+        "require_admin": row.require_admin,
+        "created_at": row.created_at,
+    }
 
 
 def _serialise(service: Service, settings: Settings) -> dict:
@@ -103,7 +136,12 @@ def _serialise(service: Service, settings: Settings) -> dict:
         "health_check": service.health_check,
         "health_check_interval": service.health_check_interval,
         "active_doors": doors.value if doors else None,
-        "authenticators": sorted(service.authenticators, key=lambda r: (r.priority, r.kind.value)),
+        "authenticators": [
+            _serialise_auth(row)
+            for row in sorted(
+                service.authenticators, key=lambda r: (r.priority, r.kind.value)
+            )
+        ],
         "filters": sorted(service.filters, key=lambda r: (r.priority, r.kind.value)),
         "access": [
             {
@@ -198,7 +236,7 @@ def create_service(
     # two requests could not work at all: a listener with no authenticator is
     # refused, so the first request would always fail.
     for row in authenticators:
-        service.authenticators.append(ServiceAuth(**row))
+        service.authenticators.append(_build_authenticator(session, row))
     for row in filters:
         service.filters.append(ServiceFilter(**row))
     for row in access:
@@ -349,7 +387,7 @@ def add_authenticator(
     settings: Settings = Depends(get_settings),
 ) -> dict:
     service = _get_or_404(session, service_id)
-    row = ServiceAuth(**payload.model_dump())
+    row = _build_authenticator(session, payload.model_dump())
     service = _add_child(
         session,
         settings,

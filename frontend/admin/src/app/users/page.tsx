@@ -1,13 +1,16 @@
 import { Card, Cell, Dot, ErrorPanel, Row, Table, relative } from "@/components/ui";
 import { tryGet } from "@/lib/api";
-import type { User } from "@/lib/types";
+import type { Group, User } from "@/lib/types";
 
 import { CreateUser, UserActions } from "./user-admin";
 
 export const dynamic = "force-dynamic";
 
 export default async function UsersPage() {
-  const { data, error } = await tryGet<User[]>("/api/v1/users");
+  const [{ data, error }, groups] = await Promise.all([
+    tryGet<User[]>("/api/v1/users"),
+    tryGet<Group[]>("/api/v1/groups"),
+  ]);
   if (error || !data) return <ErrorPanel message={error ?? "no data"} />;
 
   return (
@@ -20,13 +23,28 @@ export default async function UsersPage() {
           any-credential-unlocks-any-device would let a low-privilege account
           inherit a stolen laptop&rsquo;s access.
         </p>
+        <p className="mt-2 max-w-3xl text-sm text-ink-secondary">
+          An account&rsquo;s own groups are read by single sign-on on published
+          services, and by nothing else. They open no port and rewrite no
+          ruleset — what a device may reach still comes from the groups that
+          device is in.
+        </p>
       </div>
 
-      <CreateUser />
+      <CreateUser groups={groups.data ?? []} />
 
       <Card>
         <Table
-          headers={["Username", "Sign-in", "2FA", "Admin", "Active", "Last login", ""]}
+          headers={[
+            "Username",
+            "Sign-in",
+            "2FA",
+            "Admin",
+            "Groups",
+            "Active",
+            "Last login",
+            "",
+          ]}
           empty="No accounts yet."
         >
           {data.map((user) => (
@@ -46,6 +64,9 @@ export default async function UsersPage() {
                 )}
               </Cell>
               <Cell className="text-ink-secondary">{user.is_admin ? "yes" : "—"}</Cell>
+              <Cell className="text-ink-secondary">
+                {user.group_slugs.join(", ") || <span className="text-ink-muted">—</span>}
+              </Cell>
               <Cell>
                 {user.is_active ? (
                   <span className="text-ink-secondary">yes</span>
@@ -60,7 +81,7 @@ export default async function UsersPage() {
                 {relative(user.last_login_at)}
               </Cell>
               <Cell className="text-right">
-                <UserActions user={user} />
+                <UserActions user={user} groups={groups.data ?? []} />
               </Cell>
             </Row>
           ))}

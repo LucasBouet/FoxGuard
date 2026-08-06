@@ -588,10 +588,21 @@ These are enforced in code and covered by tests, not just documented:
   cookie natively, so a published service keeps working while the API restarts.
   The algorithm is pinned rather than read from the token: measured, the
   idiomatic HAProxy snippet accepts an unsigned `alg:none` forgery.
+- **Phase 7d — SSO authorization, done.** Signing in stopped being the same
+  thing as being allowed in. People go in the same groups the peers use — a
+  group is a set of principals, not a second taxonomy — and membership grants
+  **no** network access, which an end-to-end test pins down by asserting the
+  rendered ruleset is unchanged. A service asks for any one of a set of groups,
+  optionally and an administrator, per door rather than per service. The claim
+  is a comma-wrapped string because a JSON array comes back as raw JSON text and
+  cannot be matched, and the wrapping is what stops `infra` admitting
+  `infrastructure`. Somebody signed in without the right group gets a 403 that
+  names what they lack, never a redirect — that would bounce a valid cookie
+  round a loop nothing on the client can break. Changing a membership revokes
+  the sessions carrying it.
 - **Still open.** Geo restrictions, and CrowdSec — whose AppSec component is a
   Coraza WAF, so the bouncer and the WAF are one integration rather than two.
-  Per-user authorization for SSO services needs a user-to-group relation the
-  schema does not have yet.
+  Then mTLS.
 
 ## License
 

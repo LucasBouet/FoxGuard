@@ -165,6 +165,11 @@ class User(Base):
     )
 
     peers: Mapped[list[Peer]] = relationship(back_populates="owner")
+    #: Eager, because every SSO token issued needs it and the login path should
+    #: not pay a second round trip for something this small.
+    groups: Mapped[list[Group]] = relationship(
+        secondary="user_groups", back_populates="users", lazy="selectin"
+    )
 
     @property
     def available_auth_methods(self) -> list[AuthMethod]:
@@ -183,6 +188,36 @@ class PeerGroup(Base):
 
     peer_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("peers.id", ondelete="CASCADE"), primary_key=True
+    )
+    group_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("groups.id", ondelete="CASCADE"), primary_key=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        TimestampColumn, server_default=func.now(), nullable=False
+    )
+
+
+class UserGroup(Base):
+    """Many-to-many between people and groups.
+
+    The same ``groups`` table the peers use, deliberately, rather than a
+    parallel set of user groups. A group is a set of *principals*: "infra" being
+    both the machines and the humans is the thing an operator already believes,
+    and two vocabularies that can drift apart is how an access model becomes a
+    lie -- the same reasoning that made ``service_access`` reuse
+    ``endpoint_kind`` instead of inventing one.
+
+    **What it grants is not network access.** The nftables generator reads
+    ``peer_groups`` and nothing else, so adding a person here changes only what
+    published services their SSO session may reach. Their devices are still
+    governed by the groups those devices are in. The API refuses zones for the
+    same reason: a zone is a routed segment, and a person does not sit in one.
+    """
+
+    __tablename__ = "user_groups"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
     )
     group_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("groups.id", ondelete="CASCADE"), primary_key=True
@@ -265,6 +300,9 @@ class Group(Base):
 
     peers: Mapped[list[Peer]] = relationship(
         secondary="peer_groups", back_populates="groups"
+    )
+    users: Mapped[list[User]] = relationship(
+        secondary="user_groups", back_populates="groups"
     )
     routes: Mapped[list[ZoneRoute]] = relationship(
         back_populates="zone", cascade="all, delete-orphan", lazy="selectin"
@@ -784,6 +822,13 @@ class ServiceAuth(Base):
     proof on each door -- the tunnel proves identity by itself, the internet
     proves nothing. ``peer_identity`` scoped anywhere but ``internal`` is
     refused by the validator rather than silently ignored.
+
+    ``groups`` and ``require_admin`` are the ``foxguard_sso`` half: proving *who
+    you are* and being *allowed in* are separate questions, and until they were
+    separated an SSO service admitted every account that could sign in. They
+    hang off the authenticator rather than the service so that the two doors can
+    disagree -- "any signed-in user from the tunnel, only infra from the
+    internet" is a normal thing to want and needs two rows.
     """
 
     __tablename__ = "service_auth"
@@ -806,6 +851,12 @@ class ServiceAuth(Base):
     priority: Mapped[int] = mapped_column(Integer, default=100, nullable=False)
     #: ``basic`` only: the realm shown in the browser prompt.
     realm: Mapped[str | None] = mapped_column(String(64))
+    #: ``foxguard_sso`` only: signing in is not enough, the account must also be
+    #: an administrator. The claim it reads has been in the token since SSO
+    #: shipped; nothing consulted it until now.
+    require_admin: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
     config: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)
 
     created_at: Mapped[datetime] = mapped_column(
@@ -813,6 +864,31 @@ class ServiceAuth(Base):
     )
 
     service: Mapped[Service] = relationship(back_populates="authenticators")
+    #: ``foxguard_sso`` only: membership of *any* of these is required. Empty
+    #: means any signed-in account, which is what every service published before
+    #: this existed got, so the default cannot silently start denying.
+    groups: Mapped[list[Group]] = relationship(
+        secondary="service_auth_groups", lazy="selectin"
+    )
+
+
+class ServiceAuthGroup(Base):
+    """Groups an SSO authenticator demands membership of.
+
+    A real table with a foreign key rather than slugs in ``config``: a group
+    that is deleted must take its requirement with it, and a slug reused later
+    for an unrelated group must not silently re-grant access to a service
+    somebody locked down months ago.
+    """
+
+    __tablename__ = "service_auth_groups"
+
+    auth_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("service_auth.id", ondelete="CASCADE"), primary_key=True
+    )
+    group_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("groups.id", ondelete="CASCADE"), primary_key=True
+    )
 
 
 class ServiceFilter(Base):

@@ -444,6 +444,7 @@ export async function createUser(input: {
   email?: string;
   display_name?: string;
   is_admin: boolean;
+  group_slugs?: string[];
   external_idp_issuer?: string;
   external_idp_subject?: string;
 }): Promise<Result<User>> {
@@ -454,6 +455,7 @@ export async function createUser(input: {
       email: input.email || null,
       display_name: input.display_name || null,
       is_admin: input.is_admin,
+      group_slugs: input.group_slugs ?? [],
       external_idp_issuer: input.external_idp_issuer || null,
       external_idp_subject: input.external_idp_subject || null,
     }),
@@ -464,10 +466,20 @@ export async function createUser(input: {
 
 export async function updateUser(
   id: string,
-  patch: Partial<{ is_active: boolean; is_admin: boolean; password: string }>,
+  patch: Partial<{
+    is_active: boolean;
+    is_admin: boolean;
+    password: string;
+    /** Replaces the whole membership, and signs the person out of every
+     *  published service — their groups live inside the session cookie. */
+    group_slugs: string[];
+  }>,
 ): Promise<Result<User>> {
   const result = await run(() => api.patch<User>(`/api/v1/users/${id}`, patch));
-  if (result.ok) revalidatePath("/users");
+  if (result.ok) {
+    revalidatePath("/users");
+    revalidatePath("/services");
+  }
   return result;
 }
 
@@ -606,7 +618,15 @@ export async function deleteService(id: string): Promise<Result<void>> {
 
 export async function addServiceAuth(
   serviceId: string,
-  input: { kind: ServiceAuthKind; scope: ServiceScope; realm?: string },
+  input: {
+    kind: ServiceAuthKind;
+    scope: ServiceScope;
+    realm?: string;
+    /** `foxguard_sso` only: membership of any one is required. */
+    group_slugs?: string[];
+    /** `foxguard_sso` only, ANDed with `group_slugs`. */
+    require_admin?: boolean;
+  },
 ): Promise<Result<Service>> {
   const result = await run(() =>
     api.post<Service>(`/api/v1/services/${serviceId}/auth`, input),

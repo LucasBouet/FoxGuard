@@ -570,3 +570,106 @@ def test_a_service_that_is_not_served_is_not_a_redirect_target(db_session):
     _http_service(db_session, peer)
     db_session.flush()
     assert proxy_service.sso_hostnames(db_session, settings) == set()
+
+
+# --------------------------------------------------------------------------- #
+# authorisation: which accounts an SSO service admits
+# --------------------------------------------------------------------------- #
+
+
+def _group(session, slug, kind=GroupKind.GROUP):
+    row = Group(slug=slug, name=slug.title(), kind=kind)
+    session.add(row)
+    session.flush()
+    return row
+
+
+def test_the_token_carries_the_groups_the_person_is_in(db_session):
+    from joserfc import jwt
+    from joserfc.jwk import OctKey
+
+    from foxguard.services import sso
+
+    user = _user(db_session)
+    user.groups = [_group(db_session, "infra"), _group(db_session, "ops")]
+    db_session.flush()
+
+    token, _row = sso.issue(db_session, _sso_settings(), user)
+    claims = jwt.decode(token, OctKey.import_key("s" * 32)).claims
+    # Wrapped and sorted: the wrapping is what stops ',inf,' matching 'infra',
+    # and the ordering keeps the rendered digest stable across restarts.
+    assert claims["groups"] == ",infra,ops,"
+
+
+def test_a_person_in_nothing_gets_a_claim_that_matches_nothing(db_session):
+    from foxguard.services import sso
+
+    assert sso.group_claim([]) == ","
+    assert ",infra," not in sso.group_claim([])
+
+
+def test_a_zone_is_not_a_group_a_person_can_be_in(db_session):
+    """Fails closed if a row is hand-inserted: a zone requirement finds nobody."""
+    from foxguard.services import sso
+
+    user = _user(db_session)
+    user.groups = [_group(db_session, "infra"), _group(db_session, "office", GroupKind.ZONE)]
+    db_session.flush()
+    assert sso.member_slugs(user) == ["infra"]
+
+
+def test_a_group_requirement_reaches_the_rendered_configuration(db_session):
+    settings = _sso_settings(proxy_domain="example.com")
+    peer = _peer(db_session, "nas", "10.88.0.6")
+    service = _http_service(db_session, peer)
+    service.authenticators.clear()
+    auth = ServiceAuth(kind=ServiceAuthKind.FOXGUARD_SSO, scope=ServiceScope.INTERNAL)
+    auth.groups = [_group(db_session, "infra")]
+    auth.require_admin = True
+    service.authenticators.append(auth)
+    db_session.flush()
+
+    rendered = proxy_service.render_or_none(db_session, settings)
+    assert rendered is not None
+    conf = rendered[0]
+    assert "{ var(txn.fg_grp_app) -m sub ,infra, }" in conf
+    assert "{ var(txn.fg_adm_app) -m int eq 1 }" in conf
+
+
+def test_a_zone_on_an_authenticator_is_dropped_rather_than_rendered(db_session):
+    """The other half of failing closed, on the requirement's side."""
+    settings = _sso_settings(proxy_domain="example.com")
+    peer = _peer(db_session, "nas", "10.88.0.6")
+    service = _http_service(db_session, peer)
+    service.authenticators.clear()
+    auth = ServiceAuth(kind=ServiceAuthKind.FOXGUARD_SSO, scope=ServiceScope.INTERNAL)
+    auth.groups = [_group(db_session, "office", GroupKind.ZONE)]
+    service.authenticators.append(auth)
+    db_session.flush()
+
+    rendered = proxy_service.render_or_none(db_session, settings)
+    assert rendered is not None
+    conf = rendered[0]
+    assert "office" not in conf
+    # And with nothing left to require, it admits any account rather than
+    # rendering an empty match that would deny everybody.
+    assert "fg_az_app" not in conf
+
+
+def test_deleting_a_group_withdraws_the_requirement(db_session):
+    """The reason this is a foreign key and not a slug in a JSON column."""
+    settings = _sso_settings(proxy_domain="example.com")
+    peer = _peer(db_session, "nas", "10.88.0.6")
+    service = _http_service(db_session, peer)
+    service.authenticators.clear()
+    group = _group(db_session, "infra")
+    auth = ServiceAuth(kind=ServiceAuthKind.FOXGUARD_SSO, scope=ServiceScope.INTERNAL)
+    auth.groups = [group]
+    service.authenticators.append(auth)
+    db_session.flush()
+    assert ",infra," in proxy_service.render_or_none(db_session, settings)[0]
+
+    db_session.delete(group)
+    db_session.flush()
+    db_session.expire_all()
+    assert ",infra," not in proxy_service.render_or_none(db_session, settings)[0]

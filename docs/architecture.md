@@ -1354,10 +1354,62 @@ own domain and your own certificate. `_safe_target` accepts a destination only
 if it is a host name Foxguard currently publishes — and a service whose peer is
 down is not published, so it is not a target either.
 
+### Authorization: signed in is not the same as allowed in
+
+For one release it was. The JWT carried `sub` and `admin`, `service_access`
+spoke only in peers, groups and zones — properties of *devices* — and no
+user-to-group relation existed, so every SSO service admitted every active
+account. That is now closed.
+
+**People go in the same `groups` table the peers use.** Not a parallel taxonomy:
+a group is a set of principals, and two vocabularies that can drift apart is how
+an access model ends up with two answers to "who is in infra". What it does
+**not** grant is network access — the nftables generator reads
+`peer_groups` and nothing else, and an end-to-end test asserts that putting a
+person in a group leaves the rendered ruleset byte for byte identical.
+
+**The requirement hangs off the authenticator, not the service**, so the two
+doors can disagree: "any signed-in account from the tunnel, only `infra` from
+the internet" is one service and two rows. `service_auth_groups` is a real
+foreign key rather than slugs in `config`, so deleting a group withdraws the
+requirement instead of leaving a string that an unrelated future group with the
+same slug would satisfy.
+
+**The claim is a delimited string, and that shape is measured.** The obvious
+JSON array is unusable: `jwt_payload_query('$.groups')` on an array returns the
+**raw JSON text**, `["infra","ops"]`, quotes included, and `$.groups[0]` yields
+only the first element. A value wrapped and separated by commas answers
+membership in one condition — `-m sub ,infra,` — and several patterns on one
+condition are an **OR**, which HAProxy's condition language cannot otherwise
+express. The wrapping is not decoration: measured, an unwrapped `-m sub infra`
+admits a member of `infrastructure`. `ck_groups_slug_format` forbids a comma in
+a slug, which is what makes the delimiter unambiguous, and the renderer
+re-checks it.
+
+**The verdict goes through a variable.** `fg_az_<slug>` is set to 0 then to 1
+when the requirement holds. That indirection exists because the answer is needed
+negated as well, and the negation of a conjunction is a disjunction — so
+`eq 0` stands in for an OR that cannot be written.
+
+**A signed-in stranger gets 403, never the login page.** This is the part that
+matters most and it is not a nicety: redirecting a browser that already holds a
+valid cookie sends it to a page that signs it in again, hands back the very same
+cookie, and bounces it straight back — a loop nothing on the client can break,
+and one that reads as the service being down rather than forbidden. The refusal
+names the account and what it lacks.
+
+**Membership is baked in at issue time**, so changing somebody's groups revokes
+their SSO sessions. Without that, removing a person from a group would keep
+letting them in until their cookie happened to expire, which is not what
+"remove" means. An *unchanged* membership does not sign anyone out — saving a
+form without touching anything must not be destructive.
+
+Zones are refused on both sides and filtered on both sides. A zone is a routed
+segment and no person sits in one, so the API rejects it and the projection
+drops it anyway: a hand-inserted row makes a requirement find nobody rather than
+everybody.
+
 ### What is still missing
 
-**Per-user authorization beyond "has an account".** The JWT carries `sub` and
-`admin`, and `service_access` speaks in peers, groups and zones — which are
-properties of *devices*. There is no user-to-group relation in the schema, so an
-SSO service today admits any active account. `is_admin` is the only distinction
-available. Adding user groups is the honest fix and it is not in this phase.
+**mTLS**, and the geo/WAF/CrowdSec filters the schema accepts and the validator
+refuses. See the roadmap.

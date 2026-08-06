@@ -25,8 +25,15 @@ from ...schemas import (
     UserUpdate,
 )
 from ...services import admin_auth, audit, passwords
+from ...services import sso as sso_service
 from ...services import totp as totp_service
-from ..deps import audit_context, integrity_conflict, require_admin
+from ..deps import (
+    audit_context,
+    integrity_conflict,
+    regenerate_or_422,
+    require_admin,
+    resolve_groups,
+)
 
 router = APIRouter(
     prefix="/api/v1/users", tags=["users"], dependencies=[Depends(require_admin)]
@@ -52,7 +59,17 @@ def _serialise(user: User) -> dict:
         "last_login_at": user.last_login_at,
         "created_at": user.created_at,
         "auth_methods": user.available_auth_methods,
+        "group_slugs": sorted(group.slug for group in user.groups),
     }
+
+
+def _resolve_groups(session: Session, slugs: list[str]) -> list:
+    return resolve_groups(
+        session,
+        slugs,
+        zone_hint="a zone is a routed network segment and a person does not "
+        "sit in one; put their devices in it instead",
+    )
 
 
 @router.get("", response_model=list[UserRead])
@@ -75,6 +92,7 @@ def create_user(
         external_idp_subject=payload.external_idp_subject,
         password_hash=passwords.hash_password(payload.password) if payload.password else None,
     )
+    user.groups = _resolve_groups(session, payload.group_slugs)
     session.add(user)
     try:
         session.flush()
@@ -110,6 +128,7 @@ def update_user(
     payload: UserUpdate,
     request: Request,
     session: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
 ) -> dict:
     user = session.get(User, user_id)
     if user is None:
@@ -119,6 +138,12 @@ def update_user(
     password = changes.pop("password", None)
     if password:
         user.password_hash = passwords.hash_password(password)
+    membership_changed = False
+    if "group_slugs" in changes:
+        slugs = changes.pop("group_slugs") or []
+        before = {group.slug for group in user.groups}
+        user.groups = _resolve_groups(session, slugs)
+        membership_changed = before != set(slugs)
     for key, value in changes.items():
         setattr(user, key, value)
 
@@ -132,7 +157,25 @@ def update_user(
     if password:
         # A password change invalidates anything issued against the old one.
         revoked += admin_auth.revoke_all_for_user(session, user.id)
+
+    # SSO sessions are a separate matter, and the reasoning is the opposite of
+    # the one above: nothing re-checks them per request. The groups and the
+    # admin flag are claims inside a cookie the proxy verifies on its own, so
+    # they keep saying whatever they said when the token was signed. Taking an
+    # access away therefore has to end the sessions carrying it, or the removal
+    # would not take effect until the cookie happened to expire.
+    sso_revoked = 0
+    if (
+        membership_changed
+        or changes.get("is_active") is False
+        or changes.get("is_admin") is False
+    ):
+        sso_revoked = sso_service.revoke_for_user(session, user.id)
     session.flush()
+    if sso_revoked:
+        # Puts the revoked jtis in the denylist map the proxy reads; the agent
+        # pushes it over the runtime socket without a reload.
+        regenerate_or_422(session, settings, actor="admin-api")
 
     audit.record(
         session,
@@ -141,8 +184,13 @@ def update_user(
         object_id=user.id,
         **audit_context(request),
         detail={
-            "changes": [*changes, *(["password"] if password else [])],
+            "changes": [
+                *changes,
+                *(["password"] if password else []),
+                *(["group_slugs"] if membership_changed else []),
+            ],
             "admin_sessions_revoked": revoked,
+            "sso_sessions_revoked": sso_revoked,
         },
     )
     session.commit()

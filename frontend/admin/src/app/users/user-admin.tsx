@@ -12,6 +12,8 @@ import {
   Notice,
   ResultNotice,
   SecretOnce,
+  SlugChips,
+  toggleSlug,
 } from "@/components/forms";
 import {
   confirmTotp,
@@ -22,9 +24,9 @@ import {
   updateUser,
 } from "@/lib/actions";
 import type { Result } from "@/lib/actions";
-import type { TotpProvision, User } from "@/lib/types";
+import type { Group, TotpProvision, User } from "@/lib/types";
 
-export function CreateUser() {
+export function CreateUser({ groups }: { groups: Group[] }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [email, setEmail] = useState("");
@@ -32,6 +34,7 @@ export function CreateUser() {
   const [useOidc, setUseOidc] = useState(false);
   const [issuer, setIssuer] = useState("");
   const [subject, setSubject] = useState("");
+  const [memberOf, setMemberOf] = useState<string[]>([]);
   const [result, setResult] = useState<Result<User> | null>(null);
   const [pending, start] = useTransition();
 
@@ -43,6 +46,7 @@ export function CreateUser() {
         password: password || undefined,
         email: email || undefined,
         is_admin: isAdmin,
+        group_slugs: memberOf,
         external_idp_issuer: useOidc ? issuer : undefined,
         external_idp_subject: useOidc ? subject : undefined,
       });
@@ -52,6 +56,7 @@ export function CreateUser() {
         setPassword("");
         setEmail("");
         setSubject("");
+        setMemberOf([]);
       }
     });
   }
@@ -127,6 +132,21 @@ export function CreateUser() {
           onChange={setIsAdmin}
         />
 
+        <div>
+          <span className="text-sm text-ink-secondary">Groups</span>
+          <p className="text-xs text-ink-muted">
+            Which published services this person may sign in to. No network
+            access comes with it.
+          </p>
+          <div className="mt-1">
+            <SlugChips
+              options={groups}
+              selected={memberOf}
+              onToggle={(slug) => setMemberOf((current) => toggleSlug(current, slug))}
+            />
+          </div>
+        </div>
+
         <ResultNotice result={result} />
         {result?.ok && <Notice kind="good">Account created.</Notice>}
 
@@ -138,15 +158,18 @@ export function CreateUser() {
   );
 }
 
-export function UserActions({ user }: { user: User }) {
+export function UserActions({ user, groups }: { user: User; groups: Group[] }) {
   const [result, setResult] = useState<Result<unknown> | null>(null);
   const [provisioned, setProvisioned] = useState<TotpProvision | null>(null);
   const [code, setCode] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [open, setOpen] = useState(false);
+  const [memberOf, setMemberOf] = useState<string[]>(user.group_slugs);
   const [pending, start] = useTransition();
 
   const canTotp = user.auth_methods.includes("local");
+  const membershipChanged =
+    memberOf.slice().sort().join() !== user.group_slugs.slice().sort().join();
 
   return (
     <div className="space-y-2">
@@ -178,6 +201,31 @@ export function UserActions({ user }: { user: User }) {
               }
             >
               {user.is_admin ? "Remove admin" : "Make admin"}
+            </Button>
+          </div>
+
+          <div className="space-y-2 border-t border-hairline pt-3">
+            <p className="text-xs text-ink-secondary">
+              Groups — which published services this person may sign in to.
+              Changing them signs them out of every service immediately, because
+              their membership is written into the session cookie and the proxy
+              checks that cookie without asking Foxguard.
+            </p>
+            <SlugChips
+              options={groups}
+              selected={memberOf}
+              on="surface"
+              onToggle={(slug) => setMemberOf((current) => toggleSlug(current, slug))}
+            />
+            <Button
+              disabled={pending || !membershipChanged}
+              onClick={() =>
+                start(async () =>
+                  setResult(await updateUser(user.id, { group_slugs: memberOf })),
+                )
+              }
+            >
+              {membershipChanged ? "Save groups" : "No changes"}
             </Button>
           </div>
 

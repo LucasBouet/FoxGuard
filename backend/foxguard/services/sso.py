@@ -30,6 +30,11 @@ shape what :mod:`foxguard.proxy.haproxy` emits.
 3.  **Only ``1`` means verified.** The converter returns negative values for
     "invalid token", "unknown algorithm" and so on, and a bare truthiness test
     would accept those.
+
+Authentication is not authorization, and for one release it was: any account
+that could sign in reached every SSO-protected service. The token now carries
+the caller's groups so the proxy can require membership, and the shape of that
+claim is measured too -- see :func:`group_claim`.
 """
 
 from __future__ import annotations
@@ -44,14 +49,17 @@ from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from ..config import Settings
-from ..models import SsoSession, User
+from ..models import GroupKind, SsoSession, User
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "ALGORITHM",
+    "GROUP_DELIMITER",
     "MIN_SECRET_LENGTH",
+    "group_claim",
     "issue",
+    "member_slugs",
     "revoke",
     "revoked_jtis",
     "secret_problem",
@@ -65,6 +73,48 @@ ALGORITHM = "HS256"
 #: HS256 keys shorter than the hash are trivially weaker than the construction
 #: allows. Enforced at startup rather than discovered by an attacker.
 MIN_SECRET_LENGTH = 32
+
+#: Separates group slugs in the ``groups`` claim, and wraps the whole value.
+#: Safe because ``ck_groups_slug_format`` restricts a slug to
+#: ``[a-z0-9][a-z0-9_-]{0,23}``, so a slug can never contain one.
+GROUP_DELIMITER = ","
+
+
+def group_claim(slugs: list[str]) -> str:
+    """Group membership, in the one shape HAProxy can match cheaply.
+
+    A delimited string rather than the obvious JSON array, and both halves of
+    that are measured against HAProxy 3.0.11:
+
+    * ``jwt_payload_query('$.groups')`` on an array claim returns the **raw
+      JSON text**, quotes and brackets included -- ``["infra","ops"]``. Matching
+      membership in that means embedding quotes in config patterns.
+    * ``$.groups[0]`` works but yields only the first element, which answers a
+      question nobody asked.
+    * A value wrapped and separated by commas answers it in one condition:
+      ``-m sub ,infra,`` matches, several patterns on one condition are an
+      **OR**, and the wrapping is what stops the false positives -- measured,
+      ``,inf,`` does not match ``,infra,ops,`` and ``,infra,`` does not match
+      ``,infrastructure,``.
+
+    A person in no groups gets a lone delimiter, which matches no requirement.
+    """
+    if not slugs:
+        return GROUP_DELIMITER
+    joined = GROUP_DELIMITER.join(slugs)
+    return f"{GROUP_DELIMITER}{joined}{GROUP_DELIMITER}"
+
+
+def member_slugs(user: User) -> list[str]:
+    """The groups a person is in, sorted, zones excluded.
+
+    Zones are filtered here as well as refused by the API, so a hand-inserted
+    row fails closed: a zone is a routed segment and a person does not sit in
+    one, so a service asking for one must find nobody rather than everybody.
+    """
+    return sorted(
+        group.slug for group in user.groups if group.kind is GroupKind.GROUP
+    )
 
 
 def secret_problem(settings: Settings) -> str | None:
@@ -129,6 +179,9 @@ def issue(
         # An int, not a bool: HAProxy's jwt_payload_query only supports "int" as
         # an output type. Measured -- 'bool' is a config parse error.
         "admin": 1 if user.is_admin else 0,
+        # Baked in at issue time, which is why changing somebody's membership
+        # revokes their sessions: see revoke_for_user's callers.
+        "groups": group_claim(member_slugs(user)),
     }
     token = jwt.encode({"alg": ALGORITHM, "typ": "JWT"}, claims, _key(settings))
     return token, row
@@ -150,7 +203,14 @@ def revoke(session: Session, settings: Settings, session_id: uuid.UUID) -> bool:
 
 
 def revoke_for_user(session: Session, user_id: uuid.UUID) -> int:
-    """End every session a person holds. Used when an account is disabled."""
+    """End every session a person holds.
+
+    Used when an account is disabled, and when its **group membership changes**.
+    The second is not optional: the groups are a claim inside a token the proxy
+    verifies without asking anyone, so removing somebody from a group would
+    otherwise keep letting them in until their cookie happened to expire. Taking
+    an access away has to mean now.
+    """
     result = session.execute(
         update(SsoSession)
         .where(SsoSession.user_id == user_id, SsoSession.revoked_at.is_(None))

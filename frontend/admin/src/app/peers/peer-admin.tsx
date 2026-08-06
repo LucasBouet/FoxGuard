@@ -12,7 +12,9 @@ import {
   ResultNotice,
   SecretOnce,
   Select,
+  SlugChips,
   parseList,
+  toggleSlug,
 } from "@/components/forms";
 import {
   createEnrollmentKey,
@@ -150,24 +152,13 @@ export function CreatePeer({
 
         <div>
           <span className="text-sm text-ink-secondary">Groups</span>
-          <div className="mt-1 flex flex-wrap gap-2">
-            {groups.length === 0 && (
-              <span className="text-sm text-ink-muted">No groups yet.</span>
-            )}
-            {groups.map((group) => (
-              <button
-                key={group.id}
-                type="button"
-                onClick={() => toggleGroup(group.slug)}
-                className={`rounded-md border px-2.5 py-1 text-sm ${
-                  groupSlugs.includes(group.slug)
-                    ? "border-hairline bg-page font-medium"
-                    : "border-transparent text-ink-secondary hover:bg-page"
-                }`}
-              >
-                {group.slug}
-              </button>
-            ))}
+          <div className="mt-1">
+            <SlugChips
+              options={groups}
+              selected={groupSlugs}
+              onToggle={toggleGroup}
+              empty="No groups yet."
+            />
           </div>
         </div>
 
@@ -264,28 +255,14 @@ export function PeerActions({
               moving a peer into a stricter group shortens a session it already
               has.
             </p>
-            <div className="flex flex-wrap gap-1">
-              {groups.map((group) => (
-                <button
-                  key={group.id}
-                  type="button"
-                  onClick={() =>
-                    setMemberOf((current) =>
-                      current.includes(group.slug)
-                        ? current.filter((slug) => slug !== group.slug)
-                        : [...current, group.slug],
-                    )
-                  }
-                  className={`rounded-md border px-2.5 py-1 text-sm ${
-                    memberOf.includes(group.slug)
-                      ? "border-hairline bg-surface font-medium"
-                      : "border-transparent text-ink-secondary hover:bg-surface"
-                  }`}
-                >
-                  {group.slug}
-                </button>
-              ))}
-            </div>
+            <SlugChips
+              options={groups}
+              selected={memberOf}
+              on="surface"
+              onToggle={(slug) =>
+                setMemberOf((current) => toggleSlug(current, slug))
+              }
+            />
             <Field label="Zone">
               <Select
                 value={zoneSlug}

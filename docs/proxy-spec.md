@@ -705,7 +705,17 @@ keeps the project's normal lowercase-hex convention and the config lowercases.
   termination, TCP passthrough, internal *and* external exposure, certificates
   via certbot/Cloudflare, peer identity, bearer, basic, IP filters, rate limit,
   auto DNS name, implicit path display, 503 page, admin UI.
-* **Phase C** — Foxguard SSO by forward-auth.
+* **Phase C** — Foxguard SSO by forward-auth. *(Shipped, though not by
+  forward-auth: the proxy verifies the signed cookie itself, so a published
+  service keeps working while the API restarts. Revocation is bought back with a
+  denylist map pushed over the runtime socket.)*
+* **Phase C2 — SSO authorization.** *(Shipped.)* Users belong to the existing
+  `groups` table; an authenticator requires any one of a set, optionally ANDed
+  with an administrator flag, per door. Measured before it was written: an array
+  claim comes back as raw JSON text, so the claim is a comma-wrapped string
+  matched with `-m sub`, where several patterns are an OR and the wrapping is
+  what prevents `infra` matching `infrastructure`. A valid session that fails
+  the check must return 403 — a redirect loops forever against its own cookie.
 * **Phase D** — geo. GeoLite2 now needs a MaxMind account and `geoipupdate`;
   DB-IP lite is the no-account alternative. Load as a map through the Runtime
   API, never rendered into the config: hundreds of thousands of prefixes. Sell

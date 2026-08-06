@@ -40,6 +40,7 @@ from .model import (
     SLUG_RE,
     UNIMPLEMENTED_FILTERS,
     AccessAction,
+    Authenticator,
     AuthKind,
     Exposure,
     FilterKind,
@@ -58,8 +59,14 @@ from .model import (
 #: anything that touches a database, and a mismatch is caught by a test.
 ALGORITHM = "HS256"
 
+#: Wraps and separates the slugs in the token's ``groups`` claim. Duplicated
+#: from ``services/sso`` for the same reason as ``ALGORITHM``, and guarded by
+#: the same kind of test.
+GROUP_DELIMITER = ","
+
 __all__ = [
     "ALGORITHM",
+    "GROUP_DELIMITER",
     "ProxyValidationError",
     "PEER_SET",
     "SSO_REVOKED_FILE",
@@ -80,6 +87,10 @@ PEER_SET = "fg_peers"
 MAX_SOCKET_PATH = 97
 
 _MAX_PORT = 65535
+#: Same expression as ``ck_groups_slug_format`` in the schema. Enforced again
+#: here because it is what makes ``GROUP_DELIMITER`` unambiguous: a slug that
+#: could contain a comma would let one group's name impersonate two.
+GROUP_SLUG = re.compile(r"^[a-z0-9][a-z0-9_-]{0,23}$")
 _SET_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,47}$")
 _USERNAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
 _OPTION_RE = re.compile(r"^[a-z0-9][a-z0-9. _-]*[^\r\n]*$")
@@ -339,6 +350,20 @@ def _validate_policy(spec: ProxySpec, service: Service) -> None:
                 "the login page (FOXGUARD_PROXY_DOMAIN, or "
                 "FOXGUARD_PROXY_SSO_HOSTNAME to override it)"
             )
+        if auth.kind is not AuthKind.FOXGUARD_SSO and (auth.groups or auth.require_admin):
+            raise ProxyValidationError(
+                f"service {service.slug!r}: {auth.kind.value} carries a group or "
+                "admin requirement, and only single sign-on knows who the caller "
+                "is. A bearer token names no person"
+            )
+        for slug in auth.groups:
+            if not GROUP_SLUG.fullmatch(slug):
+                # The delimiter the claim is built from lives in this module's
+                # contract with services.sso: a slug containing one would let a
+                # membership be forged by naming a group after two others.
+                raise ProxyValidationError(
+                    f"service {service.slug!r}: {slug!r} is not a valid group slug"
+                )
         if auth.kind is AuthKind.BASIC and not service.accounts:
             raise ProxyValidationError(
                 f"service {service.slug!r}: basic auth is enabled but no service "
@@ -781,12 +806,16 @@ def _service_rules(
 
     sso = next((a for a in auths if a.kind is AuthKind.FOXGUARD_SSO), None)
     if sso and http:
-        yield from _sso_setup(spec, service, cond)
+        yield from _sso_setup(spec, service, sso, cond)
 
     conditions: list[str] = []
     for auth in auths:
         if auth.kind is AuthKind.FOXGUARD_SSO and http:
-            conditions.append(_sso_condition(service))
+            allowed = _sso_authorized(service, auth)
+            conditions.append(
+                f"{_sso_condition(service)} {allowed}" if allowed
+                else _sso_condition(service)
+            )
         elif auth.kind is AuthKind.PEER_IDENTITY:
             conditions.append(f"{{ src -f {spec.maps_dir}/{set_file(PEER_SET)} }}")
         elif auth.kind is AuthKind.BEARER and http:
@@ -812,6 +841,25 @@ def _service_rules(
             yield f"{prefix}http-request set-var(txn.fg_auth) int(1){cond(condition)}"
         failed = "{ var(txn.fg_auth) -m int eq 0 }"
         basic = next((a for a in auths if a.kind is AuthKind.BASIC), None)
+        if sso and (refused := _sso_authorized(service, sso, negated=True)):
+            # Signed in, and not allowed here. This must come *before* the
+            # redirect below and must not be one: sending this browser to the
+            # login page would sign it in again, hand it the very same cookie,
+            # and bounce it straight back -- a loop the person cannot break and
+            # that reads as the service being down. Say what is wrong instead.
+            wanted = ", ".join(sso.groups) if sso.groups else ""
+            need = " and ".join(
+                part for part in (
+                    "an administrator account" if sso.require_admin else "",
+                    f"membership of: {wanted}" if wanted else "",
+                ) if part
+            )
+            yield (
+                f"{prefix}http-request return status 403 content-type text/plain "
+                f'lf-string "signed in as %[var(txn.fg_sub_{_var(service.slug)})], '
+                f'but {service.slug} needs {need}"'
+                f"{cond(failed, _sso_condition(service), refused)}"
+            )
         if sso:
             # A browser gets sent to sign in; a 401 would just show it a blank
             # page. ``h`` and ``p`` are url-encoded and the login endpoint
@@ -863,7 +911,9 @@ def _service_rules(
 SSO_REVOKED_FILE = "sso_revoked.map"
 
 
-def _sso_setup(spec: ProxySpec, service: Service, cond) -> Iterator[str]:
+def _sso_setup(
+    spec: ProxySpec, service: Service, auth: Authenticator, cond
+) -> Iterator[str]:
     """Unpack and check the session cookie.
 
     Every line here exists because of something measured against HAProxy
@@ -913,16 +963,68 @@ def _sso_setup(spec: ProxySpec, service: Service, cond) -> Iterator[str]:
         f"{INDENT}http-request set-var(txn.fg_rev_{tag}) var(txn.fg_jti_{tag}),"
         f"map_str({maps}/{SSO_REVOKED_FILE}){cond()}"
     )
+    yield from _sso_authz(service, auth, cond)
+
+
+def _sso_authz(service: Service, auth: Authenticator, cond) -> Iterator[str]:
+    """Reduce "may this person use this service" to one integer.
+
+    A variable rather than a condition reused in two places, because the answer
+    is needed **negated** as well -- and the requirement is a conjunction, whose
+    negation is a disjunction, which HAProxy's condition language cannot
+    express. Computing it once sidesteps that: ``eq 0`` is a perfectly good
+    negation of ``eq 1``.
+
+    Emitted only when something is actually required. A service that admits any
+    signed-in account renders exactly what it did before this existed.
+    """
+    if not (auth.groups or auth.require_admin):
+        return
+    tag = _var(service.slug)
+    yield f"{INDENT}# authorisation: signed in is not the same as allowed in"
+    terms: list[str] = []
+    if auth.groups:
+        yield (
+            f"{INDENT}http-request set-var(txn.fg_grp_{tag}) var(txn.fg_jwt_{tag}),"
+            f"jwt_payload_query('$.groups'){cond()}"
+        )
+        # Several patterns on one condition are an OR -- measured. The claim
+        # wraps every slug in the delimiter, which is what stops ',inf,' from
+        # matching a member of 'infra'.
+        patterns = " ".join(
+            f"{GROUP_DELIMITER}{slug}{GROUP_DELIMITER}" for slug in auth.groups
+        )
+        terms.append(f"{{ var(txn.fg_grp_{tag}) -m sub {patterns} }}")
+    if auth.require_admin:
+        yield (
+            f"{INDENT}http-request set-var(txn.fg_adm_{tag}) var(txn.fg_jwt_{tag}),"
+            f"jwt_payload_query('$.admin','int'){cond()}"
+        )
+        terms.append(f"{{ var(txn.fg_adm_{tag}) -m int eq 1 }}")
+    yield f"{INDENT}http-request set-var(txn.fg_az_{tag}) int(0){cond()}"
+    yield f"{INDENT}http-request set-var(txn.fg_az_{tag}) int(1){cond(*terms)}"
 
 
 def _sso_condition(service: Service) -> str:
-    """All three checks, as one condition. Any missing one lets a forgery in."""
+    """All three checks, as one condition. Any missing one lets a forgery in.
+
+    Session *validity* only. Authorisation is deliberately not folded in here,
+    because the two failures deserve different answers -- see
+    :func:`_sso_authorized`.
+    """
     tag = _var(service.slug)
     return (
         f"{{ var(txn.fg_ok_{tag}) -m int eq 1 }} "
         f"{{ var(txn.fg_left_{tag}) -m int gt 0 }} "
         f"!{{ var(txn.fg_rev_{tag}) -m found }}"
     )
+
+
+def _sso_authorized(service: Service, auth: Authenticator, *, negated: bool = False) -> str:
+    """The authorisation verdict, or ``""`` when nothing is required."""
+    if not (auth.groups or auth.require_admin):
+        return ""
+    return f"{{ var(txn.fg_az_{_var(service.slug)}) -m int eq {0 if negated else 1} }}"
 
 
 def _var(slug: str) -> str:
