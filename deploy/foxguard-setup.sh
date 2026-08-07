@@ -16,6 +16,12 @@
 #   sudo ./foxguard-setup.sh              # ask, then install
 #   sudo ./foxguard-setup.sh --dry-run    # ask, print the command, change nothing
 #
+# SC2154 is off for this file alone: `ask` assigns through `printf -v "$__var"`,
+# so every answer looks unassigned to a static checker while in fact none of
+# them is. `make lint-shell` keeps that check ON everywhere else, because an
+# unassigned variable under `set -u` is how this installer has died mid-run
+# twice. Do not copy this disable into a script that assigns normally.
+# shellcheck disable=SC2154
 set -euo pipefail
 
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)

@@ -127,9 +127,20 @@ golden: ## Regenerate the nftables golden baseline (review the diff!)
 	cd $(BACKEND) && FOXGUARD_UPDATE_GOLDEN=1 pytest tests/test_nft_generator.py -k golden
 
 .PHONY: lint
-lint: ## Lint both Python packages
+lint: lint-shell ## Lint both Python packages and the deploy scripts
 	cd $(BACKEND) && ruff check .
 	cd $(AGENT) && ruff check .
+
+# -o check-unassigned-uppercase is the whole point of this target, and it is
+# off by default in shellcheck. Twice now an `unbound variable` has killed the
+# installer mid-run -- once on `$B1.` in a banner, once on `$VENV` -- each time
+# after it had created accounts and before it printed the secrets that exist
+# nowhere else. `set -u` only finds those on the branch that runs, and these
+# scripts have branches that need root, systemd and a WireGuard interface.
+# This finds them without running anything.
+.PHONY: lint-shell
+lint-shell: ## Static-check the deploy scripts, including unassigned variables
+	shellcheck -o check-unassigned-uppercase -S warning deploy/*.sh deploy/tests/*.sh
 
 .PHONY: ruleset
 ruleset: ## Print the ruleset the current database state implies

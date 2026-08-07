@@ -82,6 +82,12 @@ fi
 
 # shellcheck disable=SC1090
 set -a; . "$CONFDIR/backend.env"; set +a
+
+# Named rather than left to `set -u`: a hand-written backend.env that leaves the
+# URL out is a plausible thing to find, and "FOXGUARD_DATABASE_URL: unbound
+# variable" does not tell whoever is holding a broken gateway which file to fix.
+# shellcheck disable=SC2154  # comes from backend.env, sourced two lines up
+: "${FOXGUARD_DATABASE_URL:?not set in $CONFDIR/backend.env — there is no database to back up}"
 DB_NAME=${FOXGUARD_DATABASE_URL##*/}; DB_NAME=${DB_NAME%%\?*}
 WG_IF=${FOXGUARD_WG_INTERFACE:-wg0}
 

@@ -971,7 +971,7 @@ if [[ $PROXY_ENABLED -eq 1 ]]; then
 
   if [[ $GEO_NOW == yes ]]; then
     step "fetching the country prefix dataset"
-    if "$VENV/bin/foxguard-geo-refresh" >/dev/null 2>&1; then
+    if "$PREFIX/venv/bin/foxguard-geo-refresh" >/dev/null 2>&1; then
       ok "country dataset downloaded"
     else
       warn "could not download the country dataset -- geo filters will refuse"
