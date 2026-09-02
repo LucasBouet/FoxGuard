@@ -117,8 +117,18 @@ def _candidate_urls() -> list[str]:
     return [dataset_url(now), dataset_url(previous)]
 
 
+#: DB-IP's CDN answers 403 to the default ``Python-urllib/x.y``. Measured, not
+#: guessed: the identical request carrying any other User-Agent returns the
+#: file, on every month tested. So this says who is calling, honestly.
+#: Impersonating a browser would also work and would be a lie that breaks the
+#: day they tighten the rule -- and a firewall that stops updating its country
+#: map because of a spoofing arms race is worse than one that is told to stop.
+_USER_AGENT = "Foxguard/0.1 (+https://github.com/LucasBouet/FoxGuard)"
+
+
 def _download(url: str, destination: Path, timeout: float) -> int:
     logger.info("fetching the geo dataset from %s", url)
+    request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
     # delete=False and no context manager on the constructor: the file has to
     # outlive its own handle so it can be renamed into place. It *is* closed by
     # the `with handle` below, and removed by the except.
@@ -128,7 +138,7 @@ def _download(url: str, destination: Path, timeout: float) -> int:
     written = 0
     try:
         with handle:
-            with urllib.request.urlopen(url, timeout=timeout) as response:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
                 while chunk := response.read(1 << 16):
                     handle.write(chunk)
                     written += len(chunk)

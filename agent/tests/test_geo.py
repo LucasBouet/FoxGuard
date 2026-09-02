@@ -195,3 +195,41 @@ def test_a_download_that_fails_leaves_the_previous_dataset_alone(tmp_path):
     assert dataset.read_bytes() == b"previous"
     # And no half-written temporary file is left behind to be mistaken for one.
     assert [p.name for p in tmp_path.iterdir()] == ["dbip.csv.gz"]
+
+
+def test_the_download_identifies_itself(tmp_path, monkeypatch):
+    """DB-IP answers 403 to the default ``Python-urllib/x.y``.
+
+    Measured against the real host: the identical request with any other
+    User-Agent returns the file. Without this the country map silently never
+    updates -- the failure is a warning the agent is designed to survive, so
+    nothing ever breaks loudly enough to be noticed.
+    """
+    import urllib.request
+
+    from foxguard_agent.geo import refresh_dataset
+
+    seen = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self, _size):
+            return b""
+
+    def fake_urlopen(request, timeout=None):
+        seen["agent"] = request.get_header("User-agent")
+        seen["url"] = request.full_url
+        return FakeResponse()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    refresh_dataset(tmp_path / "dataset.csv.gz", url="https://example.test/db.csv.gz")
+
+    assert seen["agent"], "the request carried no User-Agent at all"
+    assert "urllib" not in seen["agent"].lower()
+    assert "Foxguard" in seen["agent"]
+
