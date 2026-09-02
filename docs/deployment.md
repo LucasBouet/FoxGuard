@@ -478,7 +478,7 @@ out that way.
 **Never behind a reverse proxy.** nginx or Traefik in front of the portal makes
 every request arrive from the proxy's address, and peer identification stops
 working — or, if you "fix" that by trusting the header, anyone can claim to be
-any peer. The Phase 5 reverse proxy is meant for internal *web services*, not
+any peer. The reverse proxy is meant for internal *web services*, not
 for the portal or `/api/v1/enroll`.
 
 ### Building and serving the portal UI
@@ -1317,8 +1317,17 @@ because there is no lockout; if you need it cleared immediately, restart the API
 
 ## Hardening checklist
 
+Written for the host install. On a container deployment, read `backend.env` and
+`agent.env` as the single `.env` beside `docker-compose.yml`, and the systemd
+sandboxing lines as "the gateway container holds `NET_ADMIN` and `NET_RAW` and
+nothing else, and the other two hold nothing at all" — see
+[docker.md](docker.md). Every other item applies unchanged, because it is a
+property of the configuration rather than of the init system.
+
 - [ ] `FOXGUARD_DEV_MODE` is unset or `false` on the gateway.
-- [ ] `backend.env` and `agent.env` are `0600` and owned by root.
+- [ ] `backend.env` and `agent.env` are `0600` and owned by root — or, with
+      containers, `.env` is `0600`. It carries the admin token, the database
+      password and the WireGuard private key that *is* this gateway's identity.
 - [ ] The admin and agent tokens are different values.
 - [ ] At least one administrator account exists and has signed in, so actions
       are attributed to a person rather than to `admin-token`.

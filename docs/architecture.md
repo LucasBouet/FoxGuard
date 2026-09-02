@@ -1042,7 +1042,7 @@ cannot disagree, because they are the same code path.
   CrowdSec bouncer installing its own table composes with Foxguard rather than
   fighting it.
 
-## Known gaps (after Phase 4)
+## Known gaps
 
 Stated plainly rather than discovered later:
 
@@ -1068,17 +1068,14 @@ Stated plainly rather than discovered later:
   interval of its deadline, not at it. Lower
   `FOXGUARD_SESSION_SWEEP_INTERVAL_SECONDS` if that matters; the sweep is one
   indexed query when nothing is due.
-- **Nothing warns a user before their session ends.** They discover it when the
-  connection drops and have to visit the portal again. `GET /api/v1/sessions`
-  exposes `seconds_remaining`, so a Phase 4 notification has what it needs.
 - **Rate-limit and OIDC state are per-process.** Both are in-memory. Run the API
   with a single uvicorn worker; with several, the login budget is multiplied and
   an OIDC callback can land on a worker that never saw the `start`. The expiry
   sweep is *not* affected — it takes an advisory lock (§11).
 - **No account lockout, only throttling.** A sustained attacker who waits out
   each window keeps getting attempts. Combined with argon2 and a 10-per-5-minutes
-  budget that is a very slow channel, but it is not a lockout. The Phase 5
-  CrowdSec bouncer is the intended answer.
+  budget that is a very slow channel, but it is not a lockout. The CrowdSec
+  bouncer is the intended answer, and is not built yet.
 - **TOTP secrets are stored in plaintext.** They have to be usable for
   verification, so this is inherent to TOTP rather than an oversight — but it
   means a database dump yields working second factors, unlike the password
@@ -1087,8 +1084,6 @@ Stated plainly rather than discovered later:
 - **IPAM races are resolved by the unique constraint**, not by a lock: two
   concurrent creations make one insert fail, which the caller retries. Correct,
   but it surfaces as a 409 rather than a transparent retry.
-- **The generator ignores `groups.kind`.** Creating a `zone` today behaves
-  exactly like a group.
 - **Mask selection in the QR encoder is not byte-identical to segno's.** Penalty
   rule 3 is stated as a 1:1:3:1:1 *ratio*; segno matches the literal
   seven-module pattern. Both produce valid codes and occasionally prefer
@@ -1193,6 +1188,24 @@ An internal service name becomes an A record to the **gateway**, not a CNAME to
 the peer: the proxy is the destination. Measured against dnsmasq 2.91 — a
 hosts-file entry outside `local=/zone/` is still answered, in both resolver
 modes, which is what lets the two namespaces coexist in one resolver.
+
+That coexistence was designed here and then refused one layer down. §16's
+in-zone guard — the one that stops the resolver answering for a name Foxguard
+does not own — was applied to *every* host entry, including these. So with
+`proxy_domain` outside `dns_zone`, which is the normal case and the whole point
+of two namespaces, publishing one internal service made the entire zone
+unrenderable. `render_or_none` then swallowed the failure by design (a
+hand-authored record must never stop firewall rules reaching the kernel), so the
+symptom was not an error but an absence: the agent received no zone, the running
+resolver kept serving one nobody could regenerate, and the fleet lost name
+resolution at the next restart.
+
+The fix is a set of names declared as deliberately outside the zone, checked
+per name rather than by relaxing the rule. Answering for `www.google.com` is
+still a hijack and still refused; a published service is not. Two lessons worth
+keeping: a guard and the thing it guards can be written to contradict each
+other when neither file mentions the other, and a failure path built to be
+survivable is a failure path nobody will notice.
 
 The trap this creates is recorded in the installer and the healthcheck: if
 `dns_zone` ever covered `proxy_domain` **and** the resolver were in `split`
@@ -1464,3 +1477,84 @@ was a real bug, caught by a test written to cover the case.
 DB-IP lite over MaxMind's GeoLite2 purely because it needs no account and no
 licence key. It is CC-BY-4.0, so the attribution is a comment in every generated
 map.
+
+---
+
+## 22. Containers: what they isolate here, and what they do not
+
+Foxguard ships as three images alongside the host installer. They are not a
+different product — the same code, the same rendered artefacts, the same agent
+— but the deployment makes two decisions worth recording.
+
+### Nearly everything runs in the host's network namespace
+
+Not a shortcut, and not something to "fix" later. Two independent reasons, each
+sufficient on its own:
+
+**The portal identifies a caller by the source address of its TCP connection**
+(§5), because inside WireGuard that address is bound to a public key. Docker's
+bridge rewrites source addresses. Behind one, every peer arrives as the bridge
+gateway: the portal answers 403 to everybody, or — worse — resolves them all to
+the same peer. The `X-Forwarded-For` refusal in §5 does not save this, because
+the rewrite happens in the kernel and there is no header to refuse.
+
+**The agent programs the host's network.** nftables, the WireGuard interface,
+kernel routes. In a private namespace it would get a pristine empty stack of its
+own and configure it perfectly, affecting nothing.
+
+So running the gateway container is equivalent to running the agent on the host.
+What containerisation buys is a pinned dependency tree and a one-command
+deployment — **not** a security boundary at the network layer. The trust split
+survives, because it was never a network property: the control plane and the
+dashboard drop every capability, and only the gateway holds `NET_ADMIN` and
+`NET_RAW`. Never `privileged`; those two are the whole requirement.
+
+PostgreSQL is the exception. It has no reason to see the host's stack, so it
+keeps its own namespace and is published on loopback.
+
+### There is no init system, so the reload path is reproduced by hand
+
+The agent does not start dnsmasq or HAProxy. It renders their configuration,
+validates it with the daemon's own checker, and asks an init system to make the
+daemon serve it — `is-active`, `reload`, `restart` (§16, §19). A container has
+no init system, so `docker/fg-servicectl.sh` stands in for one.
+
+It is deliberately **not** named `systemctl`. Shadowing a well-known binary
+hides what is happening from whoever is debugging at 3am, and the agent already
+makes the path configurable, so the substitution is visible in the environment
+rather than in `$PATH`.
+
+What it reproduces matters more than that it exists:
+
+- **`SIGUSR2` to the HAProxy master, not a restart.** The master keeps the
+  listening sockets, hands them to a new worker, and the old worker drains. A
+  restart would break every passthrough session on every policy change — and a
+  passthrough session is often a shell somebody is typing in.
+- **`SIGHUP` to dnsmasq**, which re-reads the hosts file and flushes the cache
+  without dropping the listening socket. Adding a peer is a reload; only a
+  change to the configuration itself is a restart.
+- **`kill -0` on the pid file**, because a pid file outlives the process it
+  named, and a crashed daemon that reads as active for ever is never restarted.
+
+Neither daemon starts at container boot, for the same reason neither unit is
+enabled at boot: before the agent has rendered a configuration there is nothing
+to serve, and a daemon restarting in a loop over a file that does not exist yet
+is noise that hides the real first-boot errors.
+
+### Two failures that only a container surfaced
+
+Both are recorded because they were invisible under systemd and obvious here.
+
+**A healthcheck aimed at loopback while the process binds the tunnel.** The API
+and the dashboard bind the gateway's tunnel address — never the WAN, §5 — so a
+healthcheck on `127.0.0.1` fails on a perfectly healthy container. With the
+dashboard waiting on `condition: service_healthy`, the whole stack sat there.
+
+**An existing `wg0` carrying a different key.** Leaving an interface alone
+because something else owns it is right; accepting it without checking which key
+it carries is not. Every generated client configuration then names a gateway
+that cannot decrypt for it, and the only symptom is peers that never handshake.
+The container compares and says so.
+
+The full deployment guide, the environment reference and the failure modes are
+in [`docker.md`](docker.md).

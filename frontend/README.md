@@ -93,6 +93,14 @@ FOXGUARD_ADMIN_API_TOKEN=<admin token> \
 
 `npm run build` for production, `npm run typecheck` for types alone.
 
+`NEXT_STANDALONE=true npm run build` additionally emits `.next/standalone`, a
+self-contained server carrying only the modules it imports. That is what the
+container image ships (`docker/dashboard.Dockerfile`); it is behind a variable
+so the systemd deployment, which runs `next start` from this directory, is
+unaffected. The standalone server reads `HOSTNAME` and `PORT` from the
+environment — the compose file binds it to the gateway's tunnel address, never
+the WAN, for the reason in the next section.
+
 ## No admin credential reaches the browser
 
 This is the reason the dashboard is a Next.js **server** app — the exact opposite

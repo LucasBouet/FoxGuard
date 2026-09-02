@@ -465,6 +465,9 @@ follow:
   refuses everyone and a deny list blocks nobody. The dashboard says so, and the
   map file itself says so in a comment. Fetch it now with
   `systemctl start foxguard-geo-refresh`, or pass `--geo-now` at install time.
+  On a container deployment there is no timer: the gateway container runs the
+  refresh on its own loop, and `docker compose exec gateway foxguard-geo-refresh
+  --rebuild` does it now.
 - **Only the countries you actually name are downloaded into the map.** That is
   a deliberate memory trade: the whole world costs HAProxy about 367 MiB, three
   countries about 47. Naming a fourth country rebuilds the map on the next poll.
@@ -535,6 +538,24 @@ their secrets live solely in the database. See "Backup and restore" in
 | The generator says "incomplete" | `FOXGUARD_WG_PUBLIC_KEY` or `FOXGUARD_WG_ENDPOINT_HOST` is unset in `/etc/foxguard/backend.env` |
 | A generated config will not import | The file name is the interface name: at most 15 characters of `[a-zA-Z0-9_=+.-]`. The generator already trims it — check nothing renamed the file |
 | The routing peer lost its own LAN | Its `AllowedIPs` contains the network it carries. Regenerate its config; the generator excludes it |
+
+**If you deployed with containers**, the commands in that table are the systemd
+ones. The equivalents:
+
+| Instead of | Run |
+| --- | --- |
+| `systemctl status foxguard-agent` | `docker compose ps gateway` |
+| `journalctl -u foxguard-agent` | `docker compose logs -f gateway` |
+| `systemctl status foxguard-dns` | `docker compose exec gateway fg-servicectl status foxguard-dns` |
+| `systemctl status foxguard-proxy` | `docker compose exec gateway fg-servicectl status foxguard-proxy` |
+| `nft list table inet foxguard` | the same — the container programs the *host's* nftables |
+| `haproxy -c -f …` | `docker compose exec gateway haproxy -c -f /etc/foxguard/proxy/haproxy.cfg` |
+| `/etc/foxguard/backend.env` | `.env` next to `docker-compose.yml` |
+
+The `Permission denied` on its own executable cannot happen in a container, and
+neither can the file-mode fix for it. Everything else behaves identically,
+because it is the same agent applying the same rendered artefacts.
+[`docker.md`](docker.md) has the failure modes specific to that deployment.
 
 Every allowed and denied decision carries a counter and a `fg:<ref>:<name>`
 comment in the live ruleset, so you can map a hit count back to the rule that
