@@ -139,8 +139,10 @@ def build_spec(session: Session, settings: Settings) -> DnsSpec:
     # are added fully qualified rather than through ``qualify``. Measured
     # against dnsmasq 2.91: a hosts-file entry outside ``local=/zone/`` is
     # still answered, in both resolver modes, so the two namespaces coexist.
+    service_names: list[str] = []
     if settings.proxy_enabled:
-        for hostname in _service_names(session, settings):
+        service_names = _service_names(session, settings)
+        for hostname in service_names:
             add(settings.gateway_ip, hostname, "published service")
 
     records = (
@@ -186,6 +188,9 @@ def build_spec(session: Session, settings: Settings) -> DnsSpec:
         hosts_path=spec.hosts_path,
         hosts=hosts,
         cnames=tuple(cnames),
+        # Declared, so the zone guard lets exactly these through and keeps
+        # refusing everything else outside the zone.
+        external_names=frozenset(service_names),
         mode=spec.mode,
         upstreams=spec.upstreams,
         cache_size=spec.cache_size,

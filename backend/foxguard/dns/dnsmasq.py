@@ -218,7 +218,13 @@ def validate_spec(spec: DnsSpec) -> None:
         for name in host.names:
             if not _check_name(name, label, errors):
                 continue
-            _check_in_zone(name, spec.zone, label, errors)
+            # A published service is fully qualified under the proxy domain,
+            # which is not this zone. Without this exemption, publishing one
+            # service makes the whole zone unrenderable -- and because
+            # `render_or_none` swallows that, the fleet silently loses name
+            # resolution at the next restart with nothing to point at.
+            if name not in spec.external_names:
+                _check_in_zone(name, spec.zone, label, errors)
             key = (name, parsed.version)
             owner = seen_names.get(key)
             if owner is not None and owner != host.address:

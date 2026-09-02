@@ -122,6 +122,38 @@ def test_names_outside_the_zone_are_refused():
     assert "outside the zone" in str(exc.value)
 
 
+def test_a_declared_service_name_may_live_outside_the_zone():
+    """Published services are the one namespace that legitimately is.
+
+    A service needs a name a public CA will sign and ``.internal`` never can be,
+    so it lives under the proxy domain while peers stay in the zone. Refusing it
+    made publishing one service take the *whole* zone down -- and because
+    ``render_or_none`` swallows that, the fleet lost name resolution silently at
+    the next restart.
+    """
+    rendered = render_hosts(
+        spec(
+            hosts=(host("10.88.0.1", f"gw.{ZONE}", "wiki.example.com"),),
+            external_names=frozenset({"wiki.example.com"}),
+        )
+    )
+    assert "wiki.example.com" in rendered
+    assert f"gw.{ZONE}" in rendered
+
+
+def test_the_exemption_is_per_name_and_not_a_blanket():
+    """Declaring one out-of-zone name must not admit a second."""
+    with pytest.raises(DnsValidationError) as exc:
+        render_hosts(
+            spec(
+                hosts=(host("10.88.0.1", "wiki.example.com", "www.google.com"),),
+                external_names=frozenset({"wiki.example.com"}),
+            )
+        )
+    assert "www.google.com" in str(exc.value)
+    assert "outside the zone" in str(exc.value)
+
+
 def test_two_devices_cannot_share_a_name():
     with pytest.raises(DnsValidationError) as exc:
         render_hosts(
