@@ -140,7 +140,7 @@ lint: lint-shell ## Lint both Python packages and the deploy scripts
 # This finds them without running anything.
 .PHONY: lint-shell
 lint-shell: ## Static-check the deploy scripts, including unassigned variables
-	shellcheck -o check-unassigned-uppercase -S warning deploy/*.sh deploy/tests/*.sh
+	shellcheck -o check-unassigned-uppercase -S warning deploy/*.sh deploy/tests/*.sh docker/*.sh
 
 .PHONY: ruleset
 ruleset: ## Print the ruleset the current database state implies
@@ -177,3 +177,35 @@ proxy: ## Print the HAProxy configuration the control plane would render
 .PHONY: setup
 setup: ## Guided install: the same options as foxguard-install.sh, asked as questions
 	sudo ./deploy/foxguard-setup.sh
+
+# --------------------------------------------------------------------------- #
+# containers
+# --------------------------------------------------------------------------- #
+# These drive docker-compose.yml, which deploys a real gateway: the agent
+# container runs in the host's network namespace with CAP_NET_ADMIN and programs
+# this machine's nftables and WireGuard. That is not a development stack -- see
+# dev-up/dev-down for one. docs/docker.md has the whole story.
+
+.PHONY: docker-env
+docker-env: ## Write .env with fresh secrets and a new interface keypair
+	./docker/gen-env.sh
+
+.PHONY: docker-build
+docker-build: ## Build the three images locally, without pushing
+	docker compose build
+
+.PHONY: docker-up
+docker-up: ## Start the containerised gateway (needs .env — run docker-env first)
+	docker compose up -d
+
+.PHONY: docker-down
+docker-down: ## Stop it, keeping the database and the agent's state
+	docker compose down
+
+.PHONY: docker-logs
+docker-logs: ## Follow every container's log
+	docker compose logs -f
+
+.PHONY: docker-ps
+docker-ps: ## What is running, and whether it is healthy
+	docker compose ps

@@ -137,6 +137,7 @@ Foxguard/
 │   │   └── tests/      #   run with `node --test` against the real wg + zbar
 │   └── portal/         # static bundle; runs in the browser, served by the API
 ├── deploy/             # installer + health check, both with their own safeguards
+├── docker/             # three images, and the shim that replaces systemd in them
 ├── examples/           # example ACL document for the import endpoint
 └── docs/
 ```
@@ -269,6 +270,50 @@ tunnel, never let a group name become an nft statement. See
 There is also a golden baseline (`backend/tests/golden/full_ruleset.nft`),
 created on the first run and committed afterwards, so any change to the rendered
 output is a reviewable diff. See `backend/tests/golden/README.md`.
+
+## Deploying with Docker
+
+```sh
+git clone <your-repo> && cd Foxguard
+./docker/gen-env.sh          # secrets + the interface keypair
+docker compose up -d
+```
+
+Three images — `foxguard-api`, `foxguard-dashboard`, `foxguard-gateway` —
+published to the GitHub Container Registry, configured entirely by environment
+variable. The split follows the trust levels the project already had: the
+control plane holds no capability at all, the dashboard holds the admin
+credential in its own process, and only the gateway container gets
+`CAP_NET_ADMIN`.
+
+**The gateway container runs in the host's network namespace, and that is not an
+oversight.** The portal identifies a caller by the source address of its TCP
+connection — inside WireGuard that address is bound to a public key — and
+Docker's bridge rewrites source addresses. Meanwhile the agent's whole job is to
+program the *host's* nftables and WireGuard interface; in a private namespace it
+would configure a pristine empty stack of its own, affecting nothing. So running
+that container is equivalent to running the agent on the host. What you get from
+containerising is a pinned dependency tree and a one-command deployment, not a
+network-layer security boundary.
+
+**Giving it to somebody else**, once the images are published:
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/LucasBouet/FoxGuard/main/deploy/foxguard-quickstart.sh
+less foxguard-quickstart.sh        # it installs Docker and edits their firewall
+bash foxguard-quickstart.sh
+```
+
+No clone, no build. It installs Docker, loads the wireguard module, turns on
+forwarding, fetches the compose file and generates their own secrets and
+interface keypair, and starts the stack with the agent in **dry run** — the
+agent programs their firewall and they are almost certainly connected over SSH,
+so going live is the one step it leaves to them.
+
+Everything else — what replaces each systemd unit, how HAProxy still gets a
+seamless reload without one, the full environment reference, backups,
+certificates, and the failure modes worth recognising — is in
+[docs/docker.md](docs/docker.md).
 
 ## Deploying on a real Linux gateway
 
