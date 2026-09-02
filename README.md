@@ -4,14 +4,17 @@ Self-hosted network access control on top of WireGuard: peers, groups, ACL
 policies and an **nftables** dataplane generated from a single source of truth.
 No cloud dependency, no feature gating, no vendor control plane.
 
-> **Status: Phases 1–6 complete.** Database schema + migrations, CRUD API, ACL
+> **Status: Phases 1–7e complete.** Database schema + migrations, CRUD API, ACL
 > import/export, the nftables generator and its test suite, the gateway agent,
 > the enrollment endpoint and the captive portal (local accounts with argon2id,
 > optional TOTP, OIDC, rate limiting, the peer state machine), session expiry
 > with per-group lifetimes, the admin dashboard with its kill switch, network
-> zones with routed networks, an internal resolver, and a client-config
-> generator that never lets a private key reach the server. What is left is the
-> reverse proxy and the bouncer (see [Roadmap](#roadmap)).
+> zones with routed networks, an internal resolver, a client-config generator
+> that never lets a private key reach the server, and a reverse proxy that
+> publishes services behind a peer with single sign-on, group authorization and
+> country filters. Deployable either with `deploy/foxguard-install.sh` on a
+> Linux box or as three container images. What is left is the CrowdSec bouncer
+> and its WAF, then mTLS (see [Roadmap](#roadmap)).
 
 ---
 
@@ -136,7 +139,7 @@ Foxguard/
 │   │   │               #   browser and import nothing — that is the invariant
 │   │   └── tests/      #   run with `node --test` against the real wg + zbar
 │   └── portal/         # static bundle; runs in the browser, served by the API
-├── deploy/             # installer + health check, both with their own safeguards
+├── deploy/             # installer, guided setup, health check, backup, quickstart
 ├── docker/             # three images, and the shim that replaces systemd in them
 ├── examples/           # example ACL document for the import endpoint
 └── docs/
@@ -210,7 +213,7 @@ have nftables locally, `curl ... | nft -c -f -` checks it without applying it.
 Three tiers, each opting in to more infrastructure:
 
 ```sh
-make test          # 260+ tests: generator, applier, IPAM, config, WireGuard sync,
+make test          # 539 tests: generator, applier, IPAM, config, WireGuard sync,
                    # state machine, rate limiter, TOTP, OIDC token verification,
                    # session deadlines. No database, no root, no nft binary.
 make test-all      # adds the PostgreSQL-backed tests (schema, policy round trip,
@@ -229,7 +232,7 @@ make test-routes-live # the reconciler against a real kernel routing table
 make test-wg-live     # a generated config loaded into a real WireGuard interface
 ```
 
-Everything above passes on a clean checkout: 393 / 524 / 45 (agent) / 137 (API)
+Everything above passes on a clean checkout: 474 / 645 / 65 (agent) / 178 (API)
 / 46 (dashboard) at the time of writing. Tiers 2 and 3 skip themselves unless
 `FOXGUARD_TEST_DATABASE_URL` / `FOXGUARD_TEST_API_URL` are set, so `make test`
 works on any machine.
@@ -653,9 +656,24 @@ These are enforced in code and covered by tests, not just documented:
   rather than a compromise, because an address in no listed country matches
   nothing, which an allow list reads as "refuse" and a deny list as "ignore".
   The 27 MiB dataset never crosses the API; only the list of countries does.
-  Refreshing it is a systemd timer and never part of a reconciliation — the loop
-  that installs firewall rules must not fail because someone else's web server
-  is down. Sold as noise reduction, not security: any VPN defeats it.
+  Refreshing it is a systemd timer — a background loop in the container
+  deployment — and never part of a reconciliation: the loop that installs
+  firewall rules must not fail because someone else's web server is down. DB-IP
+  answers 403 to the default `Python-urllib` User-Agent, so the request says who
+  it is; without that the map silently never updated, which is exactly the kind
+  of failure a design built to survive an outage will not report. Sold as noise reduction, not security: any VPN defeats it.
+- **Containers, done.** The same three trust levels as three images —
+  `foxguard-api` and `foxguard-dashboard` with every capability dropped,
+  `foxguard-gateway` with `NET_ADMIN` and `NET_RAW` and nothing else. Nearly
+  everything runs in the host's network namespace, which is not a shortcut: the
+  portal identifies a caller by the source address of its TCP connection and
+  Docker's bridge rewrites those, and the agent's whole job is to program the
+  *host's* nftables. So containerising buys a pinned dependency tree and a
+  one-command deployment, not a network-layer boundary — and the documentation
+  says so three times. There is no init system inside, so a shim reproduces what
+  the units did: `SIGUSR2` to the HAProxy master, which is what keeps a reload
+  from dropping every passthrough session, and `SIGHUP` to dnsmasq. Published to
+  GHCR for amd64 and arm64. See [`docs/docker.md`](docs/docker.md).
 - **Still open.** CrowdSec — whose AppSec component is a Coraza WAF, so the
   bouncer and the WAF are one integration rather than two. Then mTLS.
 
