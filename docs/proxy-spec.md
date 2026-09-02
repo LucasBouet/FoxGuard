@@ -4,6 +4,11 @@ Everything needed to build the reverse proxy without re-deriving the design.
 Written to be read cold by someone (or some session) with no memory of the
 conversation that produced it.
 
+> **On the number.** This was Phase 6 when it was written. Client configurations
+> took that slot while it was being built, so the README's roadmap calls the
+> reverse proxy Phase 7. The title is left as it was rather than renumbered — it
+> is what the commits and the environment variables say.
+
 > **Built.** This document is the plan; `docs/architecture.md` §19 is the record
 > of what exists and why. Batch 1 shipped in full. Three things changed while
 > building it, each because running the code said so:
@@ -21,8 +26,12 @@ conversation that produced it.
 >   be: HAProxy computes `sha2(256)` over the presented token and looks it up in
 >   a map, and there is no way to hand it a salt.
 >
-> §18's open questions are still open, except the first: TLS-wrapped TCP
-> passthrough does not share `:443`. Each passthrough service gets its own port.
+> §18's open questions are still open, except the first and the fifth. The
+> first: TLS-wrapped TCP passthrough does not share `:443` — each passthrough
+> service gets its own port. The fifth: `X-Foxguard-Groups` is **off by
+> default** and turned on globally with `FOXGUARD_PROXY_SEND_GROUP_HEADER`,
+> not per service. Sending it always would leak group names to every upstream,
+> and a per-service switch is a knob nobody asked for yet.
 
 Sections marked **DECIDED** are settled and should not be reopened without a
 reason; sections marked **OPEN** need an answer before the code that depends on
@@ -761,9 +770,10 @@ keeps the project's normal lowercase-hex convention and the config lowercases.
    the access-log digest that fills it.
 4. **Certificate inventory** — a `proxy_certificates` table, or have the agent
    report `not_after` in its existing report and store nothing.
-5. **Header allowlist to upstreams** — is `X-Foxguard-Groups` sent always, or
-   only when a service opts in? Sending it always leaks group names to every
-   upstream.
+5. ~~**Header allowlist to upstreams.**~~ Answered: off by default, enabled
+   globally with `FOXGUARD_PROXY_SEND_GROUP_HEADER`. Not per service — that is
+   a knob nobody has asked for, and the default already stops group names
+   reaching upstreams that do not need them.
 6. **Does an external service require an upstream peer at all**, or may
    `upstream_peer_id` be NULL for something the gateway hosts itself (the 503
    page, a status endpoint)? The schema allows it; the policy should be stated.
