@@ -129,6 +129,20 @@ class DnsSpec:
 
     hosts: tuple[HostEntry, ...] = ()
     cnames: tuple[CnameEntry, ...] = ()
+    #: Names that are deliberately outside ``zone``.
+    #:
+    #: Published services live under the proxy domain, not the peer zone --
+    #: ``wiki.example.com``, never ``wiki.fox.internal`` -- because a service
+    #: needs a name a public CA will sign and ``.internal`` never can be. They
+    #: still belong in the hosts file: that is what makes split horizon work,
+    #: a connected peer resolving the service to the tunnel address while
+    #: everyone else gets the public record.
+    #:
+    #: Held as an explicit set rather than inferred from "does not end in
+    #: zone", so answering for ``www.google.com`` is still refused. The
+    #: exemption is per name and opt-in, which is the difference between two
+    #: namespaces coexisting and a hijack.
+    external_names: frozenset[str] = frozenset()
 
     mode: ResolverMode = ResolverMode.FORWARD
     #: Upstream resolvers, ``address`` or ``address#port``. Only consulted in
