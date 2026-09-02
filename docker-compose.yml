@@ -1,0 +1,146 @@
+# Foxguard, as containers.
+#
+#   ./docker/gen-env.sh          # secrets + the interface keypair
+#   docker compose up -d
+#
+# Full walkthrough, and everything this file assumes: docs/docker.md
+#
+# ---------------------------------------------------------------------------
+# WHY NEARLY EVERYTHING IS ON THE HOST'S NETWORK
+#
+# Two independent reasons, and each one alone would be enough:
+#
+# 1. The portal identifies a caller by the source address of its TCP
+#    connection, because inside WireGuard that address is bound to a public
+#    key. Docker's bridge rewrites source addresses. Behind one, every peer
+#    would arrive as the bridge gateway and the portal would answer 403 to
+#    everybody -- or, worse, resolve them all to the same peer.
+#
+# 2. The agent's job is to program the *host's* nftables, WireGuard interface
+#    and routes. A private network namespace would give it a pristine, empty
+#    stack of its own to configure perfectly, affecting nothing.
+#
+# So the gateway container is not isolated from the host's network, by design.
+# What containerisation buys here is a pinned dependency tree and a one-command
+# deployment, not a security boundary at the network layer. PostgreSQL is the
+# exception: it has no reason to see the host's stack, so it keeps its own and
+# is published on loopback.
+# ---------------------------------------------------------------------------
+
+name: foxguard
+
+services:
+  # ------------------------------------------------------------------------ #
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-foxguard}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set it in .env, or run ./docker/gen-env.sh}
+      POSTGRES_DB: ${POSTGRES_DB:-foxguard}
+    ports:
+      # Loopback only. The API reaches it here because it runs in the host's
+      # network namespace; nothing off this box has any business connecting.
+      - "${POSTGRES_BIND:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - foxguard-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-foxguard} -d ${POSTGRES_DB:-foxguard}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  # ------------------------------------------------------------------------ #
+  # The control plane, and the captive portal bundle it serves. Holds no
+  # capability at all: compromise it and the database can be rewritten, but the
+  # network cannot be programmed. That is the agent's privilege, and it lives
+  # in another container.
+  api:
+    image: ${FOXGUARD_REGISTRY:-ghcr.io/lucasbouet}/foxguard-api:${FOXGUARD_VERSION:-latest}
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    restart: unless-stopped
+    network_mode: host
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    env_file: .env
+    environment:
+      # The tunnel address, never the WAN: this is where quarantined peers
+      # reach the portal, and it is the one listener on which a source address
+      # is an identity.
+      FOXGUARD_BIND_HOST: ${FOXGUARD_TUNNEL_IP:-10.88.0.1}
+      FOXGUARD_BIND_PORT: ${FOXGUARD_PORTAL_PORT:-8080}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Deliberately NOT depends_on: gateway. The API waits for the tunnel address
+    # to exist and the gateway waits for the API to answer; a compose dependency
+    # either way round would turn two bounded waits into a deadlock. They
+    # converge on their own, usually within a couple of seconds.
+
+  # ------------------------------------------------------------------------ #
+  # Anyone who can reach this port is talking to something that can already
+  # administer the network: the admin credential lives in this process and
+  # never reaches the browser. Bind it to the tunnel.
+  dashboard:
+    image: ${FOXGUARD_REGISTRY:-ghcr.io/lucasbouet}/foxguard-dashboard:${FOXGUARD_VERSION:-latest}
+    build:
+      context: .
+      dockerfile: docker/dashboard.Dockerfile
+    restart: unless-stopped
+    network_mode: host
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    env_file: .env
+    environment:
+      HOSTNAME: ${FOXGUARD_TUNNEL_IP:-10.88.0.1}
+      PORT: ${FOXGUARD_DASHBOARD_PORT:-3000}
+      FOXGUARD_API_URL: http://${FOXGUARD_TUNNEL_IP:-10.88.0.1}:${FOXGUARD_PORTAL_PORT:-8080}
+    depends_on:
+      api:
+        condition: service_healthy
+
+  # ------------------------------------------------------------------------ #
+  # The dataplane: the agent, plus the dnsmasq and HAProxy it drives. This is
+  # the privileged half. Running it is equivalent to running the agent on the
+  # host, because with the host's network namespace and CAP_NET_ADMIN that is
+  # exactly what it is.
+  gateway:
+    image: ${FOXGUARD_REGISTRY:-ghcr.io/lucasbouet}/foxguard-gateway:${FOXGUARD_VERSION:-latest}
+    build:
+      context: .
+      dockerfile: docker/gateway.Dockerfile
+    restart: unless-stopped
+    network_mode: host
+    # NET_ADMIN programs nftables, WireGuard and routes; NET_RAW is what lets
+    # the ICMP paths work. Not `privileged: true` -- these two are the whole
+    # requirement, and the difference matters.
+    cap_add: ["NET_ADMIN", "NET_RAW"]
+    security_opt: ["no-new-privileges:true"]
+    # dnsmasq and HAProxy daemonize, so their children are reparented to pid 1.
+    # Without an init that reaps them the container accumulates zombies across
+    # every reload.
+    init: true
+    env_file: .env
+    environment:
+      FOXGUARD_AGENT_API_URL: http://${FOXGUARD_TUNNEL_IP:-10.88.0.1}:${FOXGUARD_PORTAL_PORT:-8080}
+    volumes:
+      # last-good.nft (what a failed ruleset rolls back to), routes.json (which
+      # routes this agent installed, so it can withdraw them), the geo dataset,
+      # and -- when this container creates the interface -- its private key.
+      # The policy lives in the database; this is the agent's ability to undo
+      # its own work, and this gateway's identity.
+      - foxguard-state:/var/lib/foxguard
+      - foxguard-dns:/etc/foxguard/dns
+      - foxguard-proxy:/etc/foxguard/proxy
+      # A bind mount rather than a volume, because certificates come from
+      # somewhere else -- certbot, your CA, a copy from another box -- and a
+      # named volume makes putting a file into it an archaeology exercise.
+      - ${FOXGUARD_CERTS_DIR:-./certs}:/etc/foxguard/proxy/certs
+
+volumes:
+  foxguard-pgdata:
+  foxguard-state:
+  foxguard-dns:
+  foxguard-proxy:

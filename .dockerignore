@@ -1,0 +1,27 @@
+# Build context hygiene. Everything here is either rebuilt inside the image,
+# irrelevant to it, or a credential that must never end up in a layer.
+
+.git
+.gitignore
+**/node_modules
+**/.next
+**/out
+**/__pycache__
+**/*.egg-info
+**/.pytest_cache
+**/.ruff_cache
+**/.venv
+.venv
+
+# Local secrets. `backend/.env` holds a real database URL and real tokens on a
+# developer's box, and a COPY of the source tree would bake it into the image.
+backend/.env
+.env
+docker/.env
+
+docs
+examples
+deploy/tests
+**/tests
+fix.sh
+INSTRUCTIONS.md
