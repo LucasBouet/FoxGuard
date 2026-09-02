@@ -8,6 +8,9 @@ dist/
 
 .env
 .env.local
+
+# Certificates bind-mounted into the proxy container (docker-compose.yml).
+/certs/
 *.nft.local
 
 .pytest_cache/

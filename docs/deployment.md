@@ -7,6 +7,13 @@ Foxguard.** A console session through Proxmox, or SSH from a LAN address that
 does not transit the tunnel. Every step below is designed so a mistake is
 recoverable, but only if you can still reach the box.
 
+> **Containers instead?** [docker.md](docker.md) deploys the same thing as three
+> images and one compose file. Same first rule, and the same host-level
+> prerequisites — `modprobe wireguard` and `net.ipv4.ip_forward=1` cannot be done
+> from inside a container. The hardening checklist at the end of this document
+> assumes the host install; most of it still applies, but the systemd sandboxing
+> directives have no container equivalent.
+
 ---
 
 ## 0. The scripted route
