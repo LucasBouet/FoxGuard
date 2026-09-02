@@ -13,8 +13,8 @@ No cloud dependency, no feature gating, no vendor control plane.
 > that never lets a private key reach the server, and a reverse proxy that
 > publishes services behind a peer with single sign-on, group authorization and
 > country filters. Deployable either with `deploy/foxguard-install.sh` on a
-> Linux box or as three container images. What is left is the CrowdSec bouncer
-> and its WAF, then mTLS (see [Roadmap](#roadmap)).
+> Linux box or as three container images published to GHCR. What is left is the
+> CrowdSec bouncer and its WAF, then mTLS (see [Roadmap](#roadmap)).
 
 ---
 
@@ -276,18 +276,43 @@ output is a reviewable diff. See `backend/tests/golden/README.md`.
 
 ## Deploying with Docker
 
-```sh
-git clone <your-repo> && cd Foxguard
-./docker/gen-env.sh          # secrets + the interface keypair
-docker compose up -d
+Three images, published to the GitHub Container Registry for `linux/amd64` and
+`linux/arm64`. Nothing to clone and nothing to build:
+
+```
+ghcr.io/lucasbouet/foxguard-api          control plane + the captive portal it serves
+ghcr.io/lucasbouet/foxguard-dashboard    the admin UI
+ghcr.io/lucasbouet/foxguard-gateway      the agent, dnsmasq and HAProxy
 ```
 
-Three images — `foxguard-api`, `foxguard-dashboard`, `foxguard-gateway` —
-published to the GitHub Container Registry, configured entirely by environment
-variable. The split follows the trust levels the project already had: the
-control plane holds no capability at all, the dashboard holds the admin
-credential in its own process, and only the gateway container gets
-`CAP_NET_ADMIN`.
+The fastest way in, on a fresh Linux box:
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/LucasBouet/FoxGuard/main/deploy/foxguard-quickstart.sh
+less foxguard-quickstart.sh        # it installs Docker and edits your firewall
+bash foxguard-quickstart.sh
+```
+
+It installs Docker, loads the wireguard module, turns on forwarding, fetches
+`docker-compose.yml`, generates your secrets and interface keypair, and starts
+the stack **with the agent in dry run** — it programs your firewall and you are
+almost certainly connected over SSH, so going live is the one step it leaves to
+you.
+
+From a clone, if you would rather read everything first or build your own
+images:
+
+```sh
+git clone https://github.com/LucasBouet/FoxGuard && cd FoxGuard
+./docker/gen-env.sh          # secrets + the interface keypair
+docker compose up -d         # pulls from GHCR; `--build` builds instead
+```
+
+Everything is configured by environment variable — one `.env`, which
+`gen-env.sh` fills in. The split into three images follows the trust levels the
+project already had: the control plane and the dashboard drop **every**
+capability, and only the gateway gets `NET_ADMIN` and `NET_RAW`. Never
+`privileged`; those two are the whole requirement.
 
 **The gateway container runs in the host's network namespace, and that is not an
 oversight.** The portal identifies a caller by the source address of its TCP
@@ -299,23 +324,12 @@ that container is equivalent to running the agent on the host. What you get from
 containerising is a pinned dependency tree and a one-command deployment, not a
 network-layer security boundary.
 
-**Giving it to somebody else**, once the images are published:
+There is no init system inside, so a shim reproduces what the systemd units did
+— `SIGUSR2` to the HAProxy master, which is what keeps a policy change from
+dropping every passthrough session, and `SIGHUP` to dnsmasq.
 
-```sh
-curl -fsSLO https://raw.githubusercontent.com/LucasBouet/FoxGuard/main/deploy/foxguard-quickstart.sh
-less foxguard-quickstart.sh        # it installs Docker and edits their firewall
-bash foxguard-quickstart.sh
-```
-
-No clone, no build. It installs Docker, loads the wireguard module, turns on
-forwarding, fetches the compose file and generates their own secrets and
-interface keypair, and starts the stack with the agent in **dry run** — the
-agent programs their firewall and they are almost certainly connected over SSH,
-so going live is the one step it leaves to them.
-
-Everything else — what replaces each systemd unit, how HAProxy still gets a
-seamless reload without one, the full environment reference, backups,
-certificates, and the failure modes worth recognising — is in
+Everything else — the full environment reference, what replaces each unit,
+backups, certificates, and the failure modes worth recognising — is in
 [docs/docker.md](docs/docker.md).
 
 ## Deploying on a real Linux gateway
@@ -679,5 +693,8 @@ These are enforced in code and covered by tests, not just documented:
 
 ## License
 
-Choose one before publishing. AGPL-3.0 is the usual pick for self-hosted
-infrastructure you do not want re-hosted as a closed SaaS.
+[MIT](LICENSE) — © 2026 Lucas Bouet.
+
+Do what you like with it, including commercially: the one condition is that the
+copyright notice travels with the code. If you run a modified Foxguard, saying
+where it came from costs you nothing and is the whole deal.
