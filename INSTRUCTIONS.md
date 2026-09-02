@@ -5,7 +5,7 @@
 > proxy, CrowdSec) est en partie livrée depuis. Pour l'état réel du projet, voir
 > le [README](README.md) et [`docs/architecture.md`](docs/architecture.md).
 
-Copie-colle ce prompt dans Claude Code (ou un autre outil agentique) pour démarrer le projet. Adapte la stack si besoin, tout est modifiable.
+Le prompt qui a servi à démarrer le projet. Adapte la stack si besoin, tout est modifiable.
 
 ---
 
