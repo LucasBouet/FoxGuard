@@ -199,6 +199,57 @@ no WireGuard peers, no DNS zone. A device registered in the dashboard appears in
 the database and never on the interface, which looks like the control plane
 losing it.
 
+### The agent will not start: `226/NAMESPACE`
+
+```
+(rd-agent)[2032724]: foxguard-agent.service: Failed to set up mount namespacing:
+  /run/foxguard: No such file or directory
+(rd-agent)[2032724]: Failed at step NAMESPACE spawning
+  /opt/foxguard/venv/bin/foxguard-agent: No such file or directory
+```
+
+Nothing to do with the executable, despite what the second line says. The unit
+runs under `ProtectSystem=strict`, so every writable path is named in
+`ReadWritePaths=` — and a path listed there that does not exist is fatal.
+systemd fails while building the mount namespace, before the agent runs a line
+of Python.
+
+Three directories were affected, and which one bites depends on what you
+enabled:
+
+| Path | Created by |
+| --- | --- |
+| `/run/foxguard` | `foxguard-proxy.service`, via `RuntimeDirectory=` |
+| `/etc/foxguard/dns` | the installer, only with DNS enabled |
+| `/etc/foxguard/proxy` | the installer, only with the proxy enabled |
+
+So a bare install — no DNS, no proxy — produced an agent that could not start
+at all, and on a full one the agent could not start until the proxy had, while
+stopping the proxy deleted `/run/foxguard` out from under it.
+
+Fixed in the units: the agent declares `RuntimeDirectory=foxguard` itself, with
+`RuntimeDirectoryPreserve=yes` so the proxy's shutdown no longer takes the
+directory away, and the two optional directories are `-` prefixed, which means
+"ignore if absent". Copy the current unit and reload, or drop the same settings
+in as an override:
+
+```sh
+mkdir -p /etc/systemd/system/foxguard-agent.service.d
+cat > /etc/systemd/system/foxguard-agent.service.d/runtime-dir.conf <<'EOF'
+[Service]
+# The empty assignment resets the list -- drop-ins append otherwise.
+ReadWritePaths=
+ReadWritePaths=/var/lib/foxguard -/etc/foxguard/dns -/etc/foxguard/proxy
+RuntimeDirectory=foxguard
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+EOF
+systemctl daemon-reload && systemctl restart foxguard-agent
+```
+
+Enable DNS or the proxy later and the directory appears, but the agent has to
+be restarted to pick it up — a `-` prefixed path is resolved once, at start.
+
 ### If you lost the "shown once" output
 
 The installer prints the administrator's password and the bootstrap device's
@@ -283,7 +334,16 @@ wg show wg0
 ## 2. Install
 
 ```sh
-install -d -m 0750 /opt/foxguard /etc/foxguard /var/lib/foxguard
+# The prefix is world-readable on purpose. The agent's unit hardens root down
+# to CAP_NET_ADMIN/CAP_NET_RAW, which drops CAP_DAC_OVERRIDE with everything
+# else -- root there obeys the "other" bits like anyone else. Nothing secret
+# lives here; the credentials go in /etc/foxguard at 0600.
+install -d -m 0755 /opt/foxguard
+# 0751, not 0750: dnsmasq drops privileges and re-reads its hosts file as the
+# unprivileged user, so this has to stay traversable by "other". Traversable
+# is not readable -- there is no o+r here.
+install -d -m 0751 /etc/foxguard
+install -d -m 0750 /var/lib/foxguard
 git clone <your-repo> /opt/foxguard/src
 
 python3 -m venv /opt/foxguard/venv
@@ -380,7 +440,11 @@ already written down:
 
 ```sh
 useradd --system --home /opt/foxguard --shell /usr/sbin/nologin foxguard
-chown -R foxguard:foxguard /opt/foxguard
+# Do NOT chown the prefix to foxguard, however tempting. The API and the
+# dashboard only ever read what is here, and the agent -- running as root
+# without CAP_DAC_OVERRIDE -- would stop being able to open its own
+# executable. That failure is section 0 above.
+chmod -R a+rX /opt/foxguard
 cp /opt/foxguard/src/backend/systemd/foxguard-api.service /etc/systemd/system/
 # Edit --host in the unit to your tunnel address before enabling it.
 systemctl daemon-reload && systemctl enable --now foxguard-api
@@ -686,6 +750,10 @@ bound to localhost or the tunnel address, never to the WAN.
 Then install its unit:
 
 ```sh
+# The unit runs as foxguard and Next writes into .next/cache at runtime, so
+# this one directory is chowned -- and only this one. The rest of the prefix
+# stays root-owned and world-readable so the agent can reach its executable.
+chown -R foxguard:foxguard /opt/foxguard/src/frontend/admin/.next
 cp /opt/foxguard/src/frontend/admin/systemd/foxguard-dashboard.service \
    /etc/systemd/system/
 # /etc/foxguard/dashboard.env, mode 0600:

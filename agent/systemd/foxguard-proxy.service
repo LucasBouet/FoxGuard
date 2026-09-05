@@ -41,6 +41,10 @@ PrivateTmp=yes
 # ProtectSystem=strict makes /run read-only and the master cannot start.
 RuntimeDirectory=foxguard
 RuntimeDirectoryMode=0750
+# foxguard-agent.service declares the same directory and connects to the socket
+# in it. Without this, stopping the proxy would remove /run/foxguard and leave
+# the agent unable to restart.
+RuntimeDirectoryPreserve=yes
 # Read-only: the configuration is written by foxguard-agent, never by HAProxy.
 # The certificate directory is separate because certbot's deploy hook writes
 # there, and it must not be writable by this unit either.

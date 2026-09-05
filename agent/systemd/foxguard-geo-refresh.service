@@ -29,8 +29,11 @@ RestrictAddressFamilies=AF_INET AF_INET6
 RestrictNamespaces=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
-# The dataset itself, and the map the agent rebuilds from it.
-ReadWritePaths=/var/lib/foxguard /etc/foxguard/proxy/maps
+# The dataset itself, and the map the agent rebuilds from it. The map directory
+# is `-` prefixed: it only exists when the proxy is enabled, and a missing path
+# here is fatal at 226/NAMESPACE. Geo filtering still works without it -- the
+# nftables sets are built from the dataset under /var/lib/foxguard.
+ReadWritePaths=/var/lib/foxguard -/etc/foxguard/proxy/maps
 
 [Install]
 WantedBy=multi-user.target

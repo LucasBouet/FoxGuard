@@ -25,7 +25,24 @@ PrivateTmp=yes
 # agent writes has to be named here. /etc/foxguard/dns is where it renders the
 # resolver's zone; without it DNS reconciliation fails with EROFS on a box where
 # everything else works.
-ReadWritePaths=/var/lib/foxguard /etc/foxguard/dns /etc/foxguard/proxy /run/foxguard
+#
+# The dns and proxy directories are prefixed with `-` because the installer only
+# creates them for the features you enabled. Without the prefix a path that does
+# not exist is fatal: the agent dies at 226/NAMESPACE before it runs a line of
+# Python, so a --no-dns --no-proxy install produces an agent that cannot start
+# at all. The prefix means "skip it if it is absent" -- enable a feature later
+# and the directory appears, but this unit has to be restarted to see it.
+ReadWritePaths=/var/lib/foxguard -/etc/foxguard/dns -/etc/foxguard/proxy
+# /run/foxguard holds HAProxy's runtime socket, which the agent connects to for
+# seamless reloads. Declared here and not only in foxguard-proxy.service: the
+# directory used to exist solely because that unit created it, so the agent
+# could not start unless the proxy had started first, and stopping the proxy
+# deleted the directory out from under a running agent. Preserve=yes stops the
+# other unit's shutdown from taking it away; /run is tmpfs, so a reboot still
+# clears it.
+RuntimeDirectory=foxguard
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
