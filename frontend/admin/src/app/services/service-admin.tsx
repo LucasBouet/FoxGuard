@@ -59,9 +59,11 @@ const SLUG_PATTERN = "^[a-z0-9][a-z0-9_-]{0,23}$";
  * means nobody ticks a box believing the service is protected when it is not.
  */
 function availableAuth(kind: ServiceKind): ServiceAuthKind[] {
+  // "public" is offered for both: it reads nothing, so a TCP passthrough can
+  // carry it as honestly as an HTTP vhost.
   return kind === "tcp"
-    ? ["peer_identity"]
-    : ["peer_identity", "bearer", "basic", "foxguard_sso"];
+    ? ["peer_identity", "public"]
+    : ["peer_identity", "bearer", "basic", "foxguard_sso", "public"];
 }
 
 /** How each way in reads in a form, rather than as an enum value. */
@@ -70,6 +72,7 @@ const AUTH_LABEL: Record<string, string> = {
   bearer: "API token",
   basic: "service account (basic auth)",
   foxguard_sso: "Foxguard sign-in",
+  public: "public — no authentication at all",
 };
 
 /**
@@ -80,6 +83,9 @@ const AUTH_LABEL: Record<string, string> = {
  * the fact an operator most needs to see without opening anything.
  */
 function describeAudience(auth: ServiceAuth): string {
+  // Spelled out rather than left to "anyone holding the credential", which
+  // would be true and completely misleading: there is no credential.
+  if (auth.kind === "public") return "anyone at all — no credential";
   if (auth.kind !== "foxguard_sso") {
     return auth.realm ? `realm ${auth.realm}` : "anyone holding the credential";
   }
@@ -124,6 +130,17 @@ function availableScopes(kind: ServiceAuthKind): ServiceScope[] {
   // to no key, so peer identity is internal-only and the API refuses anything
   // else. Offering the choice would just produce a 422.
   return kind === "peer_identity" ? ["internal"] : ["internal", "external", "both"];
+}
+
+/**
+ * Whether adding this way in would leave the door unguarded.
+ *
+ * The control plane refuses "public" next to anything else on the same
+ * listener, because an OR with public is just public. Saying so here turns a
+ * 422 into a sentence read before the click.
+ */
+function isPublic(kind: ServiceAuthKind): boolean {
+  return kind === "public";
 }
 
 export function CreateService({
@@ -396,6 +413,20 @@ export function CreateService({
               authenticate from outside.
             </Notice>
           )}
+          {wantsExternal && isPublic(externalAuth) && (
+            <Notice kind="warning">
+              Anyone on the internet will reach this backend, with no
+              authentication of any kind. That is the right answer for a public
+              web site and the wrong one for everything else. Filters still
+              apply — add a rate limit or a geo rule if you want one.
+            </Notice>
+          )}
+          {wantsInternal && isPublic(internalAuth) && (
+            <Notice kind="warning">
+              Every peer on the tunnel reaches this backend, with no check on
+              which one. Peer identity costs nothing and names the caller.
+            </Notice>
+          )}
           <ResultNotice result={result} />
           <Button type="submit" disabled={pending} className="mt-3">
             {pending ? "Publishing…" : "Publish"}
@@ -519,6 +550,16 @@ export function ServiceDetail({
                 Add
               </Button>
             </div>
+            {isPublic(authKind) && (
+              <div className="mt-3">
+                <Notice kind="warning">
+                  A public way in cannot sit next to another one on the same
+                  door: ways in are ORed, so public would admit everyone the
+                  other turned away. Remove the existing one first, or the
+                  change will be refused.
+                </Notice>
+              </div>
+            )}
             {authKind === "foxguard_sso" && (
               <div className="mt-3 space-y-2 rounded-md border border-hairline bg-page p-3">
                 <p className="text-xs text-ink-secondary">

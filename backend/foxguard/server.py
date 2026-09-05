@@ -57,7 +57,20 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument("--reload", action="store_true", help="Development only.")
+    parser.add_argument(
+        "--ssl-certfile",
+        help=(
+            "Serve HTTPS. Needed when the portal has an address of its own and "
+            "answers on :443 -- a browser asked for a password over http:// says "
+            "so in the address bar, however encrypted the tunnel underneath is."
+        ),
+    )
+    parser.add_argument("--ssl-keyfile", help="Private key for --ssl-certfile.")
     args = parser.parse_args(argv)
+
+    # Refused here rather than by uvicorn, which fails later and less clearly.
+    if bool(args.ssl_certfile) != bool(args.ssl_keyfile):
+        parser.error("--ssl-certfile and --ssl-keyfile go together, or neither")
 
     settings = get_settings()
     if args.workers > 1:
@@ -78,6 +91,8 @@ def main(argv: list[str] | None = None) -> int:
         # The reason this module exists. Do not "helpfully" turn it back on.
         proxy_headers=False,
         forwarded_allow_ips=[],
+        ssl_certfile=args.ssl_certfile,
+        ssl_keyfile=args.ssl_keyfile,
     )
     return 0
 

@@ -1167,6 +1167,16 @@ its policy are created in one request**. `ServiceCreate` carries
 `authenticators`, `filters` and `access`, because a two-step creation could
 never succeed — the first step would always be refused.
 
+`AuthKind.PUBLIC` is what keeps that rule affordable. A reverse proxy in front
+of a public web site is a legitimate thing to want, and the coverage rule made
+it inexpressible; the tempting fix — treat an empty list as "open" — would have
+traded the guarantee for the feature. Instead "open" is a row: it admits
+everyone, it is something an operator created rather than something they forgot,
+and it is refused next to any other authenticator on the same door, because an
+OR with `public` is just `public` wearing a disguise. Filters and access rules
+are untouched by it, so a public listener still carries its rate limit and its
+geo rules.
+
 ### Passthrough is not HTTP
 
 A TCP service never sees the plaintext, so bearer, basic, SSO and the WAF cannot

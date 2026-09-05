@@ -135,6 +135,14 @@ class AuthKind(str, Enum):
     lookup, no secret and no round trip to the control plane. It is also
     meaningless outside the tunnel, where a source address belongs to an ISP or
     a NAT and is bound to nothing.
+
+    ``PUBLIC`` is the odd one: it proves nothing, because it demands nothing.
+    It exists so that "anyone may use this" is something an operator *states*
+    rather than something that happens when the authenticator list is empty --
+    a reverse proxy in front of a public web site is a legitimate thing to
+    want, and it should not be indistinguishable from a service somebody forgot
+    to guard. Filters and access rules still apply to a public listener: it
+    removes the identity requirement, not the rate limit or the geo block.
     """
 
     PEER_IDENTITY = "peer_identity"
@@ -142,6 +150,7 @@ class AuthKind(str, Enum):
     BASIC = "basic"
     FOXGUARD_SSO = "foxguard_sso"
     MTLS = "mtls"
+    PUBLIC = "public"
 
 
 class FilterKind(str, Enum):
@@ -168,7 +177,9 @@ class AccessAction(str, Enum):
 
 #: Authenticators that need to read an HTTP request. A TCP passthrough service
 #: carrying one of these is a configuration error, not a no-op: the operator
-#: believes the service is protected and it is not.
+#: believes the service is protected and it is not. ``PEER_IDENTITY`` and
+#: ``PUBLIC`` are absent because neither reads the request: one looks at the
+#: source address, the other looks at nothing.
 HTTP_ONLY_AUTH = frozenset({AuthKind.BEARER, AuthKind.BASIC, AuthKind.FOXGUARD_SSO})
 
 #: Filters that need the plaintext. ``CROWDSEC`` is absent on purpose: its IP
@@ -408,9 +419,34 @@ class ProxySpec:
     #: published service.
     sso_cookie_domain: str = ""
     sso_api_port: int = 8080
+    #: Address the control plane listens on. Empty means "the first internal
+    #: bind", which was the only possibility until the portal could be given an
+    #: address of its own -- and the API travels with it, because the portal and
+    #: the admin API are one listener.
+    sso_api_address: str = ""
+    #: Whether that listener speaks TLS. It does once the portal is on :443,
+    #: and a plaintext backend connection to it would simply fail.
+    sso_api_tls: bool = False
     #: Session ids the proxy must refuse despite a good signature. This is what
     #: makes revocation immediate rather than "whenever the token expires".
     sso_revoked: tuple[str, ...] = ()
+
+    # --- the admin dashboard ------------------------------------------------
+    #: Host name the dashboard answers on. ``None`` publishes nothing, which is
+    #: the default: the dashboard is reachable on its own port either way, and
+    #: giving it a name is a decision, not a side effect of installing.
+    #:
+    #: Deliberately internal-only, with no way to say otherwise. The dashboard
+    #: holds an administrator's session for the whole control plane, and the
+    #: tunnel is already the thing that decides who may talk to it. An operator
+    #: who genuinely wants it on the WAN can publish it as an ordinary service
+    #: and choose the authenticator themselves -- which makes that an explicit
+    #: act rather than a flag nobody read the consequences of.
+    dashboard_hostname: str | None = None
+    #: Where the dashboard process itself listens. It is a plain HTTP upstream
+    #: on the gateway, exactly like any other backend.
+    dashboard_address: str = ""
+    dashboard_port: int = 3000
 
     # --- geography ----------------------------------------------------------
     #: File the gateway builds, mapping prefixes to ISO country codes. Named
@@ -439,8 +475,15 @@ class ProxySpec:
         )
 
     @property
+    def publishes_dashboard(self) -> bool:
+        return bool(self.dashboard_hostname)
+
+    @property
     def has_internal(self) -> bool:
-        return any(s.exposure.has_internal for s in self.services)
+        # The dashboard counts. Without it a deployment whose only published
+        # thing *is* the dashboard would render no internal frontend at all, and
+        # the name would resolve to a port nothing listens on.
+        return self.publishes_dashboard or any(s.exposure.has_internal for s in self.services)
 
     @property
     def has_external(self) -> bool:

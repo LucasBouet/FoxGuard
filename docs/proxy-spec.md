@@ -228,9 +228,9 @@ Constraints worth writing explicitly:
 ### 5.2 `service_auth` — the OR list
 
 `id`, `service_id` (CASCADE), `kind` enum `service_auth_kind`
-(`peer_identity` | `bearer` | `basic` | `foxguard_sso` | `mtls`), `scope` enum
-`service_scope` (`internal` | `external` | `both`), `config` JSONB, `enabled`,
-`priority`.
+(`peer_identity` | `bearer` | `basic` | `foxguard_sso` | `mtls` | `public`),
+`scope` enum `service_scope` (`internal` | `external` | `both`), `config` JSONB,
+`enabled`, `priority`.
 
 Validation, and it has teeth:
 
@@ -240,6 +240,26 @@ Validation, and it has teeth:
   apply. Otherwise the service is either wide open or wholly unreachable
   depending on how the fallback is written — refuse at creation, and deny at
   runtime.
+* `public` may not share a door with another row. Rows are ORed, so a door
+  carrying `public` **and** `bearer` is open, while the configuration reads as
+  though a token were required — refuse at creation.
+
+#### `public`, and why it is a row rather than an empty list
+
+A reverse proxy in front of a public web site is a legitimate thing to want, and
+before this the model could not express it: the coverage rule above refuses an
+empty list precisely so that a service nobody guarded cannot be mistaken for a
+service somebody opened deliberately. Deleting that rule would have bought the
+feature by giving up the guarantee.
+
+`public` keeps both. It admits everyone, and it does so as a row an operator
+created, which an audit log records and the services table displays.
+
+It is not "no policy": filters and access rules are evaluated exactly as they
+are for any other service, so a public listener still gets its rate limit, its
+geo rules and its CIDR denies. Only the identity question is dropped. It is also
+the one authenticator that applies to a TCP passthrough service as honestly as
+to an HTTP one, because it reads nothing.
 
 ### 5.3 `service_filters` — the AND list
 
@@ -609,6 +629,7 @@ Validators to write, each of which corresponds to a real failure mode:
 3. Slug must be free across peers, groups, zones and services (§3.3).
 4. Per-exposure authenticator coverage (§5.2).
 5. `peer_identity` never scoped to `external`.
+5b. `public` never sharing a door with another authenticator (§5.2).
 6. Capability matrix respected (§9).
 7. `listen_port` inside `proxy_tcp_port_range` and unused.
 

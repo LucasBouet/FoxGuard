@@ -1058,8 +1058,13 @@ class ServiceAuthBase(ApiModel):
         ):
             raise ValueError(
                 f"{self.kind.value} cannot carry a group or admin requirement: "
-                "it proves the caller holds a credential, not which person they "
-                "are. Only foxguard_sso names an account"
+                + (
+                    "it asks the caller for nothing at all"
+                    if self.kind is ServiceAuthKind.PUBLIC
+                    else "it proves the caller holds a credential, not which "
+                    "person they are"
+                )
+                + ". Only foxguard_sso names an account"
             )
         return self
 

@@ -833,6 +833,16 @@ FOXGUARD_PROXY_CONF_PATH=$CONFDIR/proxy/haproxy.cfg
 FOXGUARD_PROXY_MAPS_DIR=$CONFDIR/proxy/maps
 FOXGUARD_PROXY_CERTS_DIR=$CONFDIR/proxy/certs
 $( [[ $SSO_ENABLED -eq 1 ]] && printf 'FOXGUARD_PROXY_SSO_SECRET=%s\n' "$SSO_SECRET" )
+# Publish the admin dashboard as admin.$PROXY_DOMAIN instead of an address and a
+# port. Tunnel-facing door only, and nothing is put in front of it: the
+# dashboard authenticates its own callers. See docs/usage.md.
+# FOXGUARD_PROXY_DASHBOARD_ENABLED=true
+#
+# Giving the captive portal a URL with no port in it needs three things this
+# installer does not do for you -- a second Address= on the interface, the
+# control plane moved onto it, and a certificate. docs/deployment.md walks
+# through it.
+# FOXGUARD_PORTAL_BIND_IP=
 PROXYEOF
 )
 

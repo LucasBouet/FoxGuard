@@ -199,6 +199,14 @@ def validate_spec(spec: ProxySpec) -> None:
     seen_slugs: set[str] = set()
     seen_hostnames: dict[str, str] = {}
     seen_ports: dict[int, str] = {}
+
+    if spec.publishes_dashboard:
+        _validate_dashboard(spec)
+        # Seeded before the services so that a service claiming the same name is
+        # refused, rather than quietly losing to the dashboard's use_backend --
+        # which is emitted first and would win every request.
+        seen_hostnames[f"internal:{spec.dashboard_hostname}"] = "the admin dashboard"
+
     for service in spec.services:
         _validate_service(spec, service, seen_slugs, seen_hostnames, seen_ports)
 
@@ -214,6 +222,46 @@ def validate_spec(spec: ProxySpec) -> None:
     for option in spec.extra_options:
         if "\n" in option or "\r" in option or not _OPTION_RE.match(option):
             raise ProxyValidationError(f"extra option {option!r} is not a single line")
+
+
+def _validate_dashboard(spec: ProxySpec) -> None:
+    if not is_hostname(spec.dashboard_hostname or ""):
+        raise ProxyValidationError(
+            f"dashboard host name {spec.dashboard_hostname!r} is not valid"
+        )
+    if spec.sso_hostname and spec.dashboard_hostname == spec.sso_hostname:
+        raise ProxyValidationError(
+            f"{spec.dashboard_hostname!r} is both the dashboard and the sign-in "
+            "page. The sign-in vhost answers on every listener and is matched "
+            "first, so the dashboard would never be reached"
+        )
+    if not spec.dashboard_address:
+        raise ProxyValidationError(
+            "the dashboard is published but no address was given for the "
+            "dashboard process itself"
+        )
+    try:
+        ipaddress.ip_address(spec.dashboard_address)
+    except ValueError as exc:
+        raise ProxyValidationError(
+            f"dashboard address {spec.dashboard_address!r} is not valid"
+        ) from exc
+    if not (1 <= spec.dashboard_port <= 65535):
+        raise ProxyValidationError(
+            f"dashboard port {spec.dashboard_port} is out of range 1-65535"
+        )
+    # Pointing the vhost at a proxy listener would make it forward to itself,
+    # the same trap `services.proxy.forbidden_upstream` catches for services.
+    if spec.dashboard_address in spec.internal_binds and spec.dashboard_port in (
+        spec.internal_https_port,
+        spec.external_https_port,
+        spec.external_http_port,
+    ):
+        raise ProxyValidationError(
+            f"the dashboard is published at {spec.dashboard_address}:"
+            f"{spec.dashboard_port}, which is the proxy's own listener: it would "
+            "forward to itself"
+        )
 
 
 def _validate_source_sets(spec: ProxySpec) -> None:
@@ -359,7 +407,12 @@ def _validate_policy(spec: ProxySpec, service: Service) -> None:
             raise ProxyValidationError(
                 f"service {service.slug!r}: {auth.kind.value} carries a group or "
                 "admin requirement, and only single sign-on knows who the caller "
-                "is. A bearer token names no person"
+                "is. "
+                + (
+                    "A public listener asks for nothing at all"
+                    if auth.kind is AuthKind.PUBLIC
+                    else "A bearer token names no person"
+                )
             )
         for slug in auth.groups:
             if not GROUP_SLUG.fullmatch(slug):
@@ -456,6 +509,9 @@ def _validate_policy(spec: ProxySpec, service: Service) -> None:
 
     # The rule with teeth: a door with no way in is either wide open or wholly
     # shut depending on how the fallback is written, and both are surprises.
+    # AuthKind.PUBLIC is how "wide open" gets said out loud, which is why an
+    # empty list is still refused: forgetting to guard a service and deciding
+    # not to must not produce the same configuration.
     for exposure in (Exposure.INTERNAL, Exposure.EXTERNAL):
         covered = (
             service.exposure.has_internal
@@ -464,12 +520,24 @@ def _validate_policy(spec: ProxySpec, service: Service) -> None:
         )
         if not covered:
             continue
-        if not service.auth_for(exposure):
+        auths = service.auth_for(exposure)
+        if not auths:
             raise ProxyValidationError(
                 f"service {service.slug!r} is exposed on the {exposure.value} "
-                "listener with no authenticator that applies there. Add one, or "
-                "narrow the exposure -- Foxguard will not publish a door it "
-                "cannot describe"
+                "listener with no authenticator that applies there. Add one, "
+                "narrow the exposure, or say 'public' if it is meant to be open "
+                "-- Foxguard will not publish a door it cannot describe"
+            )
+        if any(auth.kind is AuthKind.PUBLIC for auth in auths) and len(auths) > 1:
+            others = ", ".join(
+                sorted({a.kind.value for a in auths if a.kind is not AuthKind.PUBLIC})
+            )
+            raise ProxyValidationError(
+                f"service {service.slug!r}: the {exposure.value} listener is "
+                f"public and also carries {others}. Authenticators are ORed, so "
+                "public admits everyone the others would have turned away: the "
+                "service is open and the configuration claims it is guarded. "
+                "Keep one of the two"
             )
 
 
@@ -637,7 +705,22 @@ def _conf_lines(spec: ProxySpec) -> Iterator[str]:
         yield "# The login page, and nothing else on the API. See _sso_vhost."
         yield "backend be_fg_sso"
         yield f"{INDENT}mode http"
-        yield f"{INDENT}server s1 {_bind(spec.internal_binds[0] if spec.internal_binds else '127.0.0.1')}:{spec.sso_api_port}"
+        address = spec.sso_api_address or (
+            spec.internal_binds[0] if spec.internal_binds else "127.0.0.1"
+        )
+        # verify none: the certificate on that listener is the wildcard for the
+        # proxy domain, and this hop dials an address rather than a name, so
+        # verification could never match. The hop is gateway-local either way.
+        tls = " ssl verify none" if spec.sso_api_tls else ""
+        yield f"{INDENT}server s1 {_bind(address)}:{spec.sso_api_port}{tls}"
+
+    if spec.publishes_dashboard:
+        yield ""
+        yield "# The admin dashboard. A plain HTTP upstream on the gateway; it"
+        yield "# authenticates its own callers and this vhost adds nothing to that."
+        yield "backend be_fg_dashboard"
+        yield f"{INDENT}mode http"
+        yield f"{INDENT}server s1 {_bind(spec.dashboard_address)}:{spec.dashboard_port}"
 
     if spec.has_external or spec.has_internal:
         yield ""
@@ -724,6 +807,10 @@ def _https_frontend(spec: ProxySpec, exposure: Exposure) -> Iterator[str]:
         yield ""
         yield from _sso_vhost(spec)
 
+    if internal and spec.publishes_dashboard:
+        yield ""
+        yield from _dashboard_vhost(spec)
+
     services = [
         service
         for service in _ordered(spec)
@@ -741,9 +828,32 @@ def _https_frontend(spec: ProxySpec, exposure: Exposure) -> Iterator[str]:
     yield ""
     if spec.uses_sso and spec.sso_hostname:
         yield f"{INDENT}use_backend be_fg_sso if h_fg_sso"
+    if internal and spec.publishes_dashboard:
+        yield f"{INDENT}use_backend be_fg_dashboard if h_fg_dashboard"
     for service in services:
         yield f"{INDENT}use_backend {backend_name(service.slug)} if h_{service.slug}"
     yield f"{INDENT}default_backend be_fg_no_service"
+
+
+def _dashboard_vhost(spec: ProxySpec) -> Iterator[str]:
+    """Give the admin dashboard a name on the tunnel-facing door.
+
+    No authentication is added here, and that is not an oversight. The dashboard
+    already authenticates every caller itself -- an administrator account, a
+    session cookie, TOTP if the account carries it -- and this vhost exists to
+    remove a port number from a URL, not to become a second opinion on who may
+    sign in. Putting an authenticator in front would mean signing in twice to
+    reach the same page.
+
+    What *does* guard it is which listener it answers on. This is emitted for
+    the internal frontend only, so reaching the name at all means holding a key
+    the gateway accepted. ``ProxySpec`` offers no way to say otherwise: see
+    ``dashboard_hostname``.
+    """
+    yield f"{INDENT}# --- {spec.dashboard_hostname}: the admin dashboard ---"
+    yield (
+        f"{INDENT}acl h_fg_dashboard req.hdr(host),host_only -i {spec.dashboard_hostname}"
+    )
 
 
 def _sso_vhost(spec: ProxySpec) -> Iterator[str]:
@@ -844,7 +954,17 @@ def _service_rules(
         yield f"{prefix}{deny}{cond(*negated)}"
 
     auths = service.auth_for(exposure)
-    if not auths:
+    # Nothing to emit for a public listener -- and nothing *missing* either:
+    # the filters and access rules above have already been written, so a public
+    # service still gets its rate limit, its geo block and its CIDR rules. Only
+    # the identity question is dropped.
+    #
+    # Stated rather than left to the `if not conditions` guard further down,
+    # which happens to produce the same output today only because PUBLIC matches
+    # none of the branches that build `conditions`. Adding an `else` there would
+    # silently turn every public service into a closed one, and the failure
+    # would be a 403 on a web site that is supposed to be open.
+    if not auths or any(auth.kind is AuthKind.PUBLIC for auth in auths):
         return
 
     sso = next((a for a in auths if a.kind is AuthKind.FOXGUARD_SSO), None)

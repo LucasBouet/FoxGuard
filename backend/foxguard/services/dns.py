@@ -139,11 +139,38 @@ def build_spec(session: Session, settings: Settings) -> DnsSpec:
     # are added fully qualified rather than through ``qualify``. Measured
     # against dnsmasq 2.91: a hosts-file entry outside ``local=/zone/`` is
     # still answered, in both resolver modes, so the two namespaces coexist.
-    service_names: list[str] = []
+    # Names answered despite living outside ``zone``. Accumulated separately
+    # from the "resolves to the gateway" list below, because the portal is the
+    # one of these that does *not* resolve to the gateway -- it has an address
+    # of its own, and pointing its name at the gateway would send every
+    # quarantined peer at a port the firewall does not open for them.
+    external_names: list[str] = []
+
+    def declare_external(name: str) -> None:
+        if not name.endswith(f".{zone}"):
+            external_names.append(name)
+
+    # The captive portal, when it has been given addresses of its own. Its name
+    # usually lives under the proxy domain rather than the DNS zone -- that is
+    # what makes the wildcard certificate cover it.
+    portal_name = (settings.portal_host or "").lower()
+    if portal_name and settings.portal_addresses:
+        for address in settings.portal_addresses:
+            add(address, portal_name, "captive portal")
+        declare_external(portal_name)
+
     if settings.proxy_enabled:
         service_names = _service_names(session, settings)
+        # The dashboard's vhost is the same kind of name as a service's, and
+        # needs the same record: without it the name resolves publicly or not at
+        # all, and publishing it would have bought nothing. It is added here
+        # rather than in _service_names because it is not a Service row -- it is
+        # synthesised into the proxy spec from settings.
+        if settings.proxy_dashboard_host:
+            service_names.append(settings.proxy_dashboard_host.lower())
         for hostname in service_names:
             add(settings.gateway_ip, hostname, "published service")
+            declare_external(hostname)
 
     records = (
         session.execute(
@@ -190,7 +217,7 @@ def build_spec(session: Session, settings: Settings) -> DnsSpec:
         cnames=tuple(cnames),
         # Declared, so the zone guard lets exactly these through and keeps
         # refusing everything else outside the zone.
-        external_names=frozenset(service_names),
+        external_names=frozenset(external_names),
         mode=spec.mode,
         upstreams=spec.upstreams,
         cache_size=spec.cache_size,

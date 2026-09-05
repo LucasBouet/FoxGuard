@@ -673,3 +673,58 @@ def test_deleting_a_group_withdraws_the_requirement(db_session):
     db_session.flush()
     db_session.expire_all()
     assert ",infra," not in proxy_service.render_or_none(db_session, settings)[0]
+
+
+# --------------------------------------------------------------------------- #
+# public services, through the database
+# --------------------------------------------------------------------------- #
+
+
+def test_a_public_service_survives_the_database_round_trip(db_session):
+    """A public authenticator, stored and read back rather than constructed.
+
+    ``service_auth.kind`` is a native PostgreSQL enum, so the value has to exist
+    in the type or the INSERT fails outright -- this exercises that, and the
+    spec builder that turns the row back into an :class:`Authenticator`.
+
+    It does not exercise migration 0009: this harness builds the schema with
+    ``Base.metadata.create_all``, which derives the type from the Python enum
+    and would happily pass on a database that never ran it. The migration was
+    verified separately against PostgreSQL 17 -- upgrade, downgrade, re-upgrade.
+    """
+    peer = _peer(db_session, "web", "10.88.0.6")
+    service = _http_service(
+        db_session,
+        peer,
+        slug="site",
+        exposure=ServiceExposure.EXTERNAL,
+        internal_hostname=None,
+        external_hostname="site.example.com",
+    )
+    service.authenticators.clear()
+    service.authenticators.append(
+        ServiceAuth(kind=ServiceAuthKind.PUBLIC, scope=ServiceScope.EXTERNAL)
+    )
+    db_session.flush()
+
+    conf, _ = proxy_service.render(db_session, _settings())
+    assert "site.example.com" in conf
+
+
+def test_a_public_listener_beside_another_way_in_is_refused(db_session):
+    """The guard, reached through the same path a mutation endpoint takes.
+
+    Peer identity is the second way in because it is the one with no
+    prerequisite: bearer wants a token row and basic wants an account, and both
+    are refused earlier by a different rule, which would make this test pass for
+    the wrong reason.
+    """
+    peer = _peer(db_session, "web", "10.88.0.6")
+    service = _http_service(db_session, peer, slug="site", internal_hostname="site.example.com")
+    service.authenticators.append(
+        ServiceAuth(kind=ServiceAuthKind.PUBLIC, scope=ServiceScope.INTERNAL)
+    )
+    db_session.flush()
+
+    with pytest.raises(ProxyValidationError, match="public and also carries peer_identity"):
+        proxy_service.render(db_session, _settings())

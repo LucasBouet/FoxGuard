@@ -395,6 +395,86 @@ gateway, which no zone or group rule constrains. The service page lists that
 path, and so does the healthcheck. It is scoped to exactly the address and port
 you declared, but it is worth seeing.
 
+### Giving Foxguard's own pages a name
+
+Two of the things you reach most often are the two that answered on an address
+and a port. They are not the same problem, and only one of them is the proxy's
+to solve.
+
+**The admin dashboard.** Set `FOXGUARD_PROXY_DASHBOARD_ENABLED=true` and it
+answers on `admin.<your domain>`, on the tunnel-facing door. The wildcard
+certificate already covers that name, the internal resolver already points it at
+the gateway, and nothing else changes.
+
+No authenticator is put in front of it, on purpose. The dashboard already
+authenticates every caller — an account, a session cookie, TOTP if the account
+has one — and a second prompt would mean signing in twice to reach the same
+page. What guards it is *which listener it answers on*: the tunnel-facing one,
+and there is no setting to change that. If you want the dashboard on the WAN,
+publish it as an ordinary service pointing at the dashboard's port and pick the
+authenticator yourself. That way it is a decision rather than a flag.
+
+**The captive portal cannot go behind the proxy at all.** It identifies its
+caller by the tunnel source address — that is what lets it grant *network*
+access — and a proxy replaces that address with the gateway's, so every peer
+would arrive looking identical. There is a second reason, and it is the sharper
+one: a quarantined peer is allowed exactly one port on the gateway. Putting the
+portal behind the proxy would mean opening `:443` to peers in quarantine, and
+`:443` on the gateway is where every internally published service lives.
+
+So the port comes off a different way: give the portal an address of its own.
+
+```ini
+FOXGUARD_PORTAL_BIND_IP=10.88.0.254
+FOXGUARD_PORTAL_DEDICATED_PORT=443
+FOXGUARD_PORTAL_TLS_CERTFILE=/etc/foxguard/proxy/certs/portal.pem
+FOXGUARD_PORTAL_TLS_KEYFILE=/etc/foxguard/proxy/certs/portal.key
+```
+
+`https://portal.<your domain>` then works, with no port, and the firewall rule
+names the address as well as the port:
+
+```
+ip saddr @fg_quarantine_v4 ip daddr 10.88.0.254 tcp dport 443 accept
+```
+
+A quarantined peer reaches that and nothing else — not the proxy, not a
+published service. `docs/deployment.md` has the three steps that have to line up
+(the address on the interface, the control plane moved onto it, the
+certificate), because none of them happens on its own.
+
+**One thing to know before you do it.** The portal and the admin API are one
+listener, so moving the portal moves the whole control plane. The dashboard's
+`FOXGUARD_API_URL`, the agent's `FOXGUARD_AGENT_API_URL` and the proxy's sign-in
+vhost all follow the setting — but they follow it when you restart them, not
+before.
+
+### Publishing something with no authentication at all
+
+A public web site is the case the reverse proxy exists for and the one the
+policy model refused longest. Pick **public — no authentication at all** as the
+way in, and the listener stops asking anything of the caller.
+
+It has to be picked. Leaving the list empty is still refused, and that is
+deliberate: a service somebody forgot to guard and a service somebody opened on
+purpose must not produce the same configuration. Choosing `public` puts a row in
+the database with a name on it, an entry in the audit log, and a line in the
+services table that reads *anyone at all — no credential*.
+
+Two things it does **not** switch off:
+
+- **Filters still apply.** Rate limit, geo rules and CIDR denies are evaluated
+  exactly as on any other service. "Public, but not from these countries, and no
+  more than 60 requests a minute" is one service with one way in and two filters.
+- **The upstream is still reached from the gateway only.** Publishing does not
+  put the backend on the internet; it puts the proxy there.
+
+Foxguard refuses `public` next to another way in on the same door. Ways in are
+ORed, so `public` + `bearer` is simply open, while the configuration reads as
+though a token were needed — the kind of gap that is only ever found afterwards.
+Split horizon is still fine, because the doors are separate: **public outside,
+peer identity inside** is a normal thing to want and is accepted.
+
 ### Letting people sign in
 
 Tick **Foxguard sign-in** as the way in and the service stops asking for a token
@@ -567,6 +647,7 @@ nft -j list table inet foxguard | jq '.nftables[] | select(.rule.comment)'
 
 And every state change is in **Audit log**, attributed to whoever made it.
 | A service will not save | The message says which check failed. Most often: the upstream is on a network no peer routes to, or the external door has no authenticator that works there |
+| A service will not save, and the message mentions `public` | A door cannot carry `public` and another way in at once — the OR would make the other one decorative. Remove one |
 | A service returns 503 | The device hosting it is not reachable. The error page names it. Check the peer is `active` — a quarantined or disabled one is not served |
 | A bearer token returns 403 | It was revoked, or you are hitting the internal door where the token is not one of the authenticators. Check the scope on the service page |
 | A browser refuses the certificate | The bootstrap certificate is self-signed. Run the `certbot certonly` command the installer printed; renewals load themselves after that |

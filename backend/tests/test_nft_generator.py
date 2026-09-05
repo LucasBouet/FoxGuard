@@ -666,3 +666,90 @@ def test_full_ruleset_matches_the_golden_file(tmp_path, request):
         "rendered ruleset changed; review the diff and re-run with "
         "FOXGUARD_UPDATE_GOLDEN=1 if the change is intended"
     )
+
+
+# --------------------------------------------------------------------------- #
+# the portal on an address of its own
+# --------------------------------------------------------------------------- #
+
+
+def test_a_dedicated_portal_address_scopes_the_quarantine_accept():
+    """The reason the feature exists.
+
+    Moving the portal to ``:443`` so its URL carries no port must not open
+    ``:443`` on the *gateway* address, where the reverse proxy lives -- that
+    would hand every quarantined peer every internally published service before
+    it had authenticated. The accept therefore names an address as well as a
+    port.
+    """
+    output = generate_ruleset(
+        spec(
+            peers=(peer("q", "10.88.0.9", state=PeerState.QUARANTINED),),
+            gw=gateway(portal_port=443, portal_addresses=("10.88.0.254",)),
+        )
+    )
+    lines = chain_lines(output, "input")
+    portal = lines[index_of(lines, "fg:quarantine-portal")]
+    assert "ip daddr 10.88.0.254" in portal
+    assert "tcp dport 443" in portal
+
+
+def test_without_a_dedicated_address_the_rule_is_unchanged():
+    """Every existing deployment must render exactly what it rendered before."""
+    output = generate_ruleset(
+        spec(
+            peers=(peer("q", "10.88.0.9", state=PeerState.QUARANTINED),),
+            gw=gateway(portal_port=8080),
+        )
+    )
+    lines = chain_lines(output, "input")
+    portal = lines[index_of(lines, "fg:quarantine-portal")]
+    assert "daddr" not in portal
+    assert "tcp dport 8080" in portal
+
+
+def test_a_family_with_no_portal_address_gets_no_accept_and_says_so():
+    """Silence here would read as a routing fault rather than a missing setting.
+
+    Falling back to a port-only accept would be worse than the gap: it would
+    open that port on every gateway address of that family, which is the exact
+    thing the destination match exists to prevent.
+    """
+    output = generate_ruleset(
+        spec(
+            peers=(peer("q", "10.88.0.9", state=PeerState.QUARANTINED),),
+            gw=gateway(portal_port=443, portal_addresses=("10.88.0.254",)),
+        )
+    )
+    # chain_lines strips comments so indices match rule order, so the note is
+    # asserted on the raw ruleset and the absence on the rules themselves.
+    assert "no ip6 portal address" in output
+    input_chain = "\n".join(chain_lines(output, "input"))
+    assert "ip6 saddr @fg_quarantine_v6 tcp dport 443" not in input_chain
+
+
+def test_the_restricted_input_accept_is_scoped_too():
+    output = generate_ruleset(
+        spec(
+            gw=gateway(
+                portal_port=443,
+                portal_addresses=("10.88.0.254",),
+                gateway_input_policy=GatewayInputPolicy.RESTRICTED,
+                proxy_ports=(443,),
+            )
+        )
+    )
+    lines = chain_lines(output, "input")
+    assert "ip daddr 10.88.0.254 tcp dport 443" in lines[index_of(lines, "fg:portal")]
+
+
+def test_two_addresses_of_one_family_are_refused():
+    with pytest.raises(RulesetValidationError, match="more than one IPv4"):
+        generate_ruleset(
+            spec(gw=gateway(portal_addresses=("10.88.0.254", "10.88.0.253")))
+        )
+
+
+def test_a_portal_address_that_is_not_an_address_is_refused():
+    with pytest.raises(RulesetValidationError, match="not an IP address"):
+        generate_ruleset(spec(gw=gateway(portal_addresses=("portal.example.com",))))

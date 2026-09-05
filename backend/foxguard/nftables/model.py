@@ -292,6 +292,18 @@ class GatewaySpec:
     #: Peers reach the proxy through the input chain, not the forward chain --
     #: the proxy terminates the connection on the gateway itself.
     proxy_ports: tuple[int, ...] = ()
+    #: Gateway addresses the portal answers on, when it has been given addresses
+    #: of its own rather than sharing the gateway's. Empty keeps the historical
+    #: behaviour: the portal rules match on port alone, wherever it is listening.
+    #:
+    #: This exists so the portal can sit on ``:443`` -- a URL with no port in it
+    #: -- without that opening ``:443`` on the *gateway* address to quarantined
+    #: peers, which is where the reverse proxy lives and would have handed them
+    #: every internally published service before they had authenticated.
+    #:
+    #: One entry per family at most. A quarantined peer holding only a v6 address
+    #: needs a v6 entry here or it reaches no portal at all.
+    portal_addresses: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

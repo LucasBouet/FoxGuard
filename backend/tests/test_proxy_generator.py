@@ -831,3 +831,203 @@ def test_geo_applies_to_a_passthrough_service_too():
         )
     )
     assert "tcp-request content reject if { src,map_ip" in conf
+
+
+# --------------------------------------------------------------------------- #
+# public services
+# --------------------------------------------------------------------------- #
+
+
+def _public_site(**kwargs):
+    base = {
+        "slug": "site",
+        "exposure": Exposure.EXTERNAL,
+        "internal_hostname": None,
+        "external_hostname": "site.example.com",
+        "authenticators": (Authenticator(AuthKind.PUBLIC, Scope.EXTERNAL),),
+    }
+    base.update(kwargs)
+    return _service(**base)
+
+
+def test_a_public_service_renders_no_authentication_at_all():
+    """The point of the feature: a web site anyone may read.
+
+    Asserted on the absence of a refusal rather than on the presence of some
+    marker, because that absence *is* the behaviour -- and it is what separates
+    this from every other authenticator.
+    """
+    conf = render_conf(_spec(_public_site()))
+    body = "\n".join(
+        line for line in conf.splitlines() if "site" in line or "fg_auth" in line
+    )
+    assert "http-request deny" not in body
+    assert "http-request auth" not in body
+    assert "txn.fg_auth" not in body
+
+
+def test_a_public_service_still_gets_its_filters():
+    """Public removes the identity question, not the rest of the policy.
+
+    The regression this guards against is an implementation that returns early
+    on PUBLIC before writing the filters, which would silently drop a rate limit
+    an operator believes is in force.
+    """
+    service = _public_site(
+        filters=(
+            Filter(
+                FilterKind.GEO_DENY,
+                scope=Scope.EXTERNAL,
+                values=("RU", "KP"),
+            ),
+        ),
+    )
+    conf = render_conf(_spec(service))
+    assert "geo.map" in conf
+    assert "http-request deny" in conf
+
+
+def test_an_empty_authenticator_list_is_still_refused():
+    """Forgetting to guard a service must not look like opening it on purpose."""
+    with pytest.raises(ProxyValidationError, match="no authenticator"):
+        render_conf(_spec(_public_site(authenticators=())))
+
+
+def test_public_cannot_sit_next_to_another_way_in():
+    """An OR with public is public, so the other one is a lie in the config."""
+    service = _public_site(
+        authenticators=(
+            Authenticator(AuthKind.PUBLIC, Scope.EXTERNAL),
+            Authenticator(AuthKind.BEARER, Scope.EXTERNAL),
+        ),
+        token_hashes=(TOKEN,),
+    )
+    with pytest.raises(ProxyValidationError, match="public and also carries bearer"):
+        render_conf(_spec(service))
+
+
+def test_public_on_one_door_leaves_the_other_guarded():
+    """Split horizon, the case the model was built for: open outside, named inside."""
+    service = _public_site(
+        exposure=Exposure.BOTH,
+        internal_hostname="site.example.com",
+        authenticators=(
+            Authenticator(AuthKind.PUBLIC, Scope.EXTERNAL),
+            _peer_auth(),
+        ),
+    )
+    conf = render_conf(_spec(service))
+    assert PEER_SET in conf
+
+
+def test_a_tcp_service_may_be_public():
+    """PUBLIC reads nothing, so passthrough carries it honestly."""
+    service = _service(
+        slug="game",
+        kind=ServiceKind.TCP,
+        exposure=Exposure.EXTERNAL,
+        internal_hostname=None,
+        listen_port=25565,
+        authenticators=(Authenticator(AuthKind.PUBLIC, Scope.EXTERNAL),),
+    )
+    conf = render_conf(_spec(service))
+    assert "tcp-request content reject" not in conf
+
+
+# --------------------------------------------------------------------------- #
+# the admin dashboard vhost
+# --------------------------------------------------------------------------- #
+
+
+def _with_dashboard(*services, **kwargs):
+    kwargs.setdefault("dashboard_hostname", "admin.example.com")
+    kwargs.setdefault("dashboard_address", "10.88.0.1")
+    return _spec(*services, **kwargs)
+
+
+def test_the_dashboard_is_not_published_unless_asked():
+    conf = render_conf(_spec(_service()))
+    assert "be_fg_dashboard" not in conf
+
+
+def test_the_dashboard_answers_on_the_tunnel_door_only():
+    """The whole security argument for adding no authenticator to that vhost."""
+    service = _service(
+        exposure=Exposure.BOTH,
+        external_hostname="app.example.com",
+        authenticators=(_peer_auth(), Authenticator(AuthKind.BEARER, Scope.EXTERNAL)),
+        token_hashes=(TOKEN,),
+    )
+    conf = render_conf(_with_dashboard(service))
+    # The external frontend is rendered first, so slice on the internal one
+    # rather than assuming an order.
+    external, internal = conf.split("frontend fg_int_https", 1)
+    assert "frontend fg_ext_https" in external
+    assert "h_fg_dashboard" in internal
+    assert "h_fg_dashboard" not in external
+
+
+def test_publishing_only_the_dashboard_still_builds_an_internal_frontend():
+    """A deployment whose only published thing is the dashboard.
+
+    ``has_internal`` used to be "any service exposed internally", so this
+    rendered a name with no listener behind it.
+    """
+    conf = render_conf(_with_dashboard())
+    assert "frontend fg_int_https" in conf
+    assert "use_backend be_fg_dashboard if h_fg_dashboard" in conf
+    assert "server s1 10.88.0.1:3000" in conf
+
+
+def test_a_service_may_not_steal_the_dashboards_name():
+    """The dashboard's use_backend is emitted first and would win every request."""
+    service = _service(internal_hostname="admin.example.com")
+    with pytest.raises(ProxyValidationError, match="the admin dashboard"):
+        render_conf(_with_dashboard(service))
+
+
+def test_the_dashboard_may_not_take_the_sign_in_name():
+    spec = _with_dashboard(
+        _service(authenticators=(Authenticator(AuthKind.FOXGUARD_SSO, Scope.INTERNAL),)),
+        dashboard_hostname="auth.example.com",
+        sso_secret="s" * 32,
+        sso_hostname="auth.example.com",
+    )
+    with pytest.raises(ProxyValidationError, match="both the dashboard and the sign-in"):
+        render_conf(spec)
+
+
+def test_the_dashboard_may_not_point_at_the_proxy_itself():
+    """Same trap `forbidden_upstream` catches for ordinary services."""
+    with pytest.raises(ProxyValidationError, match="forward to itself"):
+        render_conf(_with_dashboard(dashboard_port=443))
+
+
+def test_the_sign_in_backend_follows_a_relocated_control_plane():
+    """The portal and the admin API are one listener, so moving one moves both.
+
+    Without this the sign-in vhost kept dialling the address the API used to be
+    on, and every redirect to the login page ended in a 503 that looked like an
+    SSO fault rather than a moved listener.
+    """
+    spec = _spec(
+        _service(authenticators=(Authenticator(AuthKind.FOXGUARD_SSO, Scope.INTERNAL),)),
+        sso_secret="s" * 32,
+        sso_hostname="auth.example.com",
+        sso_api_address="10.88.0.254",
+        sso_api_port=443,
+        sso_api_tls=True,
+    )
+    conf = render_conf(spec)
+    assert "server s1 10.88.0.254:443 ssl verify none" in conf
+
+
+def test_the_sign_in_backend_still_defaults_to_the_internal_bind():
+    spec = _spec(
+        _service(authenticators=(Authenticator(AuthKind.FOXGUARD_SSO, Scope.INTERNAL),)),
+        sso_secret="s" * 32,
+        sso_hostname="auth.example.com",
+    )
+    conf = render_conf(spec)
+    assert "server s1 10.88.0.1:8080" in conf
+    assert "ssl verify none" not in conf

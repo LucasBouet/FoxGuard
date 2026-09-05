@@ -322,7 +322,8 @@ export type ServiceAuthKind =
   | "bearer"
   | "basic"
   | "foxguard_sso"
-  | "mtls";
+  | "mtls"
+  | "public";
 export type ServiceFilterKind =
   | "ip_allow"
   | "ip_deny"

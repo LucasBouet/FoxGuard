@@ -103,6 +103,35 @@ class Settings(BaseSettings):
     nft_path: str = "nft"
     wan_interface: str | None = None
     portal_port: int = 8080
+
+    #: Tunnel addresses of the gateway's own that the captive portal answers on,
+    #: instead of sharing ``gateway_ip``. Unset keeps today's behaviour.
+    #:
+    #: The point is a URL with no port in it. The portal cannot go behind the
+    #: reverse proxy -- it identifies its caller by the tunnel source address,
+    #: and a proxy replaces that with the gateway's -- so the only way to put it
+    #: on ``:443`` is to give it an address where ``:443`` is free. Doing that on
+    #: ``gateway_ip`` would mean opening the proxy's own port to quarantined
+    #: peers, handing them every internally published service before they have
+    #: authenticated. On an address of its own, the firewall rule names both the
+    #: address and the port and nothing else is reachable.
+    #:
+    #: It must be inside a pool (so peers route to it) and reserved from
+    #: allocation, which ``api/routes/peers.py`` does. wg-quick must also carry
+    #: it as a second ``Address`` on the interface, or nothing answers there --
+    #: the agent programs peers and routes, not the interface's own addresses.
+    portal_bind_ip: str | None = None
+    portal_bind_ip6: str | None = None
+    #: Port used only when the portal has an address of its own. 443 is the
+    #: whole point; it is configurable because someone will already be using it.
+    portal_dedicated_port: int = Field(default=443, ge=1, le=65535)
+    #: Serve the portal over TLS. Both are needed or neither: uvicorn refuses a
+    #: half-configured pair, and so do we, earlier and with a better message.
+    portal_tls_certfile: str | None = None
+    portal_tls_keyfile: str | None = None
+    #: Name the portal answers on. Defaults to ``portal.<proxy_domain>``, which
+    #: the wildcard certificate already covers.
+    portal_hostname: str | None = None
     # NoDecode is required: without it pydantic-settings JSON-decodes list-typed
     # fields inside the env source, before any validator runs, and the
     # documented `a,b,c` form raises a SettingsError at import time.
@@ -210,6 +239,25 @@ class Settings(BaseSettings):
     #: This vhost is the ONLY place the proxy is ever put in front of the
     #: Foxguard API, and only ``/api/v1/sso/`` is routed there.
     proxy_sso_hostname: str | None = None
+
+    #: Publish the admin dashboard on the tunnel-facing listener, so it answers
+    #: to a name instead of an address and a port. Off by default: it is a
+    #: decision, and the dashboard is reachable on its own port either way.
+    #:
+    #: Internal only, with no setting to change that. The dashboard carries an
+    #: administrator's session for the whole control plane; the tunnel is what
+    #: decides who may speak to it, and a flag is a poor place to trade that
+    #: away. Wanting it on the WAN is a real position -- publish it as an
+    #: ordinary service and pick the authenticator deliberately.
+    proxy_dashboard_enabled: bool = False
+    #: Name it answers on. Defaults to ``admin.<proxy_domain>``, a subdomain of
+    #: the proxy domain so the wildcard certificate already covers it.
+    proxy_dashboard_hostname: str | None = None
+    #: Where the dashboard process listens. Matches the ``--hostname``/``--port``
+    #: in ``foxguard-dashboard.service``; the tunnel address is the default
+    #: because that unit binds it too.
+    dashboard_host: str | None = None
+    dashboard_port: int = Field(default=3000, ge=1, le=65535)
 
     # --- client configuration (Phase 6) ------------------------------------
     #: What a generated client config puts in ``AllowedIPs``. See
@@ -589,6 +637,45 @@ class Settings(BaseSettings):
         return f"auth.{self.proxy_domain}" if self.proxy_domain else None
 
     @property
+    def portal_addresses(self) -> tuple[str, ...]:
+        """Addresses the portal answers on, or empty when it shares the gateway's."""
+        return tuple(a for a in (self.portal_bind_ip, self.portal_bind_ip6) if a)
+
+    @property
+    def portal_listen_port(self) -> int:
+        """Port the portal actually listens on."""
+        return self.portal_dedicated_port if self.portal_addresses else self.portal_port
+
+    @property
+    def portal_listen_host(self) -> str:
+        """Address ``foxguard-serve`` should bind for the portal."""
+        return self.portal_bind_ip or self.gateway_ip
+
+    @property
+    def portal_host(self) -> str | None:
+        """Name the portal answers on, or ``None`` when it has no name."""
+        if self.portal_hostname:
+            return self.portal_hostname
+        if self.portal_addresses and self.proxy_domain:
+            return f"portal.{self.proxy_domain}"
+        return None
+
+    @property
+    def proxy_dashboard_host(self) -> str | None:
+        """Name the dashboard answers on, or ``None`` when it is not published.
+
+        Same shape as :attr:`proxy_sso_host`, and for the same reason: a
+        subdomain of the proxy domain is already covered by the wildcard
+        certificate, so publishing it needs no new certificate and no new ACME
+        request.
+        """
+        if not self.proxy_dashboard_enabled:
+            return None
+        if self.proxy_dashboard_hostname:
+            return self.proxy_dashboard_hostname
+        return f"admin.{self.proxy_domain}" if self.proxy_domain else None
+
+    @property
     def proxy_internal_listen(self) -> tuple[str, ...]:
         """Tunnel addresses the internal listener binds.
 
@@ -628,7 +715,12 @@ class Settings(BaseSettings):
             sso_cookie=self.proxy_sso_cookie_name,
             sso_hostname=self.proxy_sso_host,
             sso_cookie_domain=self.proxy_domain or "",
-            sso_api_port=self.portal_port,
+            sso_api_port=self.portal_listen_port,
+            sso_api_address=self.portal_listen_host,
+            sso_api_tls=bool(self.portal_tls_certfile),
+            dashboard_hostname=self.proxy_dashboard_host,
+            dashboard_address=self.dashboard_host or self.gateway_ip,
+            dashboard_port=self.dashboard_port,
             connect_timeout_seconds=self.proxy_connect_timeout_seconds,
             client_timeout_seconds=self.proxy_client_timeout_seconds,
             server_timeout_seconds=self.proxy_server_timeout_seconds,
@@ -642,7 +734,8 @@ class Settings(BaseSettings):
             wg_interface=self.wg_interface,
             wan_interface=self.wan_interface,
             table_name=self.nft_table_name,
-            portal_port=self.portal_port,
+            portal_port=self.portal_listen_port,
+            portal_addresses=self.portal_addresses,
             internal_cidrs=tuple(self.internal_cidrs),
             allow_dns_in_quarantine=self.allow_dns_in_quarantine,
             allow_icmp_to_gateway=self.allow_icmp_to_gateway,

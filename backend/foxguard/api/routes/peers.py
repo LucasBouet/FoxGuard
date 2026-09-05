@@ -154,7 +154,11 @@ def create_peer(
             session,
             pool_v4=settings.wg_staging_pool_v4 or settings.wg_pool_v4,
             pool_v6=settings.wg_staging_pool_v6 or settings.wg_pool_v6,
-            reserved=[settings.gateway_ip],
+            # The portal's own addresses are the gateway's too -- handing one
+            # to a peer would take the captive portal off the air for
+            # everybody, and the collision would surface as a peer that
+            # cannot authenticate rather than as an address conflict.
+            reserved=[settings.gateway_ip, *settings.portal_addresses],
         )
 
     peer = Peer(

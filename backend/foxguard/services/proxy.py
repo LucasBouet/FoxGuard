@@ -194,6 +194,8 @@ def build_spec(session: Session, settings: Settings) -> ProxySpec:
         sso_hostname=spec.sso_hostname,
         sso_cookie_domain=spec.sso_cookie_domain,
         sso_api_port=spec.sso_api_port,
+        sso_api_address=spec.sso_api_address,
+        sso_api_tls=spec.sso_api_tls,
         # Only sessions that are revoked *and* not yet expired. An expired one
         # is already refused by the expiry comparison in the rendered config,
         # and keeping it would grow this map forever.

@@ -246,3 +246,59 @@ def test_the_staging_pool_is_covered_too(db_session):
     cfg = settings(wg_staging_pool_v4="10.89.0.0/24")
     conf = dns_service.render(db_session, cfg)[1]
     assert "local=/0.89.10.in-addr.arpa/" in conf
+
+
+# --------------------------------------------------------------------------- #
+# names for the things Foxguard itself serves
+# --------------------------------------------------------------------------- #
+
+
+def test_the_portal_gets_a_name_pointing_at_its_own_address(db_session):
+    """Not at the gateway, which is the trap.
+
+    A published service's name resolves to the gateway because the proxy is the
+    destination. The portal is the opposite: it has an address of its own, and
+    the firewall opens its port on that address alone -- so a record pointing at
+    the gateway would send every quarantined peer somewhere the ruleset drops.
+    """
+    cfg = settings(
+        proxy_enabled=True,
+        proxy_domain="example.com",
+        portal_bind_ip="10.88.0.254",
+    )
+    hosts = hosts_of(db_session, cfg)
+    assert hosts["10.88.0.254"] == ("portal.example.com",)
+    assert "portal.example.com" not in hosts.get("10.88.0.1", ())
+
+
+def test_the_portal_has_no_name_until_it_has_an_address(db_session):
+    cfg = settings(proxy_enabled=True, proxy_domain="example.com")
+    assert "portal.example.com" not in str(hosts_of(db_session, cfg))
+
+
+def test_the_published_dashboard_resolves_to_the_gateway(db_session):
+    """The dashboard *is* behind the proxy, so its name points where the proxy is."""
+    cfg = settings(
+        proxy_enabled=True,
+        proxy_domain="example.com",
+        proxy_dashboard_enabled=True,
+    )
+    assert "admin.example.com" in hosts_of(db_session, cfg)["10.88.0.1"]
+
+
+def test_names_outside_the_zone_are_declared_rather_than_refused(db_session):
+    """The zone guard refuses out-of-zone names unless they are declared.
+
+    Both of these live under the proxy domain, so without the declaration the
+    renderer rejects the whole zone -- which is a total DNS outage, not a
+    missing record.
+    """
+    cfg = settings(
+        proxy_enabled=True,
+        proxy_domain="example.com",
+        proxy_dashboard_enabled=True,
+        portal_bind_ip="10.88.0.254",
+    )
+    spec = dns_service.build_spec(db_session, cfg)
+    assert {"admin.example.com", "portal.example.com"} <= spec.external_names
+    dns_service.render(db_session, cfg)  # must not raise

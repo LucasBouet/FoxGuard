@@ -36,6 +36,7 @@ from .model import (
     EndpointKind,
     Family,
     GatewayInputPolicy,
+    GatewaySpec,
     Protocol,
     RulesetSpec,
     RuleSpec,
@@ -202,6 +203,20 @@ def validate_spec(spec: RulesetSpec) -> None:
         errors.append(f"gateway.wan_interface {gw.wan_interface!r} is not a valid interface name")
     if not (1 <= gw.portal_port <= 65535):
         errors.append(f"gateway.portal_port {gw.portal_port} out of range 1-65535")
+    seen_families: set[int] = set()
+    for address in gw.portal_addresses:
+        try:
+            parsed = ipaddress.ip_address(address)
+        except ValueError:
+            errors.append(f"gateway.portal_addresses {address!r} is not an IP address")
+            continue
+        if parsed.version in seen_families:
+            # Two addresses of the same family would emit two accepts and leave
+            # nobody able to say which one the portal is actually on.
+            errors.append(
+                f"gateway.portal_addresses has more than one IPv{parsed.version} address"
+            )
+        seen_families.add(parsed.version)
     for cidr in gw.internal_cidrs:
         _check_cidr(cidr, "gateway.internal_cidrs", errors)
 
@@ -602,8 +617,23 @@ def _render_input_chain(spec: RulesetSpec) -> Iterator[str]:
     yield f"{INDENT * 2}# cut its open flows immediately, not only its new ones."
     for family in FAMILIES:
         quarantine = quarantine_set_name(family)
+        destination = _portal_destination(gw, family)
+        if destination is None:
+            # The portal has addresses of its own and none in this family, so a
+            # peer here has no portal to be let through to. Emitting a
+            # port-only accept would open that port on *every* gateway address
+            # instead, which is the whole thing the destination match prevents.
+            #
+            # Said out loud in the ruleset: a quarantined peer of this family
+            # can reach nothing, and would otherwise look like a routing fault.
+            yield (
+                f"{INDENT * 2}# no {family.addr_kw} portal address: a quarantined "
+                f"{family.addr_kw} peer has nowhere to authenticate"
+            )
+            continue
         yield (
-            f"{INDENT * 2}{family.addr_kw} saddr @{quarantine} tcp dport {gw.portal_port} "
+            f"{INDENT * 2}{family.addr_kw} saddr @{quarantine} {destination}"
+            f"tcp dport {gw.portal_port} "
             f'counter accept comment "fg:quarantine-portal"'
         )
     if gw.allow_dns_in_quarantine:
@@ -641,10 +671,19 @@ def _render_input_chain(spec: RulesetSpec) -> Iterator[str]:
 
     if gw.gateway_input_policy is GatewayInputPolicy.RESTRICTED:
         yield f"{INDENT * 2}# --- active peers: gateway services are restricted ---"
-        yield (
-            f"{INDENT * 2}tcp dport {gw.portal_port} counter accept "
-            f'comment "fg:portal"'
-        )
+        if gw.portal_addresses:
+            for family in FAMILIES:
+                destination = _portal_destination(gw, family)
+                if destination is not None:
+                    yield (
+                        f"{INDENT * 2}{destination}tcp dport {gw.portal_port} "
+                        f'counter accept comment "fg:portal"'
+                    )
+        else:
+            yield (
+                f"{INDENT * 2}tcp dport {gw.portal_port} counter accept "
+                f'comment "fg:portal"'
+            )
         if gw.allow_dns_in_quarantine:
             yield f'{INDENT * 2}udp dport 53 counter accept comment "fg:dns"'
             yield f'{INDENT * 2}tcp dport 53 counter accept comment "fg:dns"'
@@ -665,6 +704,31 @@ def _render_input_chain(spec: RulesetSpec) -> Iterator[str]:
         yield f"{INDENT * 2}# --- active peers: gateway-local services left to the host firewall ---"
         yield f'{INDENT * 2}accept comment "fg:gateway-input-open"'
     yield f"{INDENT}}}"
+
+
+def _portal_destination(gw: GatewaySpec, family: Family) -> str | None:
+    """The ``daddr`` clause scoping a portal rule to this family, if any.
+
+    Returns ``""`` -- match on port alone, the historical behaviour -- when the
+    portal shares the gateway's address, ``None`` when it has addresses of its
+    own but none in this family, and a clause otherwise.
+
+    The three-way answer matters: ``None`` and ``""`` are not interchangeable.
+    Falling back to ``""`` for a family the portal does not answer on would open
+    that port on every gateway address of that family, which is exactly what
+    giving the portal its own address was meant to stop.
+    """
+    if not gw.portal_addresses:
+        return ""
+    version = 4 if family is Family.V4 else 6
+    for address in gw.portal_addresses:
+        try:
+            parsed = ipaddress.ip_address(address)
+        except ValueError:  # pragma: no cover -- validate_spec refuses these first
+            continue
+        if parsed.version == version:
+            return f"{family.addr_kw} daddr {address} "
+    return None
 
 
 def _render_forward_chain(spec: RulesetSpec) -> Iterator[str]:

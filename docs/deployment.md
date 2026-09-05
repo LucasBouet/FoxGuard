@@ -615,6 +615,116 @@ accounts only — Foxguard never requires an IdP.
 Each user needs `external_idp_issuer` + `external_idp_subject` matching the
 `iss`/`sub` their IdP issues, and their peer must be bound to that account.
 
+## 5b-bis. A URL with no port: the dashboard, and the portal
+
+Two separate problems that look like one.
+
+### The dashboard
+
+```ini
+# /etc/foxguard/backend.env
+FOXGUARD_PROXY_DASHBOARD_ENABLED=true
+```
+
+`systemctl restart foxguard-api`, and `admin.<proxy domain>` answers on the
+tunnel-facing listener at the next agent poll. The name is added to the internal
+zone automatically, pointing at the gateway, and the wildcard certificate
+already covers it. Nothing else to do.
+
+It is internal-only and there is no setting to change that — see `docs/usage.md`
+for why, and for what to do instead if you want it reachable from outside.
+
+### The portal
+
+The portal cannot go behind the proxy (`docs/usage.md` explains why, twice
+over). Getting `https://portal.<domain>` without a port means giving it an
+address of its own. Three things have to line up, and the installer does none of
+them for you.
+
+**1. The address must exist on the interface.** The agent programs peers and
+routes, never the interface's own addresses, so this goes in `wg0.conf`:
+
+```ini
+[Interface]
+Address = 10.88.0.1/24, 10.88.0.254/32
+```
+
+`wg-quick down wg0 && wg-quick up wg0`, or `ip addr add 10.88.0.254/32 dev wg0`
+to avoid dropping every peer while you test. Pick something inside the pool so
+peers route to it without a new route; Foxguard reserves it from allocation
+itself once the setting below is in place, so no peer will be handed it.
+
+**2. The control plane moves onto it.** The portal and the admin API are one
+listener — one FastAPI app, one `foxguard-serve` — so this moves both:
+
+```ini
+# /etc/foxguard/backend.env
+FOXGUARD_PORTAL_BIND_IP=10.88.0.254
+FOXGUARD_PORTAL_DEDICATED_PORT=443
+FOXGUARD_PORTAL_TLS_CERTFILE=/etc/foxguard/proxy/certs/portal.pem
+FOXGUARD_PORTAL_TLS_KEYFILE=/etc/foxguard/proxy/certs/portal.key
+```
+
+and the unit has to bind it:
+
+```sh
+# /etc/systemd/system/foxguard-api.service
+ExecStart=/opt/foxguard/venv/bin/foxguard-serve \
+  --host 10.88.0.254 --port 443 \
+  --ssl-certfile /etc/foxguard/proxy/certs/portal.pem \
+  --ssl-keyfile /etc/foxguard/proxy/certs/portal.key
+```
+
+**Binding 443 needs two lines, not one.** The unit runs as `User=foxguard` with
+`CapabilityBoundingSet=` — empty, everything dropped — so it cannot open a port
+below 1024. The ambient set is masked by the bounding set, so granting the
+capability means putting it in both:
+
+```ini
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+```
+
+Measured, not assumed: with the capability dropped from the bounding set,
+raising it in the ambient set fails outright (`capsh --drop=cap_net_bind_service
+--addamb=cap_net_bind_service` → `failed to raise ambient`). Adding only the
+`AmbientCapabilities=` line leaves you with a unit that still cannot bind and no
+message saying why.
+
+The alternative is a port above 1024, which works with no capability at all and
+puts the port back in the URL — which was the thing you were removing.
+
+**Everything that talks to the control plane follows this**, and follows it on
+restart, not before:
+
+| What | Setting |
+| --- | --- |
+| the dashboard | `FOXGUARD_API_URL` in `/etc/foxguard/dashboard.env` |
+| the agent | `FOXGUARD_AGENT_API_URL` in `/etc/foxguard/agent.env` |
+| the proxy's sign-in vhost | follows `FOXGUARD_PORTAL_BIND_IP` on its own, at the next poll |
+
+**3. A certificate it can serve.** `portal.<proxy domain>` is covered by the
+wildcard already in `certs/`, so the simplest answer is to point the two TLS
+settings at it. HAProxy wants the key and the chain in one file and uvicorn
+wants them separate, so they are not the same file even when they are the same
+certificate.
+
+### What you should see afterwards
+
+```sh
+nft list chain inet foxguard input | grep quarantine-portal
+#   ip saddr @fg_quarantine_v4 ip daddr 10.88.0.254 tcp dport 443 accept
+```
+
+The rule now names an address as well as a port. That is the point of the whole
+exercise: a peer in quarantine reaches the portal and nothing else — in
+particular not `:443` on the gateway address, which is the reverse proxy and
+every service published behind it.
+
+If you run a v6 pool, give the portal a v6 address too. Without one the ruleset
+carries a comment saying so and quarantined v6 peers can reach no portal at all
+— deliberately, because the alternative is opening the port on every address.
+
 ## 5c. Session expiry
 
 Runs inside the API process; nothing extra to install or enable. Every
