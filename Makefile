@@ -122,6 +122,10 @@ test-wg-live: ## Load a generated config into a real WireGuard interface (needs 
 test-install-config: ## Check the installer's client config against the dashboard's, byte for byte
 	./deploy/tests/test-client-config.sh
 
+.PHONY: test-install-profile
+test-install-profile: ## Check the installer's answer file survives write then read
+	./deploy/tests/test-install-profile.sh
+
 .PHONY: golden
 golden: ## Regenerate the nftables golden baseline (review the diff!)
 	cd $(BACKEND) && FOXGUARD_UPDATE_GOLDEN=1 pytest tests/test_nft_generator.py -k golden

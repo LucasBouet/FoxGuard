@@ -538,6 +538,14 @@ fi
 printf '\n%s  The command this becomes:%s\n' "$D" "$N"
 printf '%s    %s %s%s\n\n' "$D" "$(basename "$INSTALLER")" "$(printable)" "$N"
 
+# Answering these questions once should be enough. The installer writes every
+# answer back, minus the Cloudflare token, so an update is one flag rather than
+# an archaeology exercise in somebody's shell history.
+printf '%s  These answers are saved to /etc/foxguard/install.conf. To update this%s\n' "$D" "$N"
+printf '%s  gateway later, or to build a second one from it:%s\n' "$D" "$N"
+printf '%s    sudo %s --profile /etc/foxguard/install.conf%s\n\n' \
+  "$D" "$(basename "$INSTALLER")" "$N"
+
 if [[ $DRY_RUN -eq 1 ]]; then
   ok "dry run -- nothing was changed"
   exit 0

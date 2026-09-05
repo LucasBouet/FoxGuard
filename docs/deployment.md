@@ -1107,8 +1107,10 @@ shows you the exact `foxguard-install.sh` command it built before running
 anything. `--dry-run` stops after printing that command.
 
 It is a front end, not a second installer — there is one implementation of the
-install, so the two cannot drift, and the command it prints is something you can
-keep for next time.
+install, so the two cannot drift.
+
+You do not have to keep the command it prints. Every install writes its answers
+to `/etc/foxguard/install.conf`, which is what section 7 uses.
 
 Two things it does that are easy to get wrong by hand:
 
@@ -1320,6 +1322,76 @@ curl -s -X POST localhost:8000/api/v1/policies/import \
 
 `prune: true` makes the import a full sync — groups and rules absent from the
 document are deleted. Without it, the import only creates and updates.
+
+## 7. Updating, and building a second gateway
+
+The installer is idempotent and re-running it is the update path. It reads the
+existing `backend.env` to reuse the secrets rather than rotating them — the
+agent holds its token in a separate file and would otherwise stop reconciling
+without saying so.
+
+What it does *not* do is remember the flags. It recomputes them, so a re-run
+with different arguments quietly reconfigures the box. That is what
+`/etc/foxguard/install.conf` is for: every successful install writes its
+answers there, taken from the values that were actually in effect rather than
+from what was typed, so detected things (the tunnel address, the pool, the WAN
+interface) are recorded as what they resolved to.
+
+```sh
+sudo ./deploy/foxguard-backup.sh                # database, tokens, wg key
+git -C ~/FoxGuard pull
+sudo ./deploy/foxguard-install.sh --profile /etc/foxguard/install.conf
+sudo ./deploy/foxguard-healthcheck.sh
+```
+
+Flags on the command line beat the file, wherever the two appear relative to
+each other — `--profile p --proxy-domain a.example` and the reverse mean the
+same thing. So changing one answer is a flag, not an edit:
+
+```sh
+sudo ./deploy/foxguard-install.sh --profile /etc/foxguard/install.conf --dns-zone lab.internal
+```
+
+and the next run records the new value.
+
+### A second gateway
+
+Copy the file, change the addresses and the domain, and add the two things it
+deliberately does not carry:
+
+```sh
+scp gw1:/etc/foxguard/install.conf ./gw2.conf
+$EDITOR ./gw2.conf                              # tunnel_ip, pool, proxy_domain
+sudo ./deploy/foxguard-install.sh --profile ./gw2.conf \
+     --bootstrap-wireguard --bootstrap-peer laptop \
+     --acme-cf-token "$CF_TOKEN"
+```
+
+### What the file leaves out, and why
+
+**The Cloudflare API token.** It is a credential, and this file is meant to be
+copied between machines. It already lives in
+`/etc/foxguard/proxy/cloudflare.ini` on a gateway that has one; pass
+`--acme-cf-token` when setting up another.
+
+**`--bootstrap-wireguard` and `--bootstrap-peer`.** Actions, not configuration.
+The file records what the box *is*, not what one install *did* once — and
+replaying them would abort the run rather than update it, because bootstrapping
+refuses to touch an interface that already exists. That refusal is the right
+behaviour; recording the flag would just turn every update into an error.
+
+### It is parsed, never sourced
+
+A file in `/etc` that the installer executes as shell would be a way to run code
+as root by editing a config file, and this one is meant to be edited. So it is
+read key by key, with an allowlist. An unknown key is an error naming the line,
+not a line quietly ignored — a typo that silently does nothing is how a gateway
+comes back up with the proxy off and nobody knowing why.
+
+`deploy/tests/test-install-profile.sh` (`make test-install-profile`) writes a
+profile from deliberately non-default values, wipes every variable, reads it
+back and compares: a key the writer forgets and a key the reader does not
+understand both fail there rather than during someone's upgrade.
 
 ## Backup and restore
 

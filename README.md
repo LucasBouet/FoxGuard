@@ -350,6 +350,18 @@ you the exact `foxguard-install.sh` command it built, and only then installs.
 `--dry-run` stops after printing the command. It is a front end to the same
 installer, not a second one, so nothing can drift between them.
 
+Whichever route you take, the answers are written to
+`/etc/foxguard/install.conf` — everything except the Cloudflare token. Updating
+later is that file and nothing else to remember:
+
+```sh
+sudo ./deploy/foxguard-install.sh --profile /etc/foxguard/install.conf
+```
+
+Copy it to another machine, change the addresses, and you have a second gateway.
+`docs/deployment.md` §7 covers both, including what the file deliberately leaves
+out.
+
 The rest of this section is the scripted form, which is what you want for a
 rebuild or for CI.
 

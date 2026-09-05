@@ -49,6 +49,7 @@ DB_NAME=foxguard
 DB_USER=foxguard
 
 SRC=""
+PROFILE=""
 ASSUME_YES=0
 CHECK_ONLY=0
 SKIP_FRONTEND=0
@@ -183,10 +184,147 @@ config_file_name() { # config_file_name <profile-json>
   printf '%s.conf' "${cleaned:-foxguard}"
 }
 
-# Sourcing this file with FOXGUARD_INSTALL_SOURCE_ONLY=1 defines the two
-# functions above and stops before anything is parsed, checked or installed. It
-# is how deploy/tests/test-client-config.sh gets at the renderer, and it is the
-# only reason this early return exists.
+# --------------------------------------------------------------------------- #
+# install profiles
+#
+# The answers, minus anything secret, so an update does not depend on someone
+# remembering the flags they used months ago -- and so a second gateway can be
+# built from the first by editing three lines.
+#
+# Parsed, never sourced. A file in /etc that the installer executes as shell is
+# a way to run code as root by editing a config file, and this one is meant to
+# be edited.
+# --------------------------------------------------------------------------- #
+
+profile_bool() { # profile_bool <value> <file:line> <key>
+  case ${1,,} in
+    true|yes|on|1)  return 0 ;;
+    false|no|off|0) return 1 ;;
+    *) die "$2: $3 must be true or false, got: $1" ;;
+  esac
+}
+
+load_profile() { # load_profile <file>
+  local file=$1 line key value where lineno=0
+  [[ -r $file ]] || die "cannot read profile: $file"
+  while IFS= read -r line || [[ -n $line ]]; do
+    lineno=$((lineno + 1))
+    line=${line%$'\r'}                       # tolerate a file edited on Windows
+    line=${line#"${line%%[![:space:]]*}"}    # ltrim
+    line=${line%"${line##*[![:space:]]}"}    # rtrim
+    [[ -z $line || $line == \#* ]] && continue
+    where="$file:$lineno"
+    [[ $line == *=* ]] || die "$where: expected key=value, got: $line"
+    key=${line%%=*}; value=${line#*=}
+    key=${key//[[:space:]]/}
+    value=${value#"${value%%[![:space:]]*}"}
+    value=${value%"${value##*[![:space:]]}"}
+    case $key in
+      prefix)          PREFIX=$value ;;
+      wg_interface)    WG_IF=$value ;;
+      tunnel_ip)       TUNNEL_IP=$value ;;
+      pool)            POOL=$value ;;
+      staging_pool)    STAGING_POOL=$value ;;
+      wan_interface)   WAN_IF=$value ;;
+      api_port)        API_PORT=$value ;;
+      dashboard_port)  DASHBOARD_PORT=$value ;;
+      admin_user)      ADMIN_USER=$value ;;
+      endpoint)        ENDPOINT=$value ;;
+      listen_port)     LISTEN_PORT=$value ;;
+      skip_frontend)   profile_bool "$value" "$where" "$key" && SKIP_FRONTEND=1 || SKIP_FRONTEND=0 ;;
+      dns)             profile_bool "$value" "$where" "$key" && DNS_ENABLED=1 || DNS_ENABLED=0 ;;
+      dns_zone)        DNS_ZONE=$value ;;
+      dns_mode)        DNS_MODE=$value ;;
+      dns_upstreams)   DNS_UPSTREAMS=$value ;;
+      proxy)           profile_bool "$value" "$where" "$key" && PROXY_ENABLED=1 || PROXY_ENABLED=0 ;;
+      proxy_domain)    PROXY_DOMAIN=$value ;;
+      proxy_external)  PROXY_EXTERNAL_BINDS=$value ;;
+      sso)             profile_bool "$value" "$where" "$key" && SSO_ENABLED=1 || SSO_ENABLED=0 ;;
+      geo_now)         profile_bool "$value" "$where" "$key" && GEO_NOW=yes || GEO_NOW=no ;;
+      acme_email)      ACME_EMAIL=$value ;;
+      # Refused rather than ignored, for the same reason an unknown flag is: a
+      # typo that silently does nothing is how a gateway comes back up with the
+      # proxy off and nobody knowing why.
+      *) die "$where: unknown key: $key" ;;
+    esac
+  done < "$file"
+  ok "answers loaded from $file"
+}
+
+# --------------------------------------------------------------------------- #
+# writing a profile back
+#
+# From the *effective* values rather than from what was typed, so a re-run
+# through --profile reproduces this gateway and not the command that happened
+# to build it: detected values -- the tunnel address, the pool, the WAN
+# interface -- are recorded as the answers they resolved to.
+# --------------------------------------------------------------------------- #
+
+write_profile() { # write_profile <file>
+  _yn() { [[ $1 -eq 1 ]] && echo true || echo false; }
+  cat > "$1" <<PROFEOF
+# Foxguard install profile. Written by foxguard-install.sh.
+#
+# What this gateway was built from, minus anything secret. Update it in place:
+#
+#     sudo foxguard-install.sh --profile $CONFDIR/install.conf
+#
+# or build a second gateway from it -- copy the file, change the addresses and
+# the domain, and add the two actions this one deliberately omits:
+#
+#     sudo foxguard-install.sh --profile ./the-copy \\
+#          --bootstrap-wireguard --bootstrap-peer laptop
+#
+# Two things are absent on purpose.
+#
+# The Cloudflare API token is a credential and does not belong in a file meant
+# to be copied between machines. It is already in $CONFDIR/proxy/cloudflare.ini
+# on this one; pass --acme-cf-token when setting up another.
+#
+# --bootstrap-wireguard and --bootstrap-peer are actions, not configuration.
+# This file records what the box IS, not what one install DID once -- and
+# replaying them would abort the run, because bootstrapping refuses to touch an
+# interface that already exists.
+#
+# Parsed, never sourced: an unknown key is an error, not a line quietly ignored.
+
+prefix=$PREFIX
+wg_interface=$WG_IF
+tunnel_ip=$TUNNEL_IP
+pool=$POOL
+staging_pool=$STAGING_POOL
+wan_interface=$WAN_IF
+endpoint=$ENDPOINT
+listen_port=$LISTEN_PORT
+
+api_port=$API_PORT
+dashboard_port=$DASHBOARD_PORT
+admin_user=$ADMIN_USER
+skip_frontend=$(_yn $SKIP_FRONTEND)
+
+dns=$(_yn $DNS_ENABLED)
+dns_zone=$DNS_ZONE
+dns_mode=$DNS_MODE
+dns_upstreams=$DNS_UPSTREAMS
+
+proxy=$(_yn $PROXY_ENABLED)
+proxy_domain=$PROXY_DOMAIN
+proxy_external=$PROXY_EXTERNAL_BINDS
+sso=$(_yn $SSO_ENABLED)
+geo_now=$([[ $GEO_NOW == yes ]] && echo true || echo false)
+acme_email=$ACME_EMAIL
+PROFEOF
+  # 0640: no secret in it, but the topology of a private network is nobody
+  # else's business either.
+  chmod 0640 "$1"
+  ok "answers written to $1 (no secrets; --profile reads it back)"
+
+}
+
+# Sourcing this file with FOXGUARD_INSTALL_SOURCE_ONLY=1 defines the functions
+# above and stops before anything is parsed, checked or installed. It is how
+# deploy/tests/ gets at the client-config renderer and at the profile
+# reader/writer, and it is the only reason this early return exists.
 [[ -n ${FOXGUARD_INSTALL_SOURCE_ONLY:-} ]] && return 0
 
 # --------------------------------------------------------------------------- #
@@ -213,6 +351,14 @@ Options:
   --admin-user NAME      First administrator account (default: $ADMIN_USER)
   --skip-frontend        Do not build the portal or dashboard
   --check-only           Run the preflight checks and exit
+  --profile FILE         Read the answers from FILE instead of typing them
+                         again. Every install writes one to
+                         $CONFDIR/install.conf, so updating in place is
+                         --profile $CONFDIR/install.conf and nothing else.
+                         Flags on the command line override the file, wherever
+                         the two appear relative to each other. It carries no
+                         secret and no bootstrap action -- see the header the
+                         file itself carries.
 
 Client configurations (the dashboard builds them; the keypair is made in the
 operator's browser and no private key ever reaches this box):
@@ -272,8 +418,21 @@ WireGuard bootstrap (opt-in — normally you bring the interface up yourself):
 EOF
 }
 
+# --profile is a base rather than an argument in sequence, so it is read in a
+# pass of its own: anything on the command line then wins, whatever order the
+# two appear in. Reading it inside the loop below would make
+# `--proxy-domain a.example --profile p` and the reverse mean different things.
+for ((_i = 1; _i <= $#; _i++)); do
+  [[ ${!_i} == --profile ]] || continue
+  _j=$((_i + 1))
+  [[ $_j -le $# ]] || die "--profile needs a file"
+  load_profile "${!_j}"
+  PROFILE=${!_j}
+done
+
 while [[ $# -gt 0 ]]; do
   case $1 in
+    --profile)         shift 2 ;;   # already applied, above
     --src)             SRC=$2; shift 2 ;;
     --prefix)          PREFIX=$2; shift 2 ;;
     --wg-interface)    WG_IF=$2; shift 2 ;;
@@ -1230,6 +1389,8 @@ fi
 if [[ -n $ADMIN_PASS || -n $CLIENT_CONF ]]; then
   printf '%s────────────────────────────────────────────────────────────────%s\n\n' "$B" "$N"
 fi
+
+write_profile "$CONFDIR/install.conf"
 
 # --------------------------------------------------------------------------- #
 # what happens next
